@@ -165,6 +165,16 @@ app.get('/jobs', async (req, res) => {
 });
 
 // Get one job
+app.get('/jobs/requisitions', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT job_id, title, job_code, client, hiring_manager, recruiter, country, job_location,
+              number_of_positions, priority, status, created_date,
+              (CURRENT_DATE - created_date::date) AS ageing_days
+         FROM jobs ORDER BY created_date DESC LIMIT 100`
+    );
+    return res.json({ jobs: rows });
+
 app.get('/jobs/:id', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM jobs WHERE job_id=$1', [req.params.id]);
@@ -1267,15 +1277,7 @@ app.get('/jobs/:jobId/full', async (req, res) => {
 });
 
 // ---------- LIST jobs with the requisition fields (for the admin/HM list) ----------
-app.get('/jobs/requisitions', async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT job_id, title, job_code, client, hiring_manager, recruiter, country, job_location,
-              number_of_positions, priority, status, created_date,
-              (CURRENT_DATE - created_date::date) AS ageing_days
-         FROM jobs ORDER BY created_date DESC LIMIT 100`
-    );
-    return res.json({ jobs: rows });
+
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
