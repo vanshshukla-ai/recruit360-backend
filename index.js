@@ -1276,13 +1276,5 @@ app.get('/jobs/:jobId/full', async (req, res) => {
   }
 });
 
-// ---------- LIST jobs with the requisition fields (for the admin/HM list) ----------
-
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('API on ' + PORT));
