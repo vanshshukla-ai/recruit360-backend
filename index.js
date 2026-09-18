@@ -174,6 +174,10 @@ app.get('/jobs/requisitions', async (req, res) => {
          FROM jobs ORDER BY created_date DESC LIMIT 100`
     );
     return res.json({ jobs: rows });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
 
 app.get('/jobs/:id', async (req, res) => {
   try {
