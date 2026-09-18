@@ -1173,5 +1173,114 @@ app.patch('/notifications/read', async (req, res) => {
   }
 });
 
+// ---------- CREATE a full job requisition (all mandatory fields) ----------
+app.post('/jobs/requisition', async (req, res) => {
+  try {
+    const b = req.body;
+    if (!b.title || !b.client || !b.hiring_manager) {
+      return res.status(400).json({ error: 'Title, Client and Hiring Manager are required.' });
+    }
+    const job_id = b.job_id || ('JOB' + Date.now().toString().slice(-7));
+    const job_code = b.job_code || ('JC-' + Date.now().toString().slice(-6));
+    const q = `INSERT INTO jobs (
+        job_id, title, job_code, client, hiring_manager, recruiter, recruitment_manager,
+        description, primary_skills, job_location, location, country, zip_code,
+        job_start_date, job_end_date, number_of_positions, openings,
+        bill_rate, bill_rate_type, tax_terms, priority, status, owner, created_by, created_date
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24, NOW())
+      ON CONFLICT (job_id) DO UPDATE SET
+        title=EXCLUDED.title, job_code=EXCLUDED.job_code, client=EXCLUDED.client,
+        hiring_manager=EXCLUDED.hiring_manager, recruiter=EXCLUDED.recruiter,
+        recruitment_manager=EXCLUDED.recruitment_manager, description=EXCLUDED.description,
+        primary_skills=EXCLUDED.primary_skills, job_location=EXCLUDED.job_location,
+        location=EXCLUDED.location, country=EXCLUDED.country, zip_code=EXCLUDED.zip_code,
+        job_start_date=EXCLUDED.job_start_date, job_end_date=EXCLUDED.job_end_date,
+        number_of_positions=EXCLUDED.number_of_positions, openings=EXCLUDED.openings,
+        bill_rate=EXCLUDED.bill_rate, bill_rate_type=EXCLUDED.bill_rate_type,
+        tax_terms=EXCLUDED.tax_terms, priority=EXCLUDED.priority, status=EXCLUDED.status,
+        owner=EXCLUDED.owner
+      RETURNING *`;
+    const vals = [
+      job_id, b.title, job_code, b.client, b.hiring_manager, b.recruiter || '', b.recruitment_manager || '',
+      b.description || '', b.primary_skills || '', b.job_location || '', b.job_location || b.location || '',
+      b.country || '', b.zip_code || '',
+      b.job_start_date || null, b.job_end_date || null,
+      parseInt(b.number_of_positions || 1, 10), parseInt(b.number_of_positions || 1, 10),
+      b.bill_rate ? Number(b.bill_rate) : null, b.bill_rate_type || '', b.tax_terms || '',
+      b.priority || 'Medium', b.status || 'Open', b.owner || b.recruiter || '', b.created_by || b.hiring_manager || '',
+    ];
+    const { rows } = await pool.query(q, vals);
+    return res.json({ ok: true, job: rows[0] });
+  } catch (e) {
+    return res.status(500).json({ error: 'Could not create requisition', detail: e.message });
+  }
+});
+
+// ---------- SINGLE-SCREEN JOB VIEW: everything for one job on one screen ----------
+app.get('/jobs/:jobId/full', async (req, res) => {
+  try {
+    // 1) The job with all fields + ageing
+    const jRes = await pool.query(
+      `SELECT *, (CURRENT_DATE - created_date::date) AS ageing_days FROM jobs WHERE job_id = $1`,
+      [req.params.jobId]
+    );
+    if (!jRes.rows.length) return res.status(404).json({ error: 'Job not found' });
+    const job = jRes.rows[0];
+
+    // 2) Submissions for this job
+    const sRes = await pool.query(
+      `SELECT submission_id, candidate_id, candidate_name, status, screening_notes, submitted_by, created_at
+         FROM submissions WHERE job_id = $1 ORDER BY created_at DESC`,
+      [req.params.jobId]
+    );
+
+    // 3) Interviews (submissions with interview data)
+    const iRes = await pool.query(
+      `SELECT submission_id, candidate_name, interview_date, interview_notes, status
+         FROM submissions WHERE job_id = $1 AND status IN ('INTERVIEW_SCHEDULED','INTERVIEWED')
+         ORDER BY interview_date DESC`,
+      [req.params.jobId]
+    );
+
+    // 4) Placements (submissions that reached placed/offer-accepted)
+    const pRes = await pool.query(
+      `SELECT submission_id, candidate_name, status, created_at
+         FROM submissions WHERE job_id = $1 AND status IN ('OFFER_ACCEPTED','PLACED')
+         ORDER BY created_at DESC`,
+      [req.params.jobId]
+    );
+
+    return res.json({
+      job,
+      submissions: sRes.rows,
+      interviews: iRes.rows,
+      placements: pRes.rows,
+      counts: {
+        submissions: sRes.rows.length,
+        interviews: iRes.rows.length,
+        placements: pRes.rows.length,
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({ error: 'Could not load job', detail: e.message });
+  }
+});
+
+// ---------- LIST jobs with the requisition fields (for the admin/HM list) ----------
+app.get('/jobs/requisitions', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT job_id, title, job_code, client, hiring_manager, recruiter, country, job_location,
+              number_of_positions, priority, status, created_date,
+              (CURRENT_DATE - created_date::date) AS ageing_days
+         FROM jobs ORDER BY created_date DESC LIMIT 100`
+    );
+    return res.json({ jobs: rows });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('API on ' + PORT));
