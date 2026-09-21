@@ -1374,13 +1374,16 @@ app.patch('/jobs/:jobId/assign', async (req, res) => {
 // ---------- RECRUITER'S OWN JOBS (only jobs assigned to them) ----------
 app.get('/recruiters/:id/jobs', async (req, res) => {
   try {
+    // Match by assigned_recruiter_id OR by recruiter name (for jobs assigned before IDs existed)
+    const nameRes = await pool.query('SELECT full_name FROM app_users WHERE user_id = $1', [req.params.id]);
+    const name = nameRes.rows.length ? nameRes.rows[0].full_name : '';
     const { rows } = await pool.query(
-      `SELECT job_id, title, job_code, client, country, job_location, number_of_positions, priority, status, created_date,
+      `SELECT job_id, title, job_code, client, country, job_location, number_of_positions, priority, status, created_date, recruiter,
               (CURRENT_DATE - created_date::date) AS ageing_days
-         FROM jobs WHERE assigned_recruiter_id = $1 ORDER BY created_date DESC`,
-      [req.params.id]
+         FROM jobs WHERE assigned_recruiter_id = $1 OR recruiter = $2 ORDER BY created_date DESC`,
+      [req.params.id, name]
     );
-    return res.json({ jobs: rows });
+    return res.json({ jobs: rows, recruiter_name: name });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
