@@ -1280,5 +1280,138 @@ app.get('/jobs/:jobId/full', async (req, res) => {
   }
 });
 
+// ---------- CLIENTS (admin manages; dropdown for HM & recruiter) ----------
+app.get('/admin/clients', async (req, res) => {
+  try { const { rows } = await pool.query('SELECT * FROM clients WHERE active = TRUE ORDER BY client_name'); return res.json({ clients: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/admin/clients', async (req, res) => {
+  try {
+    const b = req.body;
+    const client_id = b.client_id || ('CL-' + Date.now().toString().slice(-6));
+    await pool.query(
+      `INSERT INTO clients (client_id, client_name, industry, contact_person, contact_email, contact_phone, country, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (client_id) DO NOTHING`,
+      [client_id, b.client_name, b.industry || '', b.contact_person || '', b.contact_email || '', b.contact_phone || '', b.country || '', b.created_by || 'Admin']
+    );
+    return res.json({ ok: true, client_id });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- USERS (admin sees all HMs & recruiters) ----------
+app.get('/admin/users', async (req, res) => {
+  try {
+    const { role } = req.query;
+    let sql = 'SELECT user_id, full_name, email, role, user_group, phone, active FROM app_users WHERE active = TRUE';
+    const params = [];
+    if (role) { sql += ' AND role = $1'; params.push(role); }
+    sql += ' ORDER BY role, full_name';
+    const { rows } = await pool.query(sql, params);
+    return res.json({ users: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/admin/users', async (req, res) => {
+  try {
+    const b = req.body;
+    const user_id = b.user_id || ('USR-' + Date.now().toString().slice(-6));
+    await pool.query(
+      `INSERT INTO app_users (user_id, full_name, email, role, user_group, phone) VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [user_id, b.full_name, b.email || '', b.role, b.user_group || '', b.phone || '']
+    );
+    return res.json({ ok: true, user_id });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// Recruiters list (for the assign dropdown)
+app.get('/recruiters', async (req, res) => {
+  try { const { rows } = await pool.query("SELECT user_id, full_name FROM app_users WHERE role='recruiter' AND active=TRUE ORDER BY full_name"); return res.json({ recruiters: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- VISA OFFICES ----------
+app.get('/admin/visa-offices', async (req, res) => {
+  try { const { rows } = await pool.query('SELECT * FROM visa_offices ORDER BY office_name'); return res.json({ offices: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/admin/visa-offices', async (req, res) => {
+  try { const b = req.body; const id = b.office_id || ('VO-' + Date.now().toString().slice(-6));
+    await pool.query('INSERT INTO visa_offices (office_id, office_name, country, address, contact) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING', [id, b.office_name, b.country||'', b.address||'', b.contact||'']);
+    return res.json({ ok: true, office_id: id }); } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- TRAINING CENTRES ----------
+app.get('/admin/training-centres', async (req, res) => {
+  try { const { rows } = await pool.query('SELECT * FROM training_centres ORDER BY centre_name'); return res.json({ centres: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/admin/training-centres', async (req, res) => {
+  try { const b = req.body; const id = b.centre_id || ('TC-' + Date.now().toString().slice(-6));
+    await pool.query('INSERT INTO training_centres (centre_id, centre_name, location, focus_area, capacity) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING', [id, b.centre_name, b.location||'', b.focus_area||'', b.capacity||null]);
+    return res.json({ ok: true, centre_id: id }); } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- JOB ROLES + SKILLS ----------
+app.get('/admin/job-roles', async (req, res) => {
+  try { const { rows } = await pool.query('SELECT * FROM job_roles ORDER BY role_name'); return res.json({ roles: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/admin/job-roles', async (req, res) => {
+  try { const b = req.body; const id = b.role_id || ('JR-' + Date.now().toString().slice(-6));
+    await pool.query('INSERT INTO job_roles (role_id, role_name, skills) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [id, b.role_name, b.skills||'']);
+    return res.json({ ok: true, role_id: id }); } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- ASSIGN a job to a recruiter ----------
+app.patch('/jobs/:jobId/assign', async (req, res) => {
+  try {
+    const { recruiter_id, recruiter_name } = req.body;
+    await pool.query('UPDATE jobs SET assigned_recruiter_id = $1, recruiter = $2 WHERE job_id = $3', [recruiter_id, recruiter_name || '', req.params.jobId]);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- RECRUITER'S OWN JOBS (only jobs assigned to them) ----------
+app.get('/recruiters/:id/jobs', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT job_id, title, job_code, client, country, job_location, number_of_positions, priority, status, created_date,
+              (CURRENT_DATE - created_date::date) AS ageing_days
+         FROM jobs WHERE assigned_recruiter_id = $1 ORDER BY created_date DESC`,
+      [req.params.id]
+    );
+    return res.json({ jobs: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- ROLE-BASED REPORTS (3 different) ----------
+app.get('/reports/:role', async (req, res) => {
+  try {
+    const role = req.params.role;
+    const jobsTotal = await pool.query('SELECT COUNT(*) c FROM jobs');
+    const jobsOpen = await pool.query("SELECT COUNT(*) c FROM jobs WHERE status IN ('Open','Active','In Process')");
+    const subs = await pool.query('SELECT COUNT(*) c FROM submissions');
+    const placed = await pool.query("SELECT COUNT(*) c FROM submissions WHERE status='PLACED'");
+
+    if (role === 'admin') {
+      const byRecruiter = await pool.query(`SELECT recruiter, COUNT(*) jobs FROM jobs WHERE recruiter IS NOT NULL GROUP BY recruiter ORDER BY jobs DESC LIMIT 10`);
+      const byClient = await pool.query(`SELECT client, COUNT(*) jobs FROM jobs GROUP BY client ORDER BY jobs DESC LIMIT 10`);
+      return res.json({ role, scope: 'All hiring managers, recruiters & clients',
+        totals: { jobs: +jobsTotal.rows[0].c, open: +jobsOpen.rows[0].c, submissions: +subs.rows[0].c, placements: +placed.rows[0].c },
+        byRecruiter: byRecruiter.rows, byClient: byClient.rows });
+    }
+    if (role === 'hiring_manager') {
+      const byStatus = await pool.query(`SELECT status, COUNT(*) jobs FROM jobs GROUP BY status`);
+      return res.json({ role, scope: 'Your job requisitions & their progress',
+        totals: { jobs: +jobsTotal.rows[0].c, open: +jobsOpen.rows[0].c, submissions: +subs.rows[0].c, placements: +placed.rows[0].c },
+        byStatus: byStatus.rows });
+    }
+    // recruiter
+    return res.json({ role, scope: 'Your assigned jobs & submissions',
+      totals: { assigned_jobs: +jobsOpen.rows[0].c, submissions: +subs.rows[0].c, placements: +placed.rows[0].c } });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('API on ' + PORT));
