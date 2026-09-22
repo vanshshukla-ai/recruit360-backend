@@ -811,11 +811,12 @@ app.get('/submissions', async (req, res) => {
 app.patch('/submissions/:id/status', async (req, res) => {
   try {
     const { status } = req.body;
-    const allowed = ['SUBMITTED', 'CLIENT_REVIEW', 'SHORTLISTED', 'REJECTED', 'INTERVIEW_SCHEDULED', 'INTERVIEWED', 'OFFERED', 'OFFER_ACCEPTED', 'OFFER_DECLINED', 'PLACED'];
+    const allowed = ['SUBMITTED', 'RECRUITER_CALL', 'CLIENT_CONFIRM', 'TRAINING', 'CLIENT_INTERVIEW', 'CLIENT_DECISION', 'REJECTED', 'PLACED',
+                     'CLIENT_REVIEW', 'SHORTLISTED', 'INTERVIEW_SCHEDULED', 'INTERVIEWED', 'OFFERED', 'OFFER_ACCEPTED', 'OFFER_DECLINED'];
     if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status', allowed });
 
     // ENFORCE ORDER: you can only move forward one step, or reject/decline from the current stage.
-    const ORDER = ['SUBMITTED', 'CLIENT_REVIEW', 'SHORTLISTED', 'INTERVIEW_SCHEDULED', 'INTERVIEWED', 'OFFERED', 'OFFER_ACCEPTED', 'PLACED'];
+    const ORDER = ['SUBMITTED', 'RECRUITER_CALL', 'CLIENT_CONFIRM', 'TRAINING', 'CLIENT_INTERVIEW', 'CLIENT_DECISION', 'PLACED'];
     const curRes = await pool.query('SELECT status FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!curRes.rows.length) return res.status(404).json({ error: 'Submission not found' });
     const current = curRes.rows[0].status;
@@ -830,9 +831,10 @@ app.patch('/submissions/:id/status', async (req, res) => {
       const ci = ORDER.indexOf(current);
       const ni = ORDER.indexOf(status);
       if (ni === -1) return res.status(400).json({ error: 'That status is not part of the forward flow.' });
-      if (ni !== ci + 1) {
-        const expected = ORDER[ci + 1] ? ORDER[ci + 1].replace(/_/g, ' ') : 'none';
-        return res.status(400).json({ error: 'Steps must be followed in order. The next step for this candidate is: ' + expected + '.', current, next: ORDER[ci + 1] || null });
+      // Forward-only: allow moving forward one OR more steps (e.g. Scenario 3 skips training).
+      // Block only backward moves.
+      if (ni < ci) {
+        return res.status(400).json({ error: 'Cannot move a candidate backward in the flow.', current });
       }
     }
 
