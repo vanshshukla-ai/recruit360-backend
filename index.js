@@ -810,7 +810,7 @@ app.get('/submissions', async (req, res) => {
 // Update a submission's status
 app.patch('/submissions/:id/status', async (req, res) => {
   try {
-    const { status } = req.body;
+    const { status, scenario } = req.body;
     const allowed = ['SUBMITTED', 'RECRUITER_CALL', 'CLIENT_CONFIRM', 'TRAINING', 'CLIENT_INTERVIEW', 'CLIENT_DECISION', 'REJECTED', 'PLACED',
                      'CLIENT_REVIEW', 'SHORTLISTED', 'INTERVIEW_SCHEDULED', 'INTERVIEWED', 'OFFERED', 'OFFER_ACCEPTED', 'OFFER_DECLINED'];
     if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status', allowed });
@@ -839,6 +839,7 @@ app.patch('/submissions/:id/status', async (req, res) => {
     }
 
     await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [status, req.params.id]);
+    if (scenario) { try { await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS scenario INTEGER'); await pool.query('UPDATE submissions SET scenario = $1 WHERE submission_id = $2', [Number(scenario), req.params.id]); } catch(e){} }
 
     // Look up the submission for connection + notifications
     const sRes = await pool.query('SELECT candidate_id, candidate_name, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id]);
@@ -910,8 +911,9 @@ app.patch('/submissions/:id/interview', async (req, res) => {
     const cur = await pool.query('SELECT status, candidate_id, candidate_name, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!cur.rows.length) return res.status(404).json({ error: 'Submission not found' });
     const sub = cur.rows[0];
-    if (!outcome && sub.status !== 'SHORTLISTED' && sub.status !== 'INTERVIEW_SCHEDULED') {
-      return res.status(400).json({ error: 'The candidate must be shortlisted before scheduling an interview.' });
+    const schedulable = ['RECRUITER_CALL', 'CLIENT_INTERVIEW', 'SHORTLISTED', 'INTERVIEW_SCHEDULED', 'SUBMITTED', 'CLIENT_CONFIRM', 'TRAINING'];
+    if (!outcome && !schedulable.includes(sub.status)) {
+      return res.status(400).json({ error: 'The candidate is not at a stage where an interview/call can be scheduled.' });
     }
     let status = 'INTERVIEW_SCHEDULED';
     if (outcome === 'done') status = 'INTERVIEWED';
