@@ -1288,6 +1288,7 @@ app.get('/admin/clients', async (req, res) => {
 app.post('/admin/clients', async (req, res) => {
   try {
     const b = req.body;
+    if (!b.client_name || !b.client_name.trim()) return res.status(400).json({ error: 'client_name required' });
     const client_id = b.client_id || ('CL-' + Date.now().toString().slice(-6));
     await pool.query(
       `INSERT INTO clients (client_id, client_name, industry, contact_person, contact_email, contact_phone, country, created_by)
@@ -1313,6 +1314,7 @@ app.get('/admin/users', async (req, res) => {
 app.post('/admin/users', async (req, res) => {
   try {
     const b = req.body;
+    if (!b.full_name || !b.full_name.trim() || !b.role) return res.status(400).json({ error: 'full_name and role required' });
     const user_id = b.user_id || ('USR-' + Date.now().toString().slice(-6));
     await pool.query(
       `INSERT INTO app_users (user_id, full_name, email, role, user_group, phone) VALUES ($1,$2,$3,$4,$5,$6)
@@ -1335,7 +1337,7 @@ app.get('/admin/visa-offices', async (req, res) => {
   catch (e) { return res.status(500).json({ error: e.message }); }
 });
 app.post('/admin/visa-offices', async (req, res) => {
-  try { const b = req.body; const id = b.office_id || ('VO-' + Date.now().toString().slice(-6));
+  try { const b = req.body; if (!b.office_name || !b.office_name.trim()) return res.status(400).json({ error: 'office_name required' }); const id = b.office_id || ('VO-' + Date.now().toString().slice(-6));
     await pool.query('INSERT INTO visa_offices (office_id, office_name, country, address, contact) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING', [id, b.office_name, b.country||'', b.address||'', b.contact||'']);
     return res.json({ ok: true, office_id: id }); } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -1346,7 +1348,7 @@ app.get('/admin/training-centres', async (req, res) => {
   catch (e) { return res.status(500).json({ error: e.message }); }
 });
 app.post('/admin/training-centres', async (req, res) => {
-  try { const b = req.body; const id = b.centre_id || ('TC-' + Date.now().toString().slice(-6));
+  try { const b = req.body; if (!b.centre_name || !b.centre_name.trim()) return res.status(400).json({ error: 'centre_name required' }); const id = b.centre_id || ('TC-' + Date.now().toString().slice(-6));
     await pool.query('INSERT INTO training_centres (centre_id, centre_name, location, focus_area, capacity) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING', [id, b.centre_name, b.location||'', b.focus_area||'', b.capacity||null]);
     return res.json({ ok: true, centre_id: id }); } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -1357,7 +1359,7 @@ app.get('/admin/job-roles', async (req, res) => {
   catch (e) { return res.status(500).json({ error: e.message }); }
 });
 app.post('/admin/job-roles', async (req, res) => {
-  try { const b = req.body; const id = b.role_id || ('JR-' + Date.now().toString().slice(-6));
+  try { const b = req.body; if (!b.role_name || !b.role_name.trim()) return res.status(400).json({ error: 'role_name required' }); const id = b.role_id || ('JR-' + Date.now().toString().slice(-6));
     await pool.query('INSERT INTO job_roles (role_id, role_name, skills) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [id, b.role_name, b.skills||'']);
     return res.json({ ok: true, role_id: id }); } catch (e) { return res.status(500).json({ error: e.message }); }
 });
