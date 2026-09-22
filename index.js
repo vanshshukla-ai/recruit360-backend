@@ -1418,5 +1418,128 @@ app.get('/reports/:role', async (req, res) => {
 });
 
 
+// ---------- ONBOARDING: recruiter invites a candidate (creates onboarding + returns email content) ----------
+app.post('/candidates/invite', async (req, res) => {
+  try {
+    const { candidate_id, candidate_name, email, phone, job_id, job_title, client } = req.body;
+    if (!candidate_id || !candidate_name) return res.status(400).json({ error: 'candidate_id and candidate_name required' });
+    const token = 'INV-' + Math.random().toString(36).slice(2, 10).toUpperCase();
+    await pool.query(
+      `INSERT INTO candidate_onboarding (candidate_id, job_id, candidate_name, email, phone, invite_token, onboarding_status)
+       VALUES ($1,$2,$3,$4,$5,$6,'INVITED')`,
+      [candidate_id, job_id || '', candidate_name, email || '', phone || '', token]
+    );
+    // The portal link the candidate uses to upload their resume
+    const portalLink = `${process.env.PORTAL_URL || 'https://direct-tribute-502305-q5.web.app'}/#/candidate-upload?token=${token}`;
+    const emailSubject = `You've been shortlisted for ${job_title || 'a role'}${client ? ' at ' + client : ''}`;
+    const emailBody = `Dear ${candidate_name},\n\nGood news! You have been shortlisted for the position of ${job_title || 'the role'}${client ? ' with our client ' + client : ''}.\n\nTo proceed, please upload your latest resume and confirm your contact details using the secure link below:\n\n${portalLink}\n\nThis helps us move your application forward. We look forward to working with you.\n\nBest regards,\nRecruit 360 Team`;
+    return res.json({ ok: true, token, portalLink, emailSubject, emailBody, email });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- ONBOARDING: candidate fetches their invite by token ----------
+app.get('/onboarding/:token', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT candidate_id, candidate_name, email, phone, job_id, resume_uploaded, onboarding_status FROM candidate_onboarding WHERE invite_token = $1', [req.params.token]);
+    if (!rows.length) return res.status(404).json({ error: 'Invite not found' });
+    return res.json({ onboarding: rows[0] });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- ONBOARDING: candidate uploads resume + confirms contact ----------
+app.post('/onboarding/:token/submit', async (req, res) => {
+  try {
+    const { email, phone, resume_filename } = req.body;
+    await pool.query(
+      `UPDATE candidate_onboarding SET email = COALESCE($1,email), phone = COALESCE($2,phone),
+       resume_uploaded = TRUE, resume_filename = $3, onboarding_status = 'RESUME_SUBMITTED'
+       WHERE invite_token = $4`,
+      [email || null, phone || null, resume_filename || 'resume.pdf', req.params.token]
+    );
+    return res.json({ ok: true, message: 'Resume received. Your application is moving forward.' });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- VALIDATION: recruiter starts validation for a candidate ----------
+app.post('/validation/start', async (req, res) => {
+  try {
+    const { candidate_id, job_id, candidate_name } = req.body;
+    const validation_id = 'VAL-' + Date.now().toString().slice(-9);
+    await pool.query(
+      `INSERT INTO candidate_validation (validation_id, candidate_id, job_id, candidate_name, stage)
+       VALUES ($1,$2,$3,$4,'RECRUITER_CALL')`,
+      [validation_id, candidate_id, job_id || '', candidate_name || '']
+    );
+    return res.json({ ok: true, validation_id });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- VALIDATION: set scenario (1/2/3) after the recruiter call ----------
+app.patch('/validation/:id/scenario', async (req, res) => {
+  try {
+    const { scenario, recruiter_notes } = req.body;
+    // Scenario 3 skips training -> next stage is CLIENT_INTERVIEW; 1&2 -> TRAINING
+    const nextStage = Number(scenario) === 3 ? 'CLIENT_INTERVIEW' : 'CLIENT_CONFIRM';
+    await pool.query(
+      `UPDATE candidate_validation SET scenario = $1, recruiter_notes = $2, stage = $3, updated_at = NOW() WHERE validation_id = $4`,
+      [Number(scenario), recruiter_notes || '', nextStage, req.params.id]
+    );
+    return res.json({ ok: true, next_stage: nextStage });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- VALIDATION: advance to the next stage ----------
+app.patch('/validation/:id/advance', async (req, res) => {
+  try {
+    const order = ['RECRUITER_CALL', 'CLIENT_CONFIRM', 'TRAINING', 'CLIENT_INTERVIEW', 'DONE'];
+    const cur = await pool.query('SELECT stage, scenario FROM candidate_validation WHERE validation_id = $1', [req.params.id]);
+    if (!cur.rows.length) return res.status(404).json({ error: 'Not found' });
+    let idx = order.indexOf(cur.rows[0].stage);
+    let next = order[Math.min(order.length - 1, idx + 1)];
+    // Scenario 3 skips TRAINING
+    if (next === 'TRAINING' && Number(cur.rows[0].scenario) === 3) next = 'CLIENT_INTERVIEW';
+    await pool.query('UPDATE candidate_validation SET stage = $1, updated_at = NOW() WHERE validation_id = $2', [next, req.params.id]);
+    return res.json({ ok: true, stage: next });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- VALIDATION: generate an interview link (real Meet-style link) + email content ----------
+app.post('/validation/:id/interview-link', async (req, res) => {
+  try {
+    const code = Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 6);
+    const link = `https://meet.google.com/${code}`;
+    await pool.query('UPDATE candidate_validation SET interview_link = $1, updated_at = NOW() WHERE validation_id = $2', [link, req.params.id]);
+    const v = await pool.query('SELECT candidate_name FROM candidate_validation WHERE validation_id = $1', [req.params.id]);
+    const name = v.rows.length ? v.rows[0].candidate_name : 'Candidate';
+    const emailSubject = 'Your interview is scheduled';
+    const emailBody = `Dear ${name},\n\nYour interview has been scheduled. Please join using the link below at the agreed time:\n\n${link}\n\nBest regards,\nRecruit 360 Team`;
+    return res.json({ ok: true, link, emailSubject, emailBody });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- VALIDATION: client decision ----------
+app.patch('/validation/:id/decision', async (req, res) => {
+  try {
+    const { decision } = req.body; // ACCEPTED / REJECTED
+    await pool.query('UPDATE candidate_validation SET client_decision = $1, stage = $2, updated_at = NOW() WHERE validation_id = $3',
+      [decision, decision === 'ACCEPTED' ? 'DONE' : 'DONE', req.params.id]);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- VALIDATION: get validations for a job (or all) ----------
+app.get('/validations', async (req, res) => {
+  try {
+    const { job_id } = req.query;
+    let sql = 'SELECT * FROM candidate_validation';
+    const params = [];
+    if (job_id) { sql += ' WHERE job_id = $1'; params.push(job_id); }
+    sql += ' ORDER BY updated_at DESC LIMIT 100';
+    const { rows } = await pool.query(sql, params);
+    return res.json({ validations: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('API on ' + PORT));
