@@ -1595,27 +1595,133 @@ app.get('/validations', async (req, res) => {
 });
 
 
-// ---------- CHATBOT: role-aware assistant ----------
+// ============================================================
+// RECRUIT 360 AI ASSISTANT — ported from the Streamlit agent (BigQuery + Gemini)
+// Role-aware, grounded, with the guardrail rules + chat memory.
+// ============================================================
+const BQ_DS = 'direct-tribute-502305-q5.recruit360';
+
+const REJECTION_FIXES = {
+  'R-01':'Incomplete application form — complete all mandatory fields and resubmit.',
+  'R-02':'Invalid/expired passport — renew passport (min 6 months validity) and attach a clear copy.',
+  'R-03':'Insufficient financial proof — provide bank statements or a sponsorship letter meeting the threshold.',
+  'R-04':'Missing employer sponsorship — obtain a signed sponsorship letter and employment contract.',
+  'R-05':'Photograph does not meet spec — submit a biometric photo per the embassy specification.',
+  'R-06':'Missing/invalid qualifications — attach attested degree/certificates with certified translation.',
+  'R-07':'Medical certificate missing — complete the panel medical and attach the report.',
+  'R-08':'Travel/health insurance missing — purchase a compliant policy and attach it.',
+  'R-09':'Inconsistent personal details — correct mismatched details across all documents.',
+  'R-10':'Interview/extra docs required — schedule the embassy interview or provide the requested documents.'
+};
+
+const BQ_SCHEMA = `Tables in ${BQ_DS} (join on ids):
+- "visa rejected" means candidates.visa_status = 'VISA_REJECTED'.
+- The 8 valid roles: Software Engineer, Registered Nurse, Data Engineer, Cloud Architect, DevOps Engineer, Data Analyst, QA Engineer, Mechanical Engineer.
+- visa_status STAGES: Intake=INTAKE_PENDING,STAKEHOLDERS_ASSIGNED,TERMS_LOCKED; Screening=DOCUMENTS_VERIFIED,SCREENING,TRAINING_IN_PROGRESS,TRAINING_COMPLETE,REMEDIATION_IN_PROGRESS; Placement=PLACEMENT_ACTIVE; Visa=VISA_SUBMITTED,VISA_APPROVED,VISA_REJECTED; Travel=TRAVEL_CONFIRMED,REPORTED,NOT_REPORTED,ARRIVED.
+- Use LOWER(col) LIKE LOWER('%x%') for text filters. experience_years INTEGER (fresher<=1, senior>=5). No skills column.
+- origin_city = current Indian city (where they live now). destination_country = foreign country they go to. NEVER confuse them.
+candidates(candidate_id, full_name, email, origin_city, destination_country, destination_employer, role, recruiter, csr_owner, training_centre, visa_agency, visa_status, deposit_amount, currency, urgency_score, experience_years, created_at)
+visa_workflows(visa_id, candidate_id, visa_agency, jurisdiction, submitted_date, decision, rejection_codes, retry_count, decision_date)
+billing_schedules(billing_id, candidate_id, billing_domain, amount, currency, status, due_date)
+jobs(job_id, title, client, department, location, status, openings, recruiter, created_date)
+placements(placement_id, candidate_id, job_id, placement_date, fee_eur, status)`;
+
+function _readonlySQL(sql) {
+  let l = sql.toLowerCase().trim().replace(/;+$/, '').trim();
+  if (l.includes(';')) return false;
+  if (!l.startsWith('select')) return false;
+  if (/\b(insert|update|delete|drop|create|alter|merge|truncate|grant|revoke|call|execute)\b/.test(l)) return false;
+  return true;
+}
+
+async function bqQuery(sql) {
+  const [rows] = await bq.query({ query: sql, useLegacySql: false, maximumBytesBilled: '200000000' });
+  return rows;
+}
+
+// The main data agent — LLM writes SQL, we run it on BigQuery.
+async function agentQueryData(question) {
+  const wantAll = /(show all|list all|all of them|everyone|every candidate|full list|show more|all candidates|complete list|entire list|see all|view all)/i.test(question);
+  const listLimit = wantAll ? 500 : 50;
+  const prompt = `Write ONE efficient BigQuery SELECT (only SQL, no fences).
+Rules: select only needed columns (never SELECT *). For a list, add LIMIT ${listLimit} at the end. For a count/total use COUNT(*) with no LIMIT. Use COUNT/SUM/AVG for totals, GROUP BY for 'per/by/each/breakdown'. Use ORDER BY DESC + LIMIT for 'top/most/highest'. Text filters use LOWER(col) LIKE LOWER('%v%'). Map pipeline stages to visa_status IN(...). Use candidates.experience_years for experience. Prefix tables with \`${BQ_DS}.\`.
+${BQ_SCHEMA}
+Question: ${question}
+SQL:`;
+  const gen = await genModel.generateContent(prompt);
+  let sql = gen.response.candidates[0].content.parts[0].text.replace(/^```(?:sql)?|```$/gim, '').trim();
+  if (!_readonlySQL(sql)) return { text: 'That request is blocked (read-only guard).', rows: [] };
+  try {
+    const rows = await bqQuery(sql);
+    if (!rows.length) return { text: 'No records match this request in the database. The correct answer is that none were found — I will not invent any.', rows: [] };
+    const shown = rows.slice(0, wantAll ? 25 : 8);
+    const note = rows.length > shown.length ? `\n\n(Showing ${shown.length} of ${rows.length}.)` : '';
+    return { text: `Result (${rows.length} found):\n${JSON.stringify(shown, null, 1)}${note}`, rows };
+  } catch (e) { return { text: 'Query failed: ' + e.message, rows: [] }; }
+}
+
+async function agentVisaFix(candidateId) {
+  const cid = (candidateId || '').trim().toUpperCase();
+  try {
+    const rows = await bqQuery(`SELECT candidate_id, decision, rejection_codes, retry_count FROM \`${BQ_DS}.visa_workflows\` WHERE candidate_id='${cid}' AND decision='REJECTED'`);
+    if (!rows.length) return `No rejected visa found for ${cid} (nothing to remediate).`;
+    const codes = [];
+    rows.forEach(r => String(r.rejection_codes || '').split(';').forEach(c => { if (c) codes.push(c.trim()); }));
+    const mapped = codes.map(c => `- ${c}: ${REJECTION_FIXES[c] || 'Refer to embassy guidance.'}`).join('\n');
+    const gen = await genModel.generateContent(`A candidate's visa was rejected with these issues:\n${mapped}\n\nWrite a clear, numbered remediation checklist a recruiter can act on to fix and re-apply.`);
+    return `Rejection codes for ${cid}: ${codes.join(', ')}\n\n${gen.response.candidates[0].content.parts[0].text.trim()}`;
+  } catch (e) { return 'Visa lookup failed: ' + e.message; }
+}
+
+async function agentUrgency(topN) {
+  try {
+    const rows = await bqQuery(`SELECT candidate_id, full_name, role, destination_country, visa_status, urgency_score FROM \`${BQ_DS}.candidates\` WHERE visa_status IN ('VISA_REJECTED','REMEDIATION_IN_PROGRESS','NOT_REPORTED') OR urgency_score >= 75 ORDER BY urgency_score DESC LIMIT ${parseInt(topN||10,10)}`);
+    if (!rows.length) return 'No high-urgency candidates right now.';
+    return 'Top urgent / at-risk candidates:\n' + JSON.stringify(rows, null, 1);
+  } catch (e) { return 'Urgency query failed: ' + e.message; }
+}
+
+const ASSISTANT_RULES = `You are the Recruit 360 AI Assistant. Ground every answer in the data provided by the tools; never invent a candidate name or ID. If a tool returns nothing, say so plainly — do not fabricate. Answer the exact question directly and answer every part of a multi-part question. origin_city = current Indian city; destination_country = where they go (never confuse). Placement probability is a model estimate (0-1), not a guarantee. You inform, you do not decide — never tell the user to hire/reject a specific candidate. You only help with Recruit 360 recruitment data; politely decline off-topic questions. Be concise and professional.`;
+
+function roleScope(role) {
+  if (role === 'admin') return 'The user is an ADMIN with full visibility across all recruiters, clients, candidates and the pipeline.';
+  if (role === 'hiring_manager') return 'The user is a HIRING MANAGER — focus on their requisitions, pending approvals, submissions and candidate progress.';
+  if (role === 'recruiter') return 'The user is a RECRUITER — focus on their assigned jobs, their candidates, visa status and next actions.';
+  return 'The user is a platform user.';
+}
+
+// ---------- THE ASSISTANT ENDPOINT ----------
 app.post('/assistant/ask', async (req, res) => {
   try {
-    const { question, role } = req.body;
+    const { question, role, history } = req.body;
     if (!question) return res.status(400).json({ error: 'question required' });
-    // Gather quick facts grounded in real data, scoped to role
-    const jobs = await pool.query("SELECT COUNT(*) c FROM jobs");
-    const openJobs = await pool.query("SELECT COUNT(*) c FROM jobs WHERE status IN ('Open','Active','POSTED','In Process')");
-    const subs = await pool.query("SELECT COUNT(*) c FROM submissions");
-    const pending = await pool.query("SELECT COUNT(*) c FROM submissions WHERE status='PENDING_HM_APPROVAL'");
-    const placed = await pool.query("SELECT COUNT(*) c FROM submissions WHERE status='PLACED'");
-    const facts = `Total jobs: ${jobs.rows[0].c}. Open jobs: ${openJobs.rows[0].c}. Submissions: ${subs.rows[0].c}. Pending HM approval: ${pending.rows[0].c}. Placed: ${placed.rows[0].c}.`;
-    const roleScope = role === 'admin' ? 'You are speaking to an ADMIN — full visibility across all recruiters, clients and the pipeline.'
-      : role === 'hiring_manager' ? 'You are speaking to a HIRING MANAGER — focus on their requisitions, pending approvals and submissions.'
-      : role === 'recruiter' ? 'You are speaking to a RECRUITER — focus on their assigned jobs, candidates and next actions.'
-      : 'You are speaking to a user of the recruitment platform.';
-    const prompt = `You are Recruit 360's AI assistant. ${roleScope} Answer the question briefly and helpfully using ONLY these facts; do not invent data. If the answer isn't in the facts, say what you'd need.\n\nFACTS: ${facts}\n\nQUESTION: ${question}`;
-    const result = await genModel.generateContent(prompt);
-    const answer = result.response.candidates[0].content.parts[0].text.trim();
-    return res.json({ answer, role });
-  } catch (e) { return res.status(500).json({ error: 'Assistant unavailable', detail: e.message }); }
+
+    // 1) Router: which agent does this need?
+    const routePrompt = `Classify this recruitment question into ONE tool and extract any argument. Reply with JSON only: {"tool":"data|visa_fix|urgency","arg":"..."}.
+- "visa_fix" if it asks to fix/remediate a rejected visa for a candidate id (arg = the candidate id like C2013).
+- "urgency" if it asks for urgent/at-risk/AWOL candidates (arg = number or empty).
+- "data" for everything else (counts, lists, filters, jobs, submissions, placements, visa status counts).
+Question: ${question}`;
+    let route = { tool: 'data', arg: '' };
+    try {
+      const rg = await genModel.generateContent(routePrompt);
+      const raw = rg.response.candidates[0].content.parts[0].text.replace(/```json|```/g, '').trim();
+      route = JSON.parse(raw);
+    } catch (e) { route = { tool: 'data', arg: '' }; }
+
+    // 2) Run the chosen agent
+    let toolResult = '', agentName = '';
+    if (route.tool === 'visa_fix') { toolResult = await agentVisaFix(route.arg); agentName = 'Visa Fix-It'; }
+    else if (route.tool === 'urgency') { toolResult = await agentUrgency(route.arg); agentName = 'Urgency Watch'; }
+    else { const r = await agentQueryData(question); toolResult = r.text; agentName = 'Data Query'; }
+
+    // 3) Compose the final answer with rules + role scope + memory
+    const hist = (history || []).slice(-6).map(h => `${h.role === 'user' ? 'User' : 'Assistant'}: ${h.text}`).join('\n');
+    const finalPrompt = `${ASSISTANT_RULES}\n${roleScope(role)}\n\n${hist ? 'Recent conversation:\n' + hist + '\n\n' : ''}TOOL RESULT (${agentName}):\n${toolResult}\n\nUSER QUESTION: ${question}\n\nWrite the answer for the user, grounded ONLY in the tool result above. If the tool result is data, summarise it clearly.`;
+    const finalGen = await genModel.generateContent(finalPrompt);
+    const answer = finalGen.response.candidates[0].content.parts[0].text.trim();
+    return res.json({ answer, agent: agentName, role });
+  } catch (e) { return res.status(500).json({ error: 'Assistant error', detail: e.message }); }
 });
 
 const PORT = process.env.PORT || 8080;
