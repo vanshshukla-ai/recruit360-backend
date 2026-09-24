@@ -811,12 +811,12 @@ app.get('/submissions', async (req, res) => {
 app.patch('/submissions/:id/status', async (req, res) => {
   try {
     const { status, scenario } = req.body;
-    const allowed = ['SUBMITTED', 'RECRUITER_CALL', 'CLIENT_CONFIRM', 'TRAINING', 'CLIENT_INTERVIEW', 'CLIENT_DECISION', 'REJECTED', 'PLACED',
-                     'CLIENT_REVIEW', 'SHORTLISTED', 'INTERVIEW_SCHEDULED', 'INTERVIEWED', 'OFFERED', 'OFFER_ACCEPTED', 'OFFER_DECLINED'];
+    const allowed = ['PENDING_HM_APPROVAL', 'SUBMITTED', 'RECRUITER_CALL', 'HR_INTERVIEW', 'CLIENT_INTERVIEW', 'OFFER', 'PLACED', 'REJECTED',
+                     'CLIENT_CONFIRM', 'TRAINING', 'CLIENT_DECISION', 'CLIENT_REVIEW', 'SHORTLISTED', 'INTERVIEW_SCHEDULED', 'INTERVIEWED', 'OFFERED', 'OFFER_ACCEPTED', 'OFFER_DECLINED'];
     if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status', allowed });
 
     // ENFORCE ORDER: you can only move forward one step, or reject/decline from the current stage.
-    const ORDER = ['SUBMITTED', 'RECRUITER_CALL', 'CLIENT_CONFIRM', 'TRAINING', 'CLIENT_INTERVIEW', 'CLIENT_DECISION', 'PLACED'];
+    const ORDER = ['PENDING_HM_APPROVAL', 'SUBMITTED', 'RECRUITER_CALL', 'HR_INTERVIEW', 'CLIENT_INTERVIEW', 'OFFER', 'PLACED'];
     const curRes = await pool.query('SELECT status FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!curRes.rows.length) return res.status(404).json({ error: 'Submission not found' });
     const current = curRes.rows[0].status;
@@ -1111,25 +1111,54 @@ app.get('/jobs/:jobId/board', async (req, res) => {
 // Manually add a candidate (by id) as a submission to a job — bypasses AI sourcing
 app.post('/jobs/:jobId/submit-candidate', async (req, res) => {
   try {
-    const { candidate_id, submitted_by, screening_notes } = req.body;
+    const { candidate_id, submitted_by, screening_notes, current_ctc, expected_ctc } = req.body;
     if (!candidate_id) return res.status(400).json({ error: 'candidate_id is required' });
-    const jRes = await pool.query('SELECT job_id, title, client FROM jobs WHERE job_id = $1', [req.params.jobId]);
+    const jRes = await pool.query('SELECT job_id, title, client, hiring_manager FROM jobs WHERE job_id = $1', [req.params.jobId]);
     if (!jRes.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jRes.rows[0];
     const cRes = await pool.query('SELECT full_name FROM candidates WHERE candidate_id = $1', [candidate_id]);
     if (!cRes.rows.length) return res.status(404).json({ error: 'Candidate not found' });
-    // duplicate check
     const dup = await pool.query('SELECT submission_id FROM submissions WHERE candidate_id = $1 AND job_id = $2', [candidate_id, req.params.jobId]);
     if (dup.rows.length) return res.status(409).json({ error: 'duplicate', message: 'This candidate is already submitted to this job.' });
+    // Ensure CTC columns exist
+    try { await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS current_ctc TEXT'); await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS expected_ctc TEXT'); } catch(e){}
     const submission_id = 'SUB' + Date.now().toString().slice(-10);
+    // Sir's flow: start at PENDING_HM_APPROVAL — the hiring manager must approve before the candidate is emailed.
     await pool.query(
-      'INSERT INTO submissions (submission_id, candidate_id, candidate_name, job_id, job_title, client_name, status, screening_notes, submitted_by, created_at, last_updated) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())',
-      [submission_id, candidate_id, cRes.rows[0].full_name, req.params.jobId, job.title, job.client || '', 'SUBMITTED', screening_notes || '', submitted_by || '']
+      'INSERT INTO submissions (submission_id, candidate_id, candidate_name, job_id, job_title, client_name, status, screening_notes, submitted_by, current_ctc, expected_ctc, created_at, last_updated) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())',
+      [submission_id, candidate_id, cRes.rows[0].full_name, req.params.jobId, job.title, job.client || '', 'PENDING_HM_APPROVAL', screening_notes || '', submitted_by || '', current_ctc || '', expected_ctc || '']
     );
-    return res.json({ ok: true, submission_id, candidate_name: cRes.rows[0].full_name });
+    // Notify the hiring manager
+    try { await pool.query('INSERT INTO notifications (message, type, read, created_at) VALUES ($1,$2,FALSE,NOW())', ['Approval needed: ' + cRes.rows[0].full_name + ' submitted for ' + job.title, 'APPROVAL']); } catch(e){}
+    return res.json({ ok: true, submission_id, candidate_name: cRes.rows[0].full_name, hiring_manager: job.hiring_manager, status: 'PENDING_HM_APPROVAL' });
   } catch (err) {
     return res.status(500).json({ error: 'Could not submit candidate', detail: err.message });
   }
+});
+
+// ---------- HIRING MANAGER: approve or reject a submission ----------
+app.patch('/submissions/:id/approval', async (req, res) => {
+  try {
+    const { decision, approver } = req.body; // APPROVED | REJECTED
+    const newStatus = decision === 'APPROVED' ? 'SUBMITTED' : 'REJECTED';
+    await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [newStatus, req.params.id]);
+    const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (decision === 'APPROVED' && sub) {
+      // Approved -> now the candidate can be invited (email + resume upload)
+      return res.json({ ok: true, status: 'SUBMITTED', candidate: sub, canInvite: true });
+    }
+    return res.json({ ok: true, status: newStatus });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- Submissions PENDING approval (for the hiring manager) ----------
+app.get('/submissions/pending-approval', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, current_ctc, expected_ctc, submitted_by, created_at
+         FROM submissions WHERE status = 'PENDING_HM_APPROVAL' ORDER BY created_at DESC`);
+    return res.json({ pending: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
 // ---------- CANDIDATE HISTORY across jobs (sir's request: avoid repeat-rejects) ----------
@@ -1371,8 +1400,29 @@ app.post('/admin/job-roles', async (req, res) => {
 // ---------- ASSIGN a job to a recruiter ----------
 app.patch('/jobs/:jobId/assign', async (req, res) => {
   try {
-    const { recruiter_id, recruiter_name } = req.body;
-    await pool.query('UPDATE jobs SET assigned_recruiter_id = $1, recruiter = $2 WHERE job_id = $3', [recruiter_id, recruiter_name || '', req.params.jobId]);
+    const { recruiter_id, recruiter_name, recruiter_ids, recruiter_names } = req.body;
+    try { await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_ids TEXT'); await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_names TEXT'); } catch(e){}
+    if (recruiter_ids) {
+      // Multiple recruiters (comma-separated)
+      await pool.query('UPDATE jobs SET assigned_recruiter_ids = $1, assigned_recruiter_names = $2, assigned_recruiter_id = $3, recruiter = $4 WHERE job_id = $5',
+        [recruiter_ids, recruiter_names || '', (recruiter_ids.split(',')[0] || ''), (recruiter_names || '').split(',')[0] || '', req.params.jobId]);
+    } else {
+      await pool.query('UPDATE jobs SET assigned_recruiter_id = $1, recruiter = $2, assigned_recruiter_ids = $1, assigned_recruiter_names = $2 WHERE job_id = $3', [recruiter_id, recruiter_name || '', req.params.jobId]);
+    }
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- EDIT a job ----------
+app.patch('/jobs/:jobId/edit', async (req, res) => {
+  try {
+    const b = req.body;
+    const fields = ['title','job_code','client','hiring_manager','description','primary_skills','job_location','country','zip_code','number_of_positions','bill_rate','bill_rate_type','tax_terms','priority','status'];
+    const sets = []; const vals = []; let i = 1;
+    fields.forEach(f => { if (b[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(b[f]); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.jobId);
+    await pool.query('UPDATE jobs SET ' + sets.join(', ') + ' WHERE job_id = $' + i, vals);
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -1544,6 +1594,29 @@ app.get('/validations', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
+
+// ---------- CHATBOT: role-aware assistant ----------
+app.post('/assistant/ask', async (req, res) => {
+  try {
+    const { question, role } = req.body;
+    if (!question) return res.status(400).json({ error: 'question required' });
+    // Gather quick facts grounded in real data, scoped to role
+    const jobs = await pool.query("SELECT COUNT(*) c FROM jobs");
+    const openJobs = await pool.query("SELECT COUNT(*) c FROM jobs WHERE status IN ('Open','Active','POSTED','In Process')");
+    const subs = await pool.query("SELECT COUNT(*) c FROM submissions");
+    const pending = await pool.query("SELECT COUNT(*) c FROM submissions WHERE status='PENDING_HM_APPROVAL'");
+    const placed = await pool.query("SELECT COUNT(*) c FROM submissions WHERE status='PLACED'");
+    const facts = `Total jobs: ${jobs.rows[0].c}. Open jobs: ${openJobs.rows[0].c}. Submissions: ${subs.rows[0].c}. Pending HM approval: ${pending.rows[0].c}. Placed: ${placed.rows[0].c}.`;
+    const roleScope = role === 'admin' ? 'You are speaking to an ADMIN — full visibility across all recruiters, clients and the pipeline.'
+      : role === 'hiring_manager' ? 'You are speaking to a HIRING MANAGER — focus on their requisitions, pending approvals and submissions.'
+      : role === 'recruiter' ? 'You are speaking to a RECRUITER — focus on their assigned jobs, candidates and next actions.'
+      : 'You are speaking to a user of the recruitment platform.';
+    const prompt = `You are Recruit 360's AI assistant. ${roleScope} Answer the question briefly and helpfully using ONLY these facts; do not invent data. If the answer isn't in the facts, say what you'd need.\n\nFACTS: ${facts}\n\nQUESTION: ${question}`;
+    const result = await genModel.generateContent(prompt);
+    const answer = result.response.candidates[0].content.parts[0].text.trim();
+    return res.json({ answer, role });
+  } catch (e) { return res.status(500).json({ error: 'Assistant unavailable', detail: e.message }); }
+});
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('API on ' + PORT));
