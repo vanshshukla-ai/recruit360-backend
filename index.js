@@ -1659,6 +1659,30 @@ SQL:`;
   } catch (e) { return { text: 'Query failed: ' + e.message, rows: [] }; }
 }
 
+
+// Cloud SQL data agent — for jobs, submissions, approvals, placements (the live website data)
+async function agentSqlData(question, role) {
+  const schema = `Cloud SQL (PostgreSQL) tables:
+jobs(job_id, title, client, hiring_manager, recruiter, assigned_recruiter_id, country, job_location, number_of_positions, priority, status, created_date)
+  -- open jobs = status IN ('Open','Active','POSTED','In Process'); closed = status IN ('Closed','CLOSED','Filled')
+submissions(submission_id, candidate_id, candidate_name, job_id, job_title, client_name, status, submitted_by, current_ctc, expected_ctc, resume_received, created_at)
+  -- statuses: PENDING_HM_APPROVAL, SUBMITTED, RECRUITER_CALL, HR_INTERVIEW, CLIENT_INTERVIEW, OFFER, PLACED, REJECTED
+app_users(user_id, full_name, email, role, user_group)  -- roles: admin, hiring_manager, recruiter
+clients(client_id, client_name, country, industry)`;
+  const prompt = `Write ONE PostgreSQL SELECT (only SQL, no fences, no trailing semicolon). Use COUNT(*) for counts. Use ILIKE for text. Never SELECT * ; select only needed columns and LIMIT 50 for lists.
+${schema}
+Question: ${question}
+SQL:`;
+  const gen = await genModel.generateContent(prompt);
+  let sql = gen.response.candidates[0].content.parts[0].text.replace(/^```(?:sql)?|```$/gim, '').trim().replace(/;+$/,'');
+  if (!/^select/i.test(sql) || /\b(insert|update|delete|drop|alter|create)\b/i.test(sql)) return { text: 'Blocked (read-only).', rows: [] };
+  try {
+    const { rows } = await pool.query(sql);
+    if (!rows.length) return { text: 'No records found for this in the live database.', rows: [] };
+    return { text: `Result (${rows.length} found):\n${JSON.stringify(rows.slice(0,15), null, 1)}`, rows };
+  } catch (e) { return { text: 'Query failed: ' + e.message, rows: [] }; }
+}
+
 async function agentVisaFix(candidateId) {
   const cid = (candidateId || '').trim().toUpperCase();
   try {
@@ -1702,14 +1726,17 @@ app.post('/assistant/ask', async (req, res) => {
     const isUrgency = /(urgent|urgency|at.?risk|awol|not reported|priority candidates|who needs attention)/i.test(q);
 
     let toolResult = '', agentName = '', rows = [];
+    // Route: jobs/submissions/approvals/placements -> Cloud SQL (live website data). Candidates/visa -> BigQuery.
+    const isJobsData = /(open job|jobs\b|job posting|requisition|submission|submitted|approval|pending|assigned to me|my job|placement|placed|offer|interview scheduled|client interview|hr interview)/i.test(q);
     if (isVisaFix) {
       toolResult = await agentVisaFix(idMatch[0]); agentName = 'Visa Fix-It';
     } else if (isUrgency) {
       toolResult = await agentUrgency(10); agentName = 'Urgency Watch';
+    } else if (isJobsData) {
+      const r = await agentSqlData(question, role); toolResult = r.text; rows = r.rows; agentName = 'Jobs & Submissions';
     } else {
-      // DATA agent — generate SQL scoped by role, run on BigQuery, answer FROM THE ROWS.
       const r = await agentQueryData(question, role, history);
-      toolResult = r.text; rows = r.rows; agentName = 'Data Query';
+      toolResult = r.text; rows = r.rows; agentName = 'Candidate Data';
     }
 
     // Compose a clean answer that faithfully reflects the tool result (no invention).
