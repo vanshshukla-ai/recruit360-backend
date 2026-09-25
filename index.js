@@ -1667,6 +1667,9 @@ jobs(job_id, title, client, hiring_manager, recruiter, assigned_recruiter_id, co
   -- open jobs = status IN ('Open','Active','POSTED','In Process'); closed = status IN ('Closed','CLOSED','Filled')
 submissions(submission_id, candidate_id, candidate_name, job_id, job_title, client_name, status, submitted_by, current_ctc, expected_ctc, resume_received, created_at)
   -- statuses: PENDING_HM_APPROVAL, SUBMITTED, RECRUITER_CALL, HR_INTERVIEW, CLIENT_INTERVIEW, OFFER, PLACED, REJECTED
+  -- "who needs approval" / "pending approval" / "awaiting approval" / "to approve" = status = 'PENDING_HM_APPROVAL' (select candidate_name, job_title)
+  -- "submitted candidates" = all submissions. "placed" = status='PLACED'. "in interview" = status IN ('RECRUITER_CALL','HR_INTERVIEW','CLIENT_INTERVIEW')
+  -- "rejected" = status='REJECTED". Count questions use COUNT(*).
 app_users(user_id, full_name, email, role, user_group)  -- roles: admin, hiring_manager, recruiter
 clients(client_id, client_name, country, industry)`;
   const prompt = `Write ONE plain PostgreSQL SELECT statement only — no explanation, no code fences, no trailing semicolon, no ':' named parameters, no '::' type casts. Use COUNT(*) for counts, ILIKE for text matching, and LIMIT 50 for lists (never SELECT *). Write real literal values directly in the WHERE clause.
@@ -1730,7 +1733,7 @@ app.post('/assistant/ask', async (req, res) => {
 
     let toolResult = '', agentName = '', rows = [];
     // Route: jobs/submissions/approvals/placements -> Cloud SQL (live website data). Candidates/visa -> BigQuery.
-    const isJobsData = /(open job|jobs\b|job posting|requisition|submission|submitted|approval|pending|assigned to me|my job|placement|placed|offer|interview scheduled|client interview|hr interview)/i.test(q);
+    const isJobsData = /(open job|jobs\b|job posting|requisition|submission|submitted|approv|pending|awaiting|assigned|my job|placement|placed|offer|interview|recruiter call|hr round|shortlist|reject)/i.test(q);
     if (isVisaFix) {
       toolResult = await agentVisaFix(idMatch[0]); agentName = 'Visa Fix-It';
     } else if (isUrgency) {
