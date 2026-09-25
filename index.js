@@ -1499,12 +1499,14 @@ app.get('/onboarding/:token', async (req, res) => {
 app.post('/onboarding/:token/submit', async (req, res) => {
   try {
     const { email, phone, resume_filename } = req.body;
-    await pool.query(
+    const upd = await pool.query(
       `UPDATE candidate_onboarding SET email = COALESCE($1,email), phone = COALESCE($2,phone),
        resume_uploaded = TRUE, resume_filename = $3, onboarding_status = 'RESUME_SUBMITTED'
-       WHERE invite_token = $4`,
+       WHERE invite_token = $4 RETURNING candidate_id`,
       [email || null, phone || null, resume_filename || 'resume.pdf', req.params.token]
     );
+    // Mark the submission's resume as received (status indicator)
+    try { if (upd.rows.length) { await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_received BOOLEAN DEFAULT FALSE'); await pool.query('UPDATE submissions SET resume_received = TRUE WHERE candidate_id = $1', [upd.rows[0].candidate_id]); } } catch(e){}
     return res.json({ ok: true, message: 'Resume received. Your application is moving forward.' });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -1724,6 +1726,91 @@ ANSWER:`;
     const answer = finalGen.response.candidates[0].content.parts[0].text.trim();
     return res.json({ answer, agent: agentName });
   } catch (e) { return res.status(500).json({ error: 'Assistant error', detail: e.message }); }
+});
+
+// ---------- CONTEXTUAL RECRUITER AGENT: suggest & execute the next action per candidate ----------
+// Given a submission's current status, it knows exactly what the recruiter should do next.
+app.get('/submissions/:id/next-action', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, interview_link, resume_received FROM submissions WHERE submission_id = $1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    const s = rows[0];
+    const MAP = {
+      PENDING_HM_APPROVAL: { action: 'awaiting_approval', label: 'Awaiting HM approval', can: false, hint: 'The hiring manager needs to approve this candidate.' },
+      SUBMITTED:          { action: 'request_resume', label: 'Send resume request', can: true, hint: 'Approved — send the candidate the resume-upload email.' },
+      RECRUITER_CALL:     { action: 'schedule_call', label: 'Schedule recruiter call', can: true, hint: 'Set up the 5-min recruiter call and email the link.' },
+      HR_INTERVIEW:       { action: 'schedule_hr', label: 'Schedule HR interview', can: true, hint: 'Book the HR round and notify the candidate.' },
+      CLIENT_INTERVIEW:   { action: 'schedule_client', label: 'Schedule client interview', can: true, hint: 'Book the client interview and share the summary.' },
+      OFFER:              { action: 'send_offer', label: 'Send offer', can: true, hint: 'Release the offer to the candidate.' },
+      PLACED:             { action: 'done', label: 'Placed', can: false, hint: 'This candidate is placed.' },
+      REJECTED:           { action: 'done', label: 'Rejected', can: false, hint: 'This candidate was rejected.' },
+    };
+    const next = MAP[s.status] || { action: 'review', label: 'Review', can: true, hint: 'Review this candidate.' };
+    return res.json({ submission: s, next });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// Contextual agent EXECUTE — performs the suggested action (and returns any email content)
+app.post('/submissions/:id/context-action', async (req, res) => {
+  try {
+    const { action } = req.body;
+    const { rows } = await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, status FROM submissions WHERE submission_id = $1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    const s = rows[0];
+    const candEmail = (s.candidate_id || '').toLowerCase() + '@example.com';
+
+    if (action === 'request_resume') {
+      // create onboarding + invite email
+      const token = 'INV-' + Math.random().toString(36).slice(2, 10).toUpperCase();
+      try { await pool.query(`INSERT INTO candidate_onboarding (candidate_id, job_id, candidate_name, email, invite_token, onboarding_status) VALUES ($1,$2,$3,$4,$5,'INVITED')`, [s.candidate_id, s.job_id || '', s.candidate_name, candEmail, token]); } catch(e){}
+      const link = (process.env.PORTAL_URL || 'https://direct-tribute-502305-q5.web.app') + '/#/candidate-upload?token=' + token;
+      const emailSubject = 'Please upload your resume — ' + (s.job_title || 'a role');
+      const emailBody = 'Dear ' + s.candidate_name + ',\n\nYou have been shortlisted for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '. Please upload your latest resume and confirm your contact details here:\n\n' + link + '\n\nBest regards,\nRecruit 360 Team';
+      return res.json({ ok: true, done: 'request_resume', emailSubject, emailBody, candidateEmail: candEmail, link });
+    }
+    if (action === 'send_summary') {
+      const gen = await genModel.generateContent('Write a short professional candidate summary email to a client for ' + s.candidate_name + ', role ' + (s.job_title || '') + '. 4-5 lines, highlight fit. Return only the email body.');
+      const emailBody = gen.response.candidates[0].content.parts[0].text.trim();
+      return res.json({ ok: true, done: 'send_summary', emailSubject: 'Candidate summary — ' + s.candidate_name, emailBody, candidateEmail: (s.client_name||'client').toLowerCase().replace(/\s+/g,'') + '@client.com' });
+    }
+    // For schedule actions, just advance the stage (the UI opens the schedule step)
+    return res.json({ ok: true, done: action });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- BULK APPROVALS (hiring manager) ----------
+app.post('/submissions/bulk-approval', async (req, res) => {
+  try {
+    const { submission_ids, decision, approver } = req.body; // decision: APPROVED | REJECTED
+    if (!Array.isArray(submission_ids) || !submission_ids.length) return res.status(400).json({ error: 'submission_ids required' });
+    const newStatus = decision === 'APPROVED' ? 'SUBMITTED' : 'REJECTED';
+    const invites = [];
+    for (const id of submission_ids) {
+      await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [newStatus, id]);
+      if (decision === 'APPROVED') {
+        const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name FROM submissions WHERE submission_id = $1', [id])).rows[0];
+        if (sub) {
+          const token = 'INV-' + Math.random().toString(36).slice(2, 10).toUpperCase();
+          const candEmail = (sub.candidate_id || '').toLowerCase() + '@example.com';
+          try { await pool.query(`INSERT INTO candidate_onboarding (candidate_id, job_id, candidate_name, email, invite_token, onboarding_status) VALUES ($1,$2,$3,$4,$5,'INVITED')`, [sub.candidate_id, sub.job_id || '', sub.candidate_name, candEmail, token]); } catch(e){}
+          const link = (process.env.PORTAL_URL || 'https://direct-tribute-502305-q5.web.app') + '/#/candidate-upload?token=' + token;
+          invites.push({ name: sub.candidate_name, email: candEmail, subject: 'Please upload your resume — ' + (sub.job_title || 'a role'), body: 'Dear ' + sub.candidate_name + ',\n\nYou have been shortlisted for ' + (sub.job_title || 'a role') + '. Please upload your resume here:\n' + link + '\n\nBest regards,\nRecruit 360 Team' });
+        }
+      }
+    }
+    return res.json({ ok: true, count: submission_ids.length, decision, invites });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- Update CTC AFTER the interview process ----------
+app.patch('/submissions/:id/ctc', async (req, res) => {
+  try {
+    const { current_ctc, expected_ctc } = req.body;
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS current_ctc TEXT');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS expected_ctc TEXT');
+    await pool.query('UPDATE submissions SET current_ctc = COALESCE($1,current_ctc), expected_ctc = COALESCE($2,expected_ctc), last_updated = NOW() WHERE submission_id = $3', [current_ctc || null, expected_ctc || null, req.params.id]);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
 const PORT = process.env.PORT || 8080;
