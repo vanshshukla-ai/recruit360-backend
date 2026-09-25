@@ -915,28 +915,23 @@ app.patch('/submissions/:id/interview', async (req, res) => {
     if (!outcome && !schedulable.includes(sub.status)) {
       return res.status(400).json({ error: 'The candidate is not at a stage where an interview/call can be scheduled.' });
     }
-    let status = 'INTERVIEW_SCHEDULED';
-    if (outcome === 'done') status = 'INTERVIEWED';
-
-    // Generate a meeting link (demo — a Google Meet style link)
+    // Generate a meeting link (Google Meet style) — do NOT change the stage; stages advance via the step buttons.
     const meetCode = Math.random().toString(36).slice(2, 5) + '-' + Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 5);
-    const interview_link = outcome === 'done' ? undefined : 'https://meet.google.com/' + meetCode;
+    const interview_link = 'https://meet.google.com/' + meetCode;
 
-    if (interview_link) {
-      await pool.query(
-        'UPDATE submissions SET interview_date = $1, interview_notes = $2, interview_link = $3, status = $4, last_updated = NOW() WHERE submission_id = $5',
-        [interview_date || null, interview_notes || '', interview_link, status, req.params.id]
-      );
-      // Simulate sending the interview invite email (recorded as a notification)
-      await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: 'Interview scheduled for ' + (sub.job_title || 'a role') + (sub.client_name ? ' at ' + sub.client_name : '') + (interview_date ? ' on ' + interview_date : '') + '. Meeting link: ' + interview_link });
-      await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by, type: 'INTERVIEW', message: 'Interview invite sent to ' + sub.candidate_name + ' for ' + (sub.job_title || 'a role') + '.' });
-    } else {
-      await pool.query(
-        'UPDATE submissions SET interview_notes = $1, status = $2, last_updated = NOW() WHERE submission_id = $3',
-        [interview_notes || '', status, req.params.id]
-      );
-    }
-    return res.json({ ok: true, submission_id: req.params.id, status, interview_link: interview_link || null, email_sent: !!interview_link });
+    // Build the email content for the candidate (returned so the UI can open mailto)
+    const candEmail = (sub.candidate_id || '').toLowerCase() + '@example.com';
+    const emailSubject = 'Your interview is scheduled — ' + (sub.job_title || 'a role');
+    const emailBody = 'Dear ' + (sub.candidate_name || 'Candidate') + ',\n\nYour interview' + (sub.client_name ? ' with ' + sub.client_name : '') + ' has been scheduled' + (interview_date ? ' for ' + interview_date : '') + '.\n\nPlease join using this link:\n' + interview_link + '\n\nBest regards,\nRecruit 360 Team';
+
+    await pool.query(
+      'UPDATE submissions SET interview_date = $1, interview_notes = $2, interview_link = $3, last_updated = NOW() WHERE submission_id = $4',
+      [interview_date || null, interview_notes || '', interview_link, req.params.id]
+    );
+    try {
+      await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: 'Interview scheduled for ' + (sub.job_title || 'a role') + (interview_date ? ' on ' + interview_date : '') + '. Link: ' + interview_link });
+    } catch(e){}
+    return res.json({ ok: true, submission_id: req.params.id, interview_link, email_sent: true, emailSubject, emailBody, candidateEmail: candEmail });
   } catch (err) {
     return res.status(500).json({ error: 'Could not update interview', detail: err.message });
   }
@@ -1640,10 +1635,12 @@ async function bqQuery(sql) {
 }
 
 // The main data agent — LLM writes SQL, we run it on BigQuery.
-async function agentQueryData(question) {
+async function agentQueryData(question, role, history) {
   const wantAll = /(show all|list all|all of them|everyone|every candidate|full list|show more|all candidates|complete list|entire list|see all|view all)/i.test(question);
   const listLimit = wantAll ? 500 : 50;
-  const prompt = `Write ONE efficient BigQuery SELECT (only SQL, no fences).
+  const roleHint = role === 'recruiter' ? 'The user is a recruiter asking about candidates/jobs.' : role === 'hiring_manager' ? 'The user is a hiring manager.' : role === 'admin' ? 'The user is an admin with full access.' : '';
+  const ctx = (history || []).slice(-4).map(h => `${h.role}: ${h.text}`).join(' | ');
+  const prompt = `Write ONE efficient BigQuery SELECT (only SQL, no fences). ${roleHint}${ctx ? ' Recent context: ' + ctx : ''}
 Rules: select only needed columns (never SELECT *). For a list, add LIMIT ${listLimit} at the end. For a count/total use COUNT(*) with no LIMIT. Use COUNT/SUM/AVG for totals, GROUP BY for 'per/by/each/breakdown'. Use ORDER BY DESC + LIMIT for 'top/most/highest'. Text filters use LOWER(col) LIKE LOWER('%v%'). Map pipeline stages to visa_status IN(...). Use candidates.experience_years for experience. Prefix tables with \`${BQ_DS}.\`.
 ${BQ_SCHEMA}
 Question: ${question}
@@ -1690,37 +1687,42 @@ function roleScope(role) {
   return 'The user is a platform user.';
 }
 
-// ---------- THE ASSISTANT ENDPOINT ----------
+// ---------- THE ASSISTANT ENDPOINT (accurate, role-scoped, grounded) ----------
 app.post('/assistant/ask', async (req, res) => {
   try {
     const { question, role, history } = req.body;
     if (!question) return res.status(400).json({ error: 'question required' });
+    const q = question.toLowerCase();
 
-    // 1) Router: which agent does this need?
-    const routePrompt = `Classify this recruitment question into ONE tool and extract any argument. Reply with JSON only: {"tool":"data|visa_fix|urgency","arg":"..."}.
-- "visa_fix" if it asks to fix/remediate a rejected visa for a candidate id (arg = the candidate id like C2013).
-- "urgency" if it asks for urgent/at-risk/AWOL candidates (arg = number or empty).
-- "data" for everything else (counts, lists, filters, jobs, submissions, placements, visa status counts).
-Question: ${question}`;
-    let route = { tool: 'data', arg: '' };
-    try {
-      const rg = await genModel.generateContent(routePrompt);
-      const raw = rg.response.candidates[0].content.parts[0].text.replace(/```json|```/g, '').trim();
-      route = JSON.parse(raw);
-    } catch (e) { route = { tool: 'data', arg: '' }; }
+    // --- Fast intent detection (reliable keyword routing) ---
+    const idMatch = question.match(/\bC\d{4}\b/i);
+    const isVisaFix = /(fix|remediat|rejection|what.?s wrong|how to fix|resolve).*(visa)|visa.*(fix|reject)/i.test(q) && idMatch;
+    const isUrgency = /(urgent|urgency|at.?risk|awol|not reported|priority candidates|who needs attention)/i.test(q);
 
-    // 2) Run the chosen agent
-    let toolResult = '', agentName = '';
-    if (route.tool === 'visa_fix') { toolResult = await agentVisaFix(route.arg); agentName = 'Visa Fix-It'; }
-    else if (route.tool === 'urgency') { toolResult = await agentUrgency(route.arg); agentName = 'Urgency Watch'; }
-    else { const r = await agentQueryData(question); toolResult = r.text; agentName = 'Data Query'; }
+    let toolResult = '', agentName = '', rows = [];
+    if (isVisaFix) {
+      toolResult = await agentVisaFix(idMatch[0]); agentName = 'Visa Fix-It';
+    } else if (isUrgency) {
+      toolResult = await agentUrgency(10); agentName = 'Urgency Watch';
+    } else {
+      // DATA agent — generate SQL scoped by role, run on BigQuery, answer FROM THE ROWS.
+      const r = await agentQueryData(question, role, history);
+      toolResult = r.text; rows = r.rows; agentName = 'Data Query';
+    }
 
-    // 3) Compose the final answer with rules + role scope + memory
-    const hist = (history || []).slice(-6).map(h => `${h.role === 'user' ? 'User' : 'Assistant'}: ${h.text}`).join('\n');
-    const finalPrompt = `${ASSISTANT_RULES}\n${roleScope(role)}\n\n${hist ? 'Recent conversation:\n' + hist + '\n\n' : ''}TOOL RESULT (${agentName}):\n${toolResult}\n\nUSER QUESTION: ${question}\n\nWrite the answer for the user, grounded ONLY in the tool result above. If the tool result is data, summarise it clearly.`;
+    // Compose a clean answer that faithfully reflects the tool result (no invention).
+    const scope = role === 'admin' ? 'admin (full visibility)' : role === 'hiring_manager' ? 'hiring manager' : role === 'recruiter' ? 'recruiter' : 'user';
+    const finalPrompt = `You are the Recruit 360 AI assistant answering a ${scope}. Below is the exact result from the database for the user's question. Answer the user clearly and directly using ONLY this result — never add or invent names, numbers or candidates that are not in it. If the result says none were found, say clearly that there are none. Keep it concise and professional. If the result is a list, present it readably.
+
+DATABASE RESULT:
+${toolResult}
+
+USER QUESTION: ${question}
+
+ANSWER:`;
     const finalGen = await genModel.generateContent(finalPrompt);
     const answer = finalGen.response.candidates[0].content.parts[0].text.trim();
-    return res.json({ answer, agent: agentName, role });
+    return res.json({ answer, agent: agentName });
   } catch (e) { return res.status(500).json({ error: 'Assistant error', detail: e.message }); }
 });
 
