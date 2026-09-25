@@ -1669,13 +1669,16 @@ submissions(submission_id, candidate_id, candidate_name, job_id, job_title, clie
   -- statuses: PENDING_HM_APPROVAL, SUBMITTED, RECRUITER_CALL, HR_INTERVIEW, CLIENT_INTERVIEW, OFFER, PLACED, REJECTED
 app_users(user_id, full_name, email, role, user_group)  -- roles: admin, hiring_manager, recruiter
 clients(client_id, client_name, country, industry)`;
-  const prompt = `Write ONE PostgreSQL SELECT (only SQL, no fences, no trailing semicolon). Use COUNT(*) for counts. Use ILIKE for text. Never SELECT * ; select only needed columns and LIMIT 50 for lists.
+  const prompt = `Write ONE plain PostgreSQL SELECT statement only — no explanation, no code fences, no trailing semicolon, no ':' named parameters, no '::' type casts. Use COUNT(*) for counts, ILIKE for text matching, and LIMIT 50 for lists (never SELECT *). Write real literal values directly in the WHERE clause.
 ${schema}
 Question: ${question}
 SQL:`;
   const gen = await genModel.generateContent(prompt);
-  let sql = gen.response.candidates[0].content.parts[0].text.replace(/^```(?:sql)?|```$/gim, '').trim().replace(/;+$/,'');
-  if (!/^select/i.test(sql) || /\b(insert|update|delete|drop|alter|create)\b/i.test(sql)) return { text: 'Blocked (read-only).', rows: [] };
+  let sql = gen.response.candidates[0].content.parts[0].text.replace(/```sql/gi,'').replace(/```/g,'').trim().replace(/;+\s*$/,'').trim();
+  // take only the first statement / SELECT onward
+  const selIdx = sql.toLowerCase().indexOf('select');
+  if (selIdx > 0) sql = sql.slice(selIdx);
+  if (!/^select/i.test(sql) || /\b(insert|update|delete|drop|alter|create)\b/i.test(sql)) return { text: 'Could not build a safe query for that.', rows: [] };
   try {
     const { rows } = await pool.query(sql);
     if (!rows.length) return { text: 'No records found for this in the live database.', rows: [] };
@@ -1838,6 +1841,35 @@ app.patch('/submissions/:id/ctc', async (req, res) => {
     await pool.query('UPDATE submissions SET current_ctc = COALESCE($1,current_ctc), expected_ctc = COALESCE($2,expected_ctc), last_updated = NOW() WHERE submission_id = $3', [current_ctc || null, expected_ctc || null, req.params.id]);
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- VERIFY a candidate document is the CORRECT type (Document AI + Gemini) ----------
+app.post('/documents/verify-type', async (req, res) => {
+  try {
+    const { fileBase64, mimeType, expectedType } = req.body;
+    if (!fileBase64 || !expectedType) return res.status(400).json({ error: 'fileBase64 and expectedType required' });
+    // 1) Read the document text with Document AI
+    let text = '';
+    try {
+      const [result] = await docaiClient.processDocument({ name: PROCESSOR, rawDocument: { content: fileBase64, mimeType: mimeType || 'application/pdf' } });
+      text = (result.document && result.document.text) || '';
+    } catch (e) { return res.status(500).json({ error: 'Could not read the document', detail: e.message }); }
+    if (!text.trim()) return res.json({ verified: false, reason: 'The document could not be read. Please upload a clear scan.' });
+
+    // 2) Ask Gemini to classify + check it matches the expected type
+    const prompt = `You are a document verification checker. A candidate uploaded a document that should be a "${expectedType}".
+Read the extracted text below and decide: does it look like a genuine "${expectedType}"?
+Guidance: A Passport has fields like 'Passport No', 'Republic of India', 'Nationality', 'Date of Birth', 'Place of Issue'. An Aadhaar card has a 12-digit Aadhaar number, 'Unique Identification Authority of India', 'Government of India'. Educational certificates mention a degree/university/marks. Experience letters mention employer/designation/duration.
+Reply ONLY with JSON: {"matches": true/false, "detected": "what document it actually looks like", "reason": "one short sentence"}.
+
+EXTRACTED TEXT:
+${text.slice(0, 4000)}`;
+    const gen = await genModel.generateContent(prompt);
+    let out = gen.response.candidates[0].content.parts[0].text.replace(/```json|```/g, '').trim();
+    let parsed;
+    try { parsed = JSON.parse(out); } catch { parsed = { matches: false, detected: 'unknown', reason: 'Could not classify the document.' }; }
+    return res.json({ verified: !!parsed.matches, detected: parsed.detected || '', reason: parsed.reason || '', expectedType });
+  } catch (e) { return res.status(500).json({ error: 'Verification failed', detail: e.message }); }
 });
 
 const PORT = process.env.PORT || 8080;
