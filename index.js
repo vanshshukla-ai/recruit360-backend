@@ -1738,6 +1738,11 @@ app.post('/assistant/ask', async (req, res) => {
       toolResult = await agentVisaFix(idMatch[0]); agentName = 'Visa Fix-It';
     } else if (isUrgency) {
       toolResult = await agentUrgency(10); agentName = 'Urgency Watch';
+    } else if (/(who needs approv|needs approval|pending approv|awaiting approv|to approve|approval queue|whom.*approve)/i.test(q)) {
+      // Direct, reliable query for pending approvals
+      const pr = await pool.query(`SELECT candidate_name, job_title, client_name FROM submissions WHERE status = 'PENDING_HM_APPROVAL' ORDER BY created_at DESC`);
+      toolResult = pr.rows.length ? ('Candidates awaiting approval (' + pr.rows.length + '):\n' + pr.rows.map(x => '- ' + x.candidate_name + ' for ' + x.job_title + (x.client_name ? ' (' + x.client_name + ')' : '')).join('\n')) : 'There are no candidates awaiting approval right now.';
+      agentName = 'Approvals';
     } else if (isJobsData) {
       const r = await agentSqlData(question, role); toolResult = r.text; rows = r.rows; agentName = 'Jobs & Submissions';
     } else {
