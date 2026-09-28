@@ -927,7 +927,7 @@ app.patch('/submissions/:id/interview', async (req, res) => {
     try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [sub.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
 
     // Build the CANDIDATE email (link + notes) — returned so the UI can open mailto AND logged.
-    const candEmail = (sub.candidate_id || '').toLowerCase() + '@example.com';
+    const candEmail = candidateEmail(sub.candidate_id);
     const emailSubject = 'Your ' + roundLabel + ' is scheduled — ' + (sub.job_title || 'a role');
     const emailBody = 'Dear ' + (sub.candidate_name || 'Candidate') + ',\n\n'
       + 'Your ' + roundLabel + (sub.client_name ? ' with ' + sub.client_name : '') + ' for ' + (sub.job_title || 'a role') + ' has been scheduled' + (interview_date ? ' for ' + interview_date : '') + '.\n\n'
@@ -1192,6 +1192,14 @@ app.get('/candidates/:id/history', async (req, res) => {
     return res.status(500).json({ error: 'Could not fetch candidate history', detail: err.message });
   }
 });
+
+// ---------- CANDIDATE EMAIL ----------
+// Demo mode: if DEMO_EMAIL is set, every candidate email routes to that one real
+// inbox so you can show real delivery live. Otherwise it derives the placeholder.
+function candidateEmail(candidate_id) {
+  if (process.env.DEMO_EMAIL) return process.env.DEMO_EMAIL;
+  return (candidate_id || '').toLowerCase() + '@example.com';
+}
 
 // ---------- NOTIFICATIONS ----------
 async function notify({ candidate_id, recipient, type, message }) {
@@ -2009,7 +2017,7 @@ app.post('/submissions/:id/context-action', async (req, res) => {
     const { rows } = await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, status FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     const s = rows[0];
-    const candEmail = (s.candidate_id || '').toLowerCase() + '@example.com';
+    const candEmail = candidateEmail(s.candidate_id);
 
     if (action === 'request_resume') {
       // create onboarding + invite email
@@ -2085,7 +2093,7 @@ app.patch('/submissions/:id/placement-approval', async (req, res) => {
     if (!s) return res.status(404).json({ error: 'not found' });
 
     const cArgs = { submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, sent_by: approver || 'hiring_manager' };
-    const candEmail = (s.candidate_id || '').toLowerCase() + '@example.com';
+    const candEmail = candidateEmail(s.candidate_id);
     if (decision === 'APPROVED') {
       await pool.query("UPDATE submissions SET status = 'PLACED', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
       try { await pool.query("UPDATE candidates SET visa_status = 'PLACEMENT_ACTIVE', last_updated = NOW() WHERE candidate_id = $1", [s.candidate_id]); } catch (e) {}
@@ -2121,7 +2129,7 @@ app.post('/submissions/bulk-approval', async (req, res) => {
         const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name FROM submissions WHERE submission_id = $1', [id])).rows[0];
         if (sub) {
           const token = 'INV-' + Math.random().toString(36).slice(2, 10).toUpperCase();
-          const candEmail = (sub.candidate_id || '').toLowerCase() + '@example.com';
+          const candEmail = candidateEmail(sub.candidate_id);
           try { await pool.query(`INSERT INTO candidate_onboarding (candidate_id, job_id, candidate_name, email, invite_token, onboarding_status) VALUES ($1,$2,$3,$4,$5,'INVITED')`, [sub.candidate_id, sub.job_id || '', sub.candidate_name, candEmail, token]); } catch(e){}
           const link = (process.env.PORTAL_URL || 'https://direct-tribute-502305-q5.web.app') + '/#/candidate-upload?token=' + token;
           invites.push({ name: sub.candidate_name, email: candEmail, subject: 'Please upload your resume — ' + (sub.job_title || 'a role'), body: 'Dear ' + sub.candidate_name + ',\n\nYou have been shortlisted for ' + (sub.job_title || 'a role') + '. Please upload your resume here:\n' + link + '\n\nBest regards,\nRecruit 360 Team' });
