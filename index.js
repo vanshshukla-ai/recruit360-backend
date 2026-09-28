@@ -1040,7 +1040,7 @@ app.get('/jobs/:jobId/board', async (req, res) => {
 
     // 2. Its submissions
     const subRes = await pool.query(
-      'SELECT submission_id, candidate_id, candidate_name, status, screening_notes, submitted_by, created_at FROM submissions WHERE job_id = $1 ORDER BY created_at DESC',
+      'SELECT submission_id, candidate_id, candidate_name, status, screening_notes, submitted_by, resume_received, resume_requested, interview_link, created_at FROM submissions WHERE job_id = $1 ORDER BY created_at DESC',
       [req.params.jobId]
     );
     const submissions = subRes.rows;
@@ -1153,7 +1153,10 @@ app.patch('/submissions/:id/approval', async (req, res) => {
   try {
     const { decision, approver } = req.body; // APPROVED | REJECTED
     const newStatus = decision === 'APPROVED' ? 'SUBMITTED' : 'REJECTED';
-    await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [newStatus, req.params.id]);
+    // On approval, the resume-upload invite is sent, so mark the resume as REQUESTED
+    // (so the recruiter's chip shows "Awaiting resume", not "Request resume" again).
+    if (decision === 'APPROVED') await pool.query('UPDATE submissions SET status = $1, resume_requested = TRUE, last_updated = NOW() WHERE submission_id = $2', [newStatus, req.params.id]);
+    else await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [newStatus, req.params.id]);
     const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
     if (decision === 'APPROVED' && sub) {
       // Approved -> now the candidate can be invited (email + resume upload)
@@ -1349,7 +1352,7 @@ app.get('/jobs/:jobId/full', async (req, res) => {
 
     // 2) Submissions for this job (resume_received included so the row shows it)
     const sRes = await pool.query(
-      `SELECT submission_id, candidate_id, candidate_name, status, screening_notes, submitted_by, resume_received, created_at
+      `SELECT submission_id, candidate_id, candidate_name, status, screening_notes, submitted_by, resume_received, resume_requested, created_at
          FROM submissions WHERE job_id = $1 ORDER BY created_at DESC`,
       [req.params.jobId]
     );
@@ -1723,7 +1726,7 @@ async function agentQueryData(question, role, history) {
   const roleHint = role === 'recruiter' ? 'The user is a recruiter asking about candidates/jobs.' : role === 'hiring_manager' ? 'The user is a hiring manager.' : role === 'admin' ? 'The user is an admin with full access.' : '';
   const ctx = (history || []).slice(-4).map(h => `${h.role}: ${h.text}`).join(' | ');
   const prompt = `Write ONE efficient BigQuery SELECT (only SQL, no fences). ${roleHint}${ctx ? ' Recent context: ' + ctx : ''}
-Rules: select only needed columns (never SELECT *). For a list, add LIMIT ${listLimit} at the end. For a count/total use COUNT(*) with no LIMIT. Use COUNT/SUM/AVG for totals, GROUP BY for 'per/by/each/breakdown'. Use ORDER BY DESC + LIMIT for 'top/most/highest'. Text filters use LOWER(col) LIKE LOWER('%v%'). Map pipeline stages to visa_status IN(...). Use candidates.experience_years for experience. Prefix tables with \`${BQ_DS}.\`.
+Rules: select only needed columns (never SELECT *). ALWAYS alias aggregates with a readable name (e.g. COUNT(*) AS count, never a bare COUNT(*)). For a list, add LIMIT ${listLimit} at the end. For a count/total use COUNT(*) AS count with no LIMIT. Use COUNT/SUM/AVG for totals, GROUP BY for 'per/by/each/breakdown'. Use ORDER BY DESC + LIMIT for 'top/most/highest'. Text filters use LOWER(col) LIKE LOWER('%v%'). Map pipeline stages to visa_status IN(...). Use candidates.experience_years for experience. Prefix tables with \`${BQ_DS}.\`.
 ${BQ_SCHEMA}
 Question: ${question}
 SQL:`;
@@ -1752,7 +1755,7 @@ submissions(submission_id, candidate_id, candidate_name, job_id, job_title, clie
   -- "rejected" = status='REJECTED". Count questions use COUNT(*).
 app_users(user_id, full_name, email, role, user_group)  -- roles: admin, hiring_manager, recruiter
 clients(client_id, client_name, country, industry)`;
-  const prompt = `Write ONE plain PostgreSQL SELECT statement only — no explanation, no code fences, no trailing semicolon, no ':' named parameters, no '::' type casts. Use COUNT(*) for counts, ILIKE for text matching, and LIMIT 50 for lists (never SELECT *). Write real literal values directly in the WHERE clause.
+  const prompt = `Write ONE plain PostgreSQL SELECT statement only — no explanation, no code fences, no trailing semicolon, no ':' named parameters, no '::' type casts. Use COUNT(*) for counts and ALWAYS alias aggregates with a readable name (e.g. COUNT(*) AS count, never a bare COUNT(*)). Use ILIKE for text matching, and LIMIT 50 for lists (never SELECT *). Write real literal values directly in the WHERE clause.
 ${schema}
 Question: ${question}
 SQL:`;
@@ -1920,7 +1923,20 @@ app.post('/assistant/ask', async (req, res) => {
   try {
     const { question, role, history } = req.body;
     if (!question) return res.status(400).json({ error: 'question required' });
-    const q = question.toLowerCase();
+    const q = question.toLowerCase().trim();
+
+    // --- Greetings & vague follow-ups: show a helpful menu instead of guessing ---
+    const menu = (role === 'hiring_manager')
+      ? 'I can help with:\n• What needs my attention today?\n• Why haven’t we found candidates for a role (e.g. Registered Nurse)?\n• Which candidates have visa issues?\n• How many submissions are pending my approval?'
+      : (role === 'admin')
+      ? 'I can help with:\n• Which jobs are idle more than 5 days and what is blocking each?\n• What needs attention today?\n• Which candidates have visa issues?\n• Which placements are at risk?'
+      : 'I can help with:\n• What should I work on today?\n• Which jobs are idle more than 5 days and what is blocking each?\n• Which candidates have visa issues and what is the action?\n• Which of my placements are at risk?';
+    if (/^(hi|hello|hey|yo|hii+|namaste)\b/i.test(q)) {
+      return res.json({ answer: 'Hello! I’m the Recruit 360 assistant. ' + menu, agent: 'Assistant' });
+    }
+    if (q.length < 6 || /^(anything else|what else|more|ok(ay)?|yes|no|hmm+|and\??|next|continue|thanks?|thank you)$/i.test(q)) {
+      return res.json({ answer: 'Sure — here’s what I can do. ' + menu, agent: 'Assistant' });
+    }
 
     // --- Fast intent detection (reliable keyword routing) ---
     const idMatch = question.match(/\bC\d{4}\b/i);
@@ -1969,7 +1985,7 @@ app.post('/assistant/ask', async (req, res) => {
 
     // Compose a clean answer that faithfully reflects the tool result (no invention).
     const scope = role === 'admin' ? 'admin (full visibility)' : role === 'hiring_manager' ? 'hiring manager' : role === 'recruiter' ? 'recruiter' : 'user';
-    const finalPrompt = `You are the Recruit 360 AI assistant answering a ${scope}. Below is the exact result from the database for the user's question. Answer the user clearly and directly using ONLY this result — never add or invent names, numbers or candidates that are not in it. If the result says none were found, say clearly that there are none. Keep it concise and professional. If the result is a list, present it readably.
+    const finalPrompt = `You are the Recruit 360 AI assistant answering a ${scope}. Below is the exact result from the database for the user's question. Answer the user clearly and directly using ONLY this result — never add or invent names, numbers or candidates that are not in it. If the result says none were found, say clearly that there are none. Never output raw column names or aliases like "f0_" or JSON keys — describe the numbers in a plain sentence (e.g. "There are 78 …"). Keep it concise and professional. If the result is a list, present it readably.
 
 DATABASE RESULT:
 ${toolResult}
@@ -1987,13 +2003,15 @@ ANSWER:`;
 // Given a submission's current status, it knows exactly what the recruiter should do next.
 app.get('/submissions/:id/next-action', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, interview_link, resume_received FROM submissions WHERE submission_id = $1', [req.params.id]);
+    const { rows } = await pool.query('SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, interview_link, resume_received, resume_requested FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     const s = rows[0];
-    // SUBMITTED depends on whether the resume has been received.
+    // SUBMITTED depends on the resume state: received -> schedule; already requested -> waiting; else -> request.
     const submittedStep = s.resume_received
       ? { action: 'schedule_call', label: 'Schedule recruiter call', can: true, hint: 'Resume received — set up the 5-min recruiter call.' }
-      : { action: 'request_resume', label: 'Request resume', can: true, hint: 'Approved — send the candidate the resume-upload email.' };
+      : s.resume_requested
+        ? { action: 'await_resume', label: 'Awaiting resume', can: false, hint: 'The resume-upload email was sent — waiting for the candidate to upload.' }
+        : { action: 'request_resume', label: 'Request resume', can: true, hint: 'Send the candidate the resume-upload email.' };
     const MAP = {
       PENDING_HM_APPROVAL:        { action: 'awaiting_approval', label: 'Awaiting approval', can: false, hint: 'The hiring manager needs to approve this submission.' },
       SUBMITTED:                  submittedStep,
@@ -2026,6 +2044,8 @@ app.post('/submissions/:id/context-action', async (req, res) => {
       const link = (process.env.PORTAL_URL || 'https://direct-tribute-502305-q5.web.app') + '/#/candidate-upload?token=' + token;
       const emailSubject = 'Please upload your resume — ' + (s.job_title || 'a role');
       const emailBody = 'Dear ' + s.candidate_name + ',\n\nYou have been shortlisted for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '. Please upload your latest resume and confirm your contact details here:\n\n' + link + '\n\nBest regards,\nRecruit 360 Team';
+      try { await pool.query('UPDATE submissions SET resume_requested = TRUE, last_updated = NOW() WHERE submission_id = $1', [req.params.id]); } catch (e) {}
+      await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody, sent_by: 'recruiter' });
       return res.json({ ok: true, done: 'request_resume', emailSubject, emailBody, candidateEmail: candEmail, link });
     }
     if (action === 'send_summary') {
@@ -2124,7 +2144,8 @@ app.post('/submissions/bulk-approval', async (req, res) => {
     const newStatus = decision === 'APPROVED' ? 'SUBMITTED' : 'REJECTED';
     const invites = [];
     for (const id of submission_ids) {
-      await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [newStatus, id]);
+      if (decision === 'APPROVED') await pool.query('UPDATE submissions SET status = $1, resume_requested = TRUE, last_updated = NOW() WHERE submission_id = $2', [newStatus, id]);
+      else await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [newStatus, id]);
       if (decision === 'APPROVED') {
         const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name FROM submissions WHERE submission_id = $1', [id])).rows[0];
         if (sub) {
@@ -2195,6 +2216,7 @@ async function ensureSchema() {
     await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_flag BOOLEAN DEFAULT FALSE');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications (recipient)');
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_received BOOLEAN DEFAULT FALSE');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_requested BOOLEAN DEFAULT FALSE');
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS current_ctc TEXT');
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS expected_ctc TEXT');
     await pool.query(`CREATE TABLE IF NOT EXISTS user_settings (
