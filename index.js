@@ -811,12 +811,12 @@ app.get('/submissions', async (req, res) => {
 app.patch('/submissions/:id/status', async (req, res) => {
   try {
     const { status, scenario } = req.body;
-    const allowed = ['PENDING_HM_APPROVAL', 'SUBMITTED', 'RECRUITER_CALL', 'HR_INTERVIEW', 'CLIENT_INTERVIEW', 'OFFER', 'PLACED', 'REJECTED',
+    const allowed = ['PENDING_HM_APPROVAL', 'SUBMITTED', 'RECRUITER_CALL', 'HR_INTERVIEW', 'CLIENT_INTERVIEW', 'PENDING_PLACEMENT_APPROVAL', 'OFFER', 'PLACED', 'REJECTED',
                      'CLIENT_CONFIRM', 'TRAINING', 'CLIENT_DECISION', 'CLIENT_REVIEW', 'SHORTLISTED', 'INTERVIEW_SCHEDULED', 'INTERVIEWED', 'OFFERED', 'OFFER_ACCEPTED', 'OFFER_DECLINED'];
     if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status', allowed });
 
     // ENFORCE ORDER: you can only move forward one step, or reject/decline from the current stage.
-    const ORDER = ['PENDING_HM_APPROVAL', 'SUBMITTED', 'RECRUITER_CALL', 'HR_INTERVIEW', 'CLIENT_INTERVIEW', 'OFFER', 'PLACED'];
+    const ORDER = ['PENDING_HM_APPROVAL', 'SUBMITTED', 'RECRUITER_CALL', 'HR_INTERVIEW', 'CLIENT_INTERVIEW', 'PENDING_PLACEMENT_APPROVAL', 'OFFER', 'PLACED'];
     const curRes = await pool.query('SELECT status FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!curRes.rows.length) return res.status(404).json({ error: 'Submission not found' });
     const current = curRes.rows[0].status;
@@ -908,30 +908,47 @@ app.patch('/submissions/:id/interview', async (req, res) => {
   try {
     const { interview_date, interview_notes, outcome } = req.body;
     // Only allow scheduling once the candidate is SHORTLISTED (enforce order)
-    const cur = await pool.query('SELECT status, candidate_id, candidate_name, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id]);
+    const cur = await pool.query('SELECT status, candidate_id, candidate_name, job_id, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!cur.rows.length) return res.status(404).json({ error: 'Submission not found' });
     const sub = cur.rows[0];
-    const schedulable = ['RECRUITER_CALL', 'CLIENT_INTERVIEW', 'SHORTLISTED', 'INTERVIEW_SCHEDULED', 'SUBMITTED', 'CLIENT_CONFIRM', 'TRAINING'];
+    const schedulable = ['RECRUITER_CALL', 'HR_INTERVIEW', 'CLIENT_INTERVIEW', 'SHORTLISTED', 'INTERVIEW_SCHEDULED', 'SUBMITTED', 'CLIENT_CONFIRM', 'TRAINING'];
     if (!outcome && !schedulable.includes(sub.status)) {
       return res.status(400).json({ error: 'The candidate is not at a stage where an interview/call can be scheduled.' });
     }
+    // Which round is this? (label for the emails)
+    const roundLabel = sub.status === 'CLIENT_INTERVIEW' ? 'client interview' : sub.status === 'HR_INTERVIEW' ? 'HR interview' : sub.status === 'RECRUITER_CALL' ? 'recruiter call' : 'interview';
+
     // Generate a meeting link (Google Meet style) — do NOT change the stage; stages advance via the step buttons.
     const meetCode = Math.random().toString(36).slice(2, 5) + '-' + Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 5);
     const interview_link = 'https://meet.google.com/' + meetCode;
 
-    // Build the email content for the candidate (returned so the UI can open mailto)
+    // Hiring manager for this job (to keep everyone in the loop)
+    let hm = '';
+    try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [sub.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
+
+    // Build the CANDIDATE email (link + notes) — returned so the UI can open mailto AND logged.
     const candEmail = (sub.candidate_id || '').toLowerCase() + '@example.com';
-    const emailSubject = 'Your interview is scheduled — ' + (sub.job_title || 'a role');
-    const emailBody = 'Dear ' + (sub.candidate_name || 'Candidate') + ',\n\nYour interview' + (sub.client_name ? ' with ' + sub.client_name : '') + ' has been scheduled' + (interview_date ? ' for ' + interview_date : '') + '.\n\nPlease join using this link:\n' + interview_link + '\n\nBest regards,\nRecruit 360 Team';
+    const emailSubject = 'Your ' + roundLabel + ' is scheduled — ' + (sub.job_title || 'a role');
+    const emailBody = 'Dear ' + (sub.candidate_name || 'Candidate') + ',\n\n'
+      + 'Your ' + roundLabel + (sub.client_name ? ' with ' + sub.client_name : '') + ' for ' + (sub.job_title || 'a role') + ' has been scheduled' + (interview_date ? ' for ' + interview_date : '') + '.\n\n'
+      + 'Join using this link:\n' + interview_link + '\n\n'
+      + (interview_notes ? 'Details / notes:\n' + interview_notes + '\n\n' : '')
+      + 'Please confirm your availability by replying to this email.\n\nBest regards,\nRecruit 360 Team';
 
     await pool.query(
       'UPDATE submissions SET interview_date = $1, interview_notes = $2, interview_link = $3, last_updated = NOW() WHERE submission_id = $4',
       [interview_date || null, interview_notes || '', interview_link, req.params.id]
     );
-    try {
-      await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: 'Interview scheduled for ' + (sub.job_title || 'a role') + (interview_date ? ' on ' + interview_date : '') + '. Link: ' + interview_link });
-    } catch(e){}
-    return res.json({ ok: true, submission_id: req.params.id, interview_link, email_sent: true, emailSubject, emailBody, candidateEmail: candEmail });
+
+    // Record & notify: candidate (email), recruiter + hiring manager (update)
+    const commArgs = { submission_id: req.params.id, candidate_id: sub.candidate_id, job_id: sub.job_id, sent_by: sub.submitted_by || 'recruiter' };
+    await logComm({ ...commArgs, channel: 'EMAIL', to_role: 'candidate', to_name: sub.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody });
+    const updateMsg = sub.candidate_name + '’s ' + roundLabel + ' for ' + (sub.job_title || 'a role') + (interview_date ? ' is set for ' + interview_date : ' has been scheduled') + '. Link: ' + interview_link;
+    if (sub.submitted_by) { await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by, type: 'INTERVIEW', message: updateMsg }); await logComm({ ...commArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: sub.submitted_by, subject: 'Interview scheduled — ' + sub.candidate_name, body: updateMsg }); }
+    if (hm) { await notify({ candidate_id: sub.candidate_id, recipient: hm, type: 'INTERVIEW', message: updateMsg }); await logComm({ ...commArgs, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm, subject: 'Interview scheduled — ' + sub.candidate_name, body: updateMsg }); }
+    await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: 'Your ' + roundLabel + ' is scheduled' + (interview_date ? ' on ' + interview_date : '') + '. Link: ' + interview_link });
+
+    return res.json({ ok: true, submission_id: req.params.id, interview_link, email_sent: true, emailSubject, emailBody, candidateEmail: candEmail, notified: { recruiter: sub.submitted_by || null, hiring_manager: hm || null } });
   } catch (err) {
     return res.status(500).json({ error: 'Could not update interview', detail: err.message });
   }
@@ -1187,6 +1204,37 @@ async function notify({ candidate_id, recipient, type, message }) {
   } catch (e) { /* notifications are best-effort, never block the main action */ }
 }
 
+// ---------- COMMUNICATIONS LOG ----------
+// Every email/update in the recruitment flow is recorded here so the full
+// communication trail (to candidate, recruiter, hiring manager, client) is
+// visible and demonstrable in the app.
+async function logComm({ submission_id, candidate_id, job_id, channel, to_role, to_name, to_email, subject, body, sent_by }) {
+  try {
+    const comm_id = 'CM' + Date.now().toString().slice(-10) + Math.floor(Math.random()*1000);
+    await pool.query(
+      `INSERT INTO communications (comm_id, submission_id, candidate_id, job_id, channel, to_role, to_name, to_email, subject, body, sent_by, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())`,
+      [comm_id, submission_id || null, candidate_id || null, job_id || null, channel || 'EMAIL', to_role || '', to_name || '', to_email || '', subject || '', body || '', sent_by || 'system']
+    );
+    return comm_id;
+  } catch (e) { /* best-effort, never block the main action */ return null; }
+}
+
+// List the communication trail for a submission (or a whole job)
+app.get('/communications', async (req, res) => {
+  try {
+    const { submission_id, job_id } = req.query;
+    let sql = 'SELECT comm_id, submission_id, candidate_id, job_id, channel, to_role, to_name, to_email, subject, body, sent_by, created_at FROM communications';
+    const params = []; const where = [];
+    if (submission_id) { params.push(submission_id); where.push('submission_id = $' + params.length); }
+    if (job_id) { params.push(job_id); where.push('job_id = $' + params.length); }
+    if (where.length) sql += ' WHERE ' + where.join(' AND ');
+    sql += ' ORDER BY created_at ASC LIMIT 200';
+    const { rows } = await pool.query(sql, params);
+    return res.json({ communications: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
 // List notifications (optionally for a recipient)
 app.get('/notifications', async (req, res) => {
   try {
@@ -1213,6 +1261,28 @@ app.patch('/notifications/read', async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: 'Could not update notifications', detail: err.message });
   }
+});
+
+// ---------- USER SETTINGS (preferences incl. email notifications toggle) ----------
+app.get('/settings', async (req, res) => {
+  try {
+    const { user } = req.query;
+    if (!user) return res.json({ settings: {} });
+    const { rows } = await pool.query('SELECT prefs FROM user_settings WHERE user_key = $1', [user]);
+    return res.json({ settings: rows.length ? rows[0].prefs : {} });
+  } catch (e) { return res.json({ settings: {} }); }
+});
+app.patch('/settings', async (req, res) => {
+  try {
+    const { user, prefs } = req.body;
+    if (!user) return res.status(400).json({ error: 'user required' });
+    await pool.query(
+      `INSERT INTO user_settings (user_key, prefs, updated_at) VALUES ($1,$2,NOW())
+       ON CONFLICT (user_key) DO UPDATE SET prefs = EXCLUDED.prefs, updated_at = NOW()`,
+      [user, JSON.stringify(prefs || {})]
+    );
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
 // ---------- CREATE a full job requisition (all mandatory fields) ----------
@@ -1269,25 +1339,27 @@ app.get('/jobs/:jobId/full', async (req, res) => {
     if (!jRes.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jRes.rows[0];
 
-    // 2) Submissions for this job
+    // 2) Submissions for this job (resume_received included so the row shows it)
     const sRes = await pool.query(
-      `SELECT submission_id, candidate_id, candidate_name, status, screening_notes, submitted_by, created_at
+      `SELECT submission_id, candidate_id, candidate_name, status, screening_notes, submitted_by, resume_received, created_at
          FROM submissions WHERE job_id = $1 ORDER BY created_at DESC`,
       [req.params.jobId]
     );
 
-    // 3) Interviews (submissions with interview data)
+    // 3) Interviews — any submission that has entered the interview stages
     const iRes = await pool.query(
       `SELECT submission_id, candidate_name, interview_date, interview_notes, status
-         FROM submissions WHERE job_id = $1 AND status IN ('INTERVIEW_SCHEDULED','INTERVIEWED')
-         ORDER BY interview_date DESC`,
+         FROM submissions WHERE job_id = $1
+           AND status IN ('RECRUITER_CALL','HR_INTERVIEW','CLIENT_INTERVIEW','INTERVIEW_SCHEDULED','INTERVIEWED')
+         ORDER BY interview_date DESC NULLS LAST, created_at DESC`,
       [req.params.jobId]
     );
 
-    // 4) Placements (submissions that reached placed/offer-accepted)
+    // 4) Placements — placed candidates + those awaiting the HM's placement approval
     const pRes = await pool.query(
       `SELECT submission_id, candidate_name, status, created_at
-         FROM submissions WHERE job_id = $1 AND status IN ('OFFER_ACCEPTED','PLACED')
+         FROM submissions WHERE job_id = $1
+           AND status IN ('PENDING_PLACEMENT_APPROVAL','OFFER','OFFER_ACCEPTED','PLACED')
          ORDER BY created_at DESC`,
       [req.params.jobId]
     );
@@ -1710,6 +1782,122 @@ async function agentUrgency(topN) {
   } catch (e) { return 'Urgency query failed: ' + e.message; }
 }
 
+// ============================================================
+// USE-CASE SKILLS — deterministic answers to sir's exact questions.
+// These give accurate, grounded results where plain text-to-SQL is unreliable.
+// ============================================================
+
+// RECRUITER Q1 — jobs sitting idle >5 days + WHY (blocker classification)
+async function skillIdleJobs() {
+  const jobs = (await pool.query(`
+    SELECT j.job_id, j.title, j.client, j.description,
+           (CURRENT_DATE - j.created_date::date) AS age_days,
+           COUNT(s.submission_id) AS subs,
+           COUNT(*) FILTER (WHERE s.status = 'PENDING_HM_APPROVAL') AS pending_hm,
+           COUNT(*) FILTER (WHERE s.status = 'CLIENT_INTERVIEW') AS at_client,
+           COUNT(*) FILTER (WHERE s.status IN ('RECRUITER_CALL','HR_INTERVIEW')) AS interviewing
+      FROM jobs j
+      LEFT JOIN submissions s ON s.job_id = j.job_id
+     WHERE COALESCE(j.status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED')
+     GROUP BY j.job_id, j.title, j.client, j.description, j.created_date
+     HAVING (CURRENT_DATE - j.created_date::date) >= 5
+     ORDER BY age_days DESC LIMIT 25`)).rows;
+  if (!jobs.length) return 'No open jobs have been idle for more than 5 days.';
+  const lines = jobs.map(j => {
+    let blocker;
+    if (Number(j.subs) === 0) blocker = (!j.description || !j.description.trim()) ? 'Missing JD — add the job description so sourcing can start' : 'No candidates sourced yet — source and submit candidates';
+    else if (Number(j.pending_hm) > 0) blocker = `Waiting on hiring-manager approval for ${j.pending_hm} submission(s)`;
+    else if (Number(j.at_client) > 0) blocker = `Awaiting client feedback on ${j.at_client} candidate(s) in client interview`;
+    else if (Number(j.interviewing) > 0) blocker = 'Interview scheduling in progress — move the interviews forward';
+    else blocker = 'No active movement — review and push the pipeline';
+    return `- ${j.title} (${j.client || '—'}, ${j.job_id}) · idle ${j.age_days} days · Blocker: ${blocker}`;
+  });
+  return `Open jobs idle 5+ days (${jobs.length}), each with what is blocking it:\n` + lines.join('\n');
+}
+
+// RECRUITER Q2 — candidates with visa issues / rejections + reason + action
+async function skillVisaIssues() {
+  try {
+    const rows = await bqQuery(`SELECT c.candidate_id, c.full_name, c.role, c.destination_country, w.rejection_codes
+      FROM \`${BQ_DS}.candidates\` c JOIN \`${BQ_DS}.visa_workflows\` w ON w.candidate_id = c.candidate_id
+      WHERE w.decision = 'REJECTED' LIMIT 25`);
+    if (!rows.length) return 'No candidates currently have a rejected visa.';
+    const lines = rows.map(r => {
+      const codes = String(r.rejection_codes || '').split(';').map(c => c.trim()).filter(Boolean);
+      const actions = codes.map(c => REJECTION_FIXES[c] || 'Refer to embassy guidance.').join(' ');
+      return `- ${r.full_name} (${r.candidate_id}, ${r.role} → ${r.destination_country}) · Reason: ${codes.join(', ') || 'unspecified'} · Action: ${actions}`;
+    });
+    return `Candidates with visa rejections (${rows.length}) — reason and action required:\n` + lines.join('\n');
+  } catch (e) { return 'Visa issues lookup failed: ' + e.message; }
+}
+
+// RECRUITER Q3 — "what should I work on today?" (prioritised work queue)
+async function skillRecruiterQueue() {
+  const needResume = (await pool.query(`SELECT candidate_name, job_title FROM submissions WHERE status='SUBMITTED' AND COALESCE(resume_received,FALSE)=FALSE ORDER BY created_at DESC LIMIT 10`)).rows;
+  const toSchedule = (await pool.query(`SELECT candidate_name, job_title, status FROM submissions WHERE status IN ('RECRUITER_CALL','HR_INTERVIEW','CLIENT_INTERVIEW') ORDER BY last_updated ASC NULLS FIRST LIMIT 10`)).rows;
+  const forPlacement = (await pool.query(`SELECT candidate_name, job_title FROM submissions WHERE status='CLIENT_INTERVIEW' ORDER BY last_updated ASC NULLS FIRST LIMIT 10`)).rows;
+  const idle = (await pool.query(`SELECT title, client, (CURRENT_DATE - created_date::date) AS age FROM jobs WHERE COALESCE(status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED') AND (CURRENT_DATE - created_date::date) >= 5 ORDER BY age DESC LIMIT 5`)).rows;
+  const parts = [];
+  if (needResume.length) parts.push(`1) Chase resumes (${needResume.length}): ` + needResume.map(r => r.candidate_name + ' — ' + r.job_title).join('; '));
+  if (toSchedule.length) parts.push(`2) Move interviews forward (${toSchedule.length}): ` + toSchedule.map(r => r.candidate_name + ' (' + (r.status || '').replace(/_/g,' ') + ')').join('; '));
+  if (forPlacement.length) parts.push(`3) Close out client interviews / send for placement approval (${forPlacement.length}): ` + forPlacement.map(r => r.candidate_name).join('; '));
+  if (idle.length) parts.push(`4) Unblock aging jobs (${idle.length}): ` + idle.map(r => r.title + ' — ' + r.age + 'd').join('; '));
+  if (!parts.length) return 'Nothing urgent in your queue right now — pipeline is clear.';
+  return 'Your prioritised work for today:\n' + parts.join('\n');
+}
+
+// RECRUITER complex Q1 — candidates close to placement but blocked
+async function skillPlacementRisk() {
+  const rows = (await pool.query(`SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, COALESCE(resume_received,FALSE) AS resume_received
+     FROM submissions WHERE status IN ('CLIENT_INTERVIEW','PENDING_PLACEMENT_APPROVAL','OFFER') ORDER BY last_updated ASC NULLS FIRST LIMIT 25`)).rows;
+  if (!rows.length) return 'No candidates are near placement right now.';
+  // enrich with visa status from BigQuery in one shot
+  let visaMap = {};
+  try {
+    const ids = rows.map(r => `'${(r.candidate_id||'').replace(/'/g,'')}'`).filter(x => x !== "''");
+    if (ids.length) {
+      const v = await bqQuery(`SELECT candidate_id, visa_status FROM \`${BQ_DS}.candidates\` WHERE candidate_id IN (${ids.join(',')})`);
+      v.forEach(x => { visaMap[x.candidate_id] = x.visa_status; });
+    }
+  } catch (e) {}
+  const lines = rows.map(r => {
+    const visa = visaMap[r.candidate_id];
+    let blocker, who;
+    if (visa && /REJECT/.test(visa)) { blocker = 'Visa rejected — documents incomplete'; who = 'candidate action'; }
+    else if (!r.resume_received && r.status === 'CLIENT_INTERVIEW') { blocker = 'Resume not on file'; who = 'candidate action'; }
+    else if (r.status === 'PENDING_PLACEMENT_APPROVAL' || r.status === 'OFFER') { blocker = 'Placement approval pending'; who = 'hiring-manager action'; }
+    else { blocker = 'Awaiting client decision'; who = 'client / recruiter action'; }
+    return `- ${r.candidate_name} → ${(r.status||'').replace(/_/g,' ')} → ${blocker} → ${who}`;
+  });
+  return `${rows.length} placement(s) at risk — blocker, then who needs to act:\n` + lines.join('\n');
+}
+
+// HIRING MANAGER Q1 — what needs my attention today
+async function skillHMToday() {
+  const subs = (await pool.query(`SELECT candidate_name, job_title, client_name FROM submissions WHERE status='PENDING_HM_APPROVAL' ORDER BY created_at DESC LIMIT 15`)).rows;
+  const placements = (await pool.query(`SELECT candidate_name, job_title, client_name FROM submissions WHERE status='PENDING_PLACEMENT_APPROVAL' ORDER BY created_at DESC LIMIT 15`)).rows;
+  const parts = [];
+  parts.push(`Submission approvals waiting (${subs.length})` + (subs.length ? ':\n' + subs.map(s => '  - ' + s.candidate_name + ' for ' + s.job_title + (s.client_name ? ' (' + s.client_name + ')' : '')).join('\n') : ' — none.'));
+  parts.push(`Placement approvals waiting (${placements.length})` + (placements.length ? ':\n' + placements.map(s => '  - ' + s.candidate_name + ' for ' + s.job_title + (s.client_name ? ' (' + s.client_name + ')' : '')).join('\n') : ' — none.'));
+  return 'What needs your attention today:\n' + parts.join('\n');
+}
+
+// HIRING MANAGER Q2 — why haven't we found candidates for this role?
+async function skillWhyNoCandidates(question) {
+  const roles = ['Software Engineer','Registered Nurse','Data Engineer','Cloud Architect','DevOps Engineer','Data Analyst','QA Engineer','Mechanical Engineer'];
+  const found = roles.find(r => question.toLowerCase().includes(r.toLowerCase()));
+  if (!found) return null; // let the fallback handle it
+  try {
+    const total = (await bqQuery(`SELECT COUNT(*) AS n FROM \`${BQ_DS}.candidates\` WHERE LOWER(role)=LOWER('${found}')`))[0]?.n || 0;
+    const rejected = (await bqQuery(`SELECT COUNT(*) AS n FROM \`${BQ_DS}.candidates\` WHERE LOWER(role)=LOWER('${found}') AND visa_status='VISA_REJECTED'`))[0]?.n || 0;
+    const ready = (await bqQuery(`SELECT COUNT(*) AS n FROM \`${BQ_DS}.candidates\` WHERE LOWER(role)=LOWER('${found}') AND visa_status IN ('TRAINING_COMPLETE','VISA_APPROVED','PLACEMENT_ACTIVE')`))[0]?.n || 0;
+    return `Feasibility for ${found}: ${total} candidates in the pool, ${ready} are placement-ready, ${rejected} have a visa rejection. ` +
+      (Number(total) === 0 ? 'The pool is empty for this role — it is a skill-scarcity problem; widen sourcing or relax location/rate.' :
+       Number(ready) === 0 ? 'Candidates exist but none are placement-ready yet (training/visa in progress).' :
+       'There is a ready pool — the gap is likely matching or client feedback, not supply.');
+  } catch (e) { return null; }
+}
+
 const ASSISTANT_RULES = `You are the Recruit 360 AI Assistant. Ground every answer in the data provided by the tools; never invent a candidate name or ID. If a tool returns nothing, say so plainly — do not fabricate. Answer the exact question directly and answer every part of a multi-part question. origin_city = current Indian city; destination_country = where they go (never confuse). Placement probability is a model estimate (0-1), not a guarantee. You inform, you do not decide — never tell the user to hire/reject a specific candidate. You only help with Recruit 360 recruitment data; politely decline off-topic questions. Be concise and professional.`;
 
 function roleScope(role) {
@@ -1734,8 +1922,29 @@ app.post('/assistant/ask', async (req, res) => {
     let toolResult = '', agentName = '', rows = [];
     // Route: jobs/submissions/approvals/placements -> Cloud SQL (live website data). Candidates/visa -> BigQuery.
     const isJobsData = /(open job|jobs\b|job posting|requisition|submission|submitted|approv|pending|awaiting|assigned|my job|placement|placed|offer|interview|recruiter call|hr round|shortlist|reject)/i.test(q);
+
+    // --- Use-case skills (sir's exact questions) — checked first for reliable answers ---
+    const isIdleJobs = /((idle|sitting idle|stuck|blocked|blocker|not moving|no movement|aging|ageing)[^.]*\b(job|jobs|requisition)|which jobs[^.]*(idle|blocked|stuck|blocking))/i.test(q);
+    const isVisaIssues = /(visa (issue|problem|reject)|rejections?|who[^.]*visa|candidates[^.]*visa[^.]*(issue|reject))/i.test(q) && !idMatch;
+    const isWorkToday = /(work on today|what should i (do|work)|my (work|queue|priorities|priority)|today.?s (work|priorities|tasks)|prioriti[sz]e[^.]*today|need[^.]*my attention|what needs my attention)/i.test(q);
+    const isPlacementRisk = /(close to placement|near placement|placement[^.]*(risk|blocker|block)|at risk[^.]*placement|placements? at risk)/i.test(q);
+    const isWhyNoCand = /(why[^.]*(no|haven.?t|not)[^.]*candidat|why[^.]*can.?t[^.]*find|feasibility)/i.test(q);
+
     if (isVisaFix) {
       toolResult = await agentVisaFix(idMatch[0]); agentName = 'Visa Fix-It';
+    } else if (isIdleJobs) {
+      toolResult = await skillIdleJobs(); agentName = 'Idle & Blocked Jobs';
+    } else if (isPlacementRisk) {
+      toolResult = await skillPlacementRisk(); agentName = 'Placement Risk';
+    } else if (isWorkToday) {
+      toolResult = (role === 'hiring_manager' || role === 'admin') ? await skillHMToday() : await skillRecruiterQueue();
+      agentName = 'My Work Today';
+    } else if (isVisaIssues) {
+      toolResult = await skillVisaIssues(); agentName = 'Visa Issues';
+    } else if (isWhyNoCand) {
+      const r = await skillWhyNoCandidates(question);
+      if (r) { toolResult = r; agentName = 'Role Feasibility'; }
+      else { const rr = await agentQueryData(question, role, history); toolResult = rr.text; rows = rr.rows; agentName = 'Candidate Data'; }
     } else if (isUrgency) {
       toolResult = await agentUrgency(10); agentName = 'Urgency Watch';
     } else if (/(who needs approv|needs approval|pending approv|awaiting approv|to approve|approval queue|whom.*approve)/i.test(q)) {
@@ -1773,15 +1982,20 @@ app.get('/submissions/:id/next-action', async (req, res) => {
     const { rows } = await pool.query('SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, interview_link, resume_received FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     const s = rows[0];
+    // SUBMITTED depends on whether the resume has been received.
+    const submittedStep = s.resume_received
+      ? { action: 'schedule_call', label: 'Schedule recruiter call', can: true, hint: 'Resume received — set up the 5-min recruiter call.' }
+      : { action: 'request_resume', label: 'Request resume', can: true, hint: 'Approved — send the candidate the resume-upload email.' };
     const MAP = {
-      PENDING_HM_APPROVAL: { action: 'awaiting_approval', label: 'Awaiting HM approval', can: false, hint: 'The hiring manager needs to approve this candidate.' },
-      SUBMITTED:          { action: 'request_resume', label: 'Send resume request', can: true, hint: 'Approved — send the candidate the resume-upload email.' },
-      RECRUITER_CALL:     { action: 'schedule_call', label: 'Schedule recruiter call', can: true, hint: 'Set up the 5-min recruiter call and email the link.' },
-      HR_INTERVIEW:       { action: 'schedule_hr', label: 'Schedule HR interview', can: true, hint: 'Book the HR round and notify the candidate.' },
-      CLIENT_INTERVIEW:   { action: 'schedule_client', label: 'Schedule client interview', can: true, hint: 'Book the client interview and share the summary.' },
-      OFFER:              { action: 'send_offer', label: 'Send offer', can: true, hint: 'Release the offer to the candidate.' },
-      PLACED:             { action: 'done', label: 'Placed', can: false, hint: 'This candidate is placed.' },
-      REJECTED:           { action: 'done', label: 'Rejected', can: false, hint: 'This candidate was rejected.' },
+      PENDING_HM_APPROVAL:        { action: 'awaiting_approval', label: 'Awaiting approval', can: false, hint: 'The hiring manager needs to approve this submission.' },
+      SUBMITTED:                  submittedStep,
+      RECRUITER_CALL:             { action: 'schedule_hr', label: 'Schedule HR interview', can: true, hint: 'Book the HR round and notify the candidate.' },
+      HR_INTERVIEW:               { action: 'schedule_client', label: 'Schedule client interview', can: true, hint: 'Book the client interview and share the summary.' },
+      CLIENT_INTERVIEW:           { action: 'request_placement', label: 'Send for placement approval', can: true, hint: 'Client interview done — send to the hiring manager for placement approval.' },
+      PENDING_PLACEMENT_APPROVAL: { action: 'await_placement', label: 'Awaiting placement approval', can: false, hint: 'Placement approval is pending with the hiring manager.' },
+      OFFER:                      { action: 'await_placement', label: 'Awaiting placement approval', can: false, hint: 'Placement approval is pending with the hiring manager.' },
+      PLACED:                     { action: 'done', label: 'Placed', can: false, hint: 'This candidate is placed.' },
+      REJECTED:                   { action: 'done', label: 'Rejected', can: false, hint: 'This candidate was rejected.' },
     };
     const next = MAP[s.status] || { action: 'review', label: 'Review', can: true, hint: 'Review this candidate.' };
     return res.json({ submission: s, next });
@@ -1811,8 +2025,86 @@ app.post('/submissions/:id/context-action', async (req, res) => {
       const emailBody = gen.response.candidates[0].content.parts[0].text.trim();
       return res.json({ ok: true, done: 'send_summary', emailSubject: 'Candidate summary — ' + s.candidate_name, emailBody, candidateEmail: (s.client_name||'client').toLowerCase().replace(/\s+/g,'') + '@client.com' });
     }
-    // For schedule actions, just advance the stage (the UI opens the schedule step)
+
+    // Recruiter sends the candidate to the hiring manager for PLACEMENT approval.
+    // Recruiters cannot place directly — this only queues it for the HM.
+    if (action === 'request_placement') {
+      if (s.status !== 'CLIENT_INTERVIEW') {
+        return res.status(400).json({ error: 'Placement can only be requested after the client interview.' });
+      }
+      await pool.query("UPDATE submissions SET status = 'PENDING_PLACEMENT_APPROVAL', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
+      // Notify the hiring manager for this job
+      let hm = '';
+      try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
+      const hmMsg = `Placement approval needed: ${s.candidate_name} for ${s.job_title || 'a role'}${s.client_name ? ' (' + s.client_name + ')' : ''}.`;
+      await notify({ candidate_id: s.candidate_id, recipient: hm || 'hiring_manager', type: 'PLACEMENT_APPROVAL', message: hmMsg });
+      await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm || 'hiring_manager', subject: 'Placement approval needed — ' + s.candidate_name, body: hmMsg, sent_by: s.submitted_by || 'recruiter' });
+      return res.json({ ok: true, done: 'request_placement', status: 'PENDING_PLACEMENT_APPROVAL', message: 'Sent to the hiring manager for placement approval.' });
+    }
+
+    // Schedule actions advance the pipeline forward by one stage (one-click flow).
+    const ADVANCE = { schedule_call: 'RECRUITER_CALL', schedule_hr: 'HR_INTERVIEW', schedule_client: 'CLIENT_INTERVIEW' };
+    if (ADVANCE[action]) {
+      await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [ADVANCE[action], req.params.id]);
+      const labels = { schedule_call: 'recruiter call', schedule_hr: 'HR interview', schedule_client: 'client interview' };
+      const meetCode = Math.random().toString(36).slice(2, 5) + '-' + Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 5);
+      const interview_link = 'https://meet.google.com/' + meetCode;
+      const emailSubject = 'Your ' + labels[action] + ' is scheduled — ' + (s.job_title || 'a role');
+      const emailBody = 'Dear ' + s.candidate_name + ',\n\nYour ' + labels[action] + ' for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + ' has been scheduled.\n\nJoin using this link:\n' + interview_link + '\n\nPlease confirm your availability by replying to this email.\n\nBest regards,\nRecruit 360 Team';
+      await pool.query('UPDATE submissions SET interview_link = $1 WHERE submission_id = $2', [interview_link, req.params.id]).catch(() => {});
+      // Record & keep recruiter + hiring manager in the loop
+      let hm2 = '';
+      try { hm2 = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
+      const cArgs = { submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, sent_by: 'recruiter' };
+      await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody });
+      const upd = s.candidate_name + '’s ' + labels[action] + ' for ' + (s.job_title || 'a role') + ' has been scheduled. Link: ' + interview_link;
+      await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: 'Your ' + labels[action] + ' is scheduled. Link: ' + interview_link });
+      if (hm2) { await notify({ candidate_id: s.candidate_id, recipient: hm2, type: 'INTERVIEW', message: upd }); await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm2, subject: 'Interview scheduled — ' + s.candidate_name, body: upd }); }
+      return res.json({ ok: true, done: action, status: ADVANCE[action], interview_link, emailSubject, emailBody, candidateEmail: candEmail });
+    }
+
     return res.json({ ok: true, done: action });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- PLACEMENT APPROVAL (hiring manager only) ----------
+// Recruiters queue placements; the hiring manager approves here.
+app.get('/placements/pending-approval', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, current_ctc, expected_ctc, submitted_by, created_at
+         FROM submissions WHERE status = 'PENDING_PLACEMENT_APPROVAL' ORDER BY created_at DESC`);
+    return res.json({ pending: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/submissions/:id/placement-approval', async (req, res) => {
+  try {
+    const { decision, approver, reason } = req.body; // APPROVED | REJECTED
+    const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (!s) return res.status(404).json({ error: 'not found' });
+
+    const cArgs = { submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, sent_by: approver || 'hiring_manager' };
+    const candEmail = (s.candidate_id || '').toLowerCase() + '@example.com';
+    if (decision === 'APPROVED') {
+      await pool.query("UPDATE submissions SET status = 'PLACED', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
+      try { await pool.query("UPDATE candidates SET visa_status = 'PLACEMENT_ACTIVE', last_updated = NOW() WHERE candidate_id = $1", [s.candidate_id]); } catch (e) {}
+      const recMsg = `Placement APPROVED: ${s.candidate_name} for ${s.job_title || 'a role'}. Proceed to onboarding.`;
+      await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACEMENT_APPROVED', message: recMsg });
+      await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Placement approved — ' + s.candidate_name, body: recMsg });
+      // Congratulations email to the candidate
+      const congratsSubject = 'Congratulations — you have been placed for ' + (s.job_title || 'a role');
+      const congratsBody = 'Dear ' + s.candidate_name + ',\n\nWe are pleased to confirm your placement for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '. Our team will contact you shortly with the onboarding steps.\n\nCongratulations and welcome aboard!\n\nBest regards,\nRecruit 360 Team';
+      await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'PLACED', message: 'Congratulations! You have been placed for ' + (s.job_title || 'a role') + '.' });
+      await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: congratsSubject, body: congratsBody });
+      return res.json({ ok: true, status: 'PLACED', candidateEmail: candEmail, emailSubject: congratsSubject, emailBody: congratsBody });
+    }
+    // Rejected -> send it back to the recruiter at the client-interview stage with a reason
+    await pool.query("UPDATE submissions SET status = 'CLIENT_INTERVIEW', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
+    const rejMsg = `Placement not approved for ${s.candidate_name}${reason ? ': ' + reason : ''}.`;
+    await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACEMENT_REJECTED', message: rejMsg });
+    await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Placement not approved — ' + s.candidate_name, body: rejMsg });
+    return res.json({ ok: true, status: 'CLIENT_INTERVIEW' });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -1880,5 +2172,46 @@ ${text.slice(0, 4000)}`;
   } catch (e) { return res.status(500).json({ error: 'Verification failed', detail: e.message }); }
 });
 
+// ---------- Self-healing schema: make sure supporting tables/columns exist ----------
+async function ensureSchema() {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS notifications (
+      notif_id     TEXT PRIMARY KEY,
+      candidate_id TEXT,
+      recipient    TEXT,
+      type         TEXT,
+      message      TEXT,
+      read_flag    BOOLEAN DEFAULT FALSE,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_flag BOOLEAN DEFAULT FALSE');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications (recipient)');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_received BOOLEAN DEFAULT FALSE');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS current_ctc TEXT');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS expected_ctc TEXT');
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_settings (
+      user_key   TEXT PRIMARY KEY,
+      prefs      JSONB DEFAULT '{}',
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS communications (
+      comm_id       TEXT PRIMARY KEY,
+      submission_id TEXT,
+      candidate_id  TEXT,
+      job_id        TEXT,
+      channel       TEXT,
+      to_role       TEXT,
+      to_name       TEXT,
+      to_email      TEXT,
+      subject       TEXT,
+      body          TEXT,
+      sent_by       TEXT,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_comm_submission ON communications (submission_id)');
+    console.log('Schema ensured.');
+  } catch (e) { console.log('ensureSchema warning:', e.message); }
+}
+
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log('API on ' + PORT));
+app.listen(PORT, () => { console.log('API on ' + PORT); ensureSchema(); });
