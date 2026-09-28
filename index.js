@@ -1950,7 +1950,7 @@ app.post('/assistant/ask', async (req, res) => {
     // --- Use-case skills (sir's exact questions) — checked first for reliable answers ---
     const isIdleJobs = /((idle|sitting idle|stuck|blocked|blocker|not moving|no movement|aging|ageing)[^.]*\b(job|jobs|requisition)|which jobs[^.]*(idle|blocked|stuck|blocking))/i.test(q);
     const isVisaIssues = /(visa (issue|problem|reject)|rejections?|who[^.]*visa|candidates[^.]*visa[^.]*(issue|reject))/i.test(q) && !idMatch;
-    const isWorkToday = /(work on today|what should i (do|work)|my (work|queue|priorities|priority)|today.?s (work|priorities|tasks)|prioriti[sz]e[^.]*today|need[^.]*my attention|what needs my attention)/i.test(q);
+    const isWorkToday = /(work on today|what should i (do|work)|my (work|queue|priorities|priority|tasks|pending)|today.?s (work|priorities|tasks)|prioriti[sz]e[^.]*today|need[^.]*my attention|what needs my attention|pending work|what.?s pending|whats pending|summary of (my )?(work|pending|tasks)|work summary|summari[sz]e (my )?(work|pending|tasks|day))/i.test(q);
     const isPlacementRisk = /(close to placement|near placement|placement[^.]*(risk|blocker|block)|at risk[^.]*placement|placements? at risk)/i.test(q);
     const isWhyNoCand = /(why[^.]*(no|haven.?t|not)[^.]*candidat|why[^.]*can.?t[^.]*find|feasibility)/i.test(q);
 
@@ -1961,7 +1961,9 @@ app.post('/assistant/ask', async (req, res) => {
     } else if (isPlacementRisk) {
       toolResult = await skillPlacementRisk(); agentName = 'Placement Risk';
     } else if (isWorkToday) {
-      toolResult = (role === 'hiring_manager' || role === 'admin') ? await skillHMToday() : await skillRecruiterQueue();
+      if (role === 'hiring_manager') toolResult = await skillHMToday();
+      else if (role === 'admin') { const a = await skillHMToday(); const b = await skillIdleJobs(); toolResult = a + '\n\n' + b; }
+      else toolResult = await skillRecruiterQueue();
       agentName = 'My Work Today';
     } else if (isVisaIssues) {
       toolResult = await skillVisaIssues(); agentName = 'Visa Issues';
@@ -2103,6 +2105,24 @@ app.get('/placements/pending-approval', async (req, res) => {
       `SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, current_ctc, expected_ctc, submitted_by, created_at
          FROM submissions WHERE status = 'PENDING_PLACEMENT_APPROVAL' ORDER BY created_at DESC`);
     return res.json({ pending: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- MANUAL / OFFLINE RESUME (recruiter received it via email/chat/call) ----------
+// sir's flow: recruiter reaches out -> candidate sends resume -> recruiter adds it here.
+app.patch('/submissions/:id/resume', async (req, res) => {
+  try {
+    const { filename, doc_type, pasted_text, source, added_by } = req.body || {};
+    const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (!s) return res.status(404).json({ error: 'not found' });
+    await pool.query('UPDATE submissions SET resume_received = TRUE, resume_requested = TRUE, last_updated = NOW() WHERE submission_id = $1', [req.params.id]);
+    const tag = doc_type || 'Resume';
+    const via = source ? ' (received via ' + source + ')' : '';
+    const body = `${tag} received for ${s.candidate_name}${filename ? ' — ' + filename : ''}${via} and added manually by the recruiter.`
+      + (pasted_text ? '\n\n--- Pasted content ---\n' + String(pasted_text).slice(0, 4000) : '')
+      + '\n\nReady for the recruiter call.';
+    await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'DOCUMENT', to_role: 'recruiter', to_name: added_by || 'recruiter', subject: tag + ' added (offline)', body, sent_by: added_by || 'recruiter' });
+    return res.json({ ok: true, resume_received: true });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
