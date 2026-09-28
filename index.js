@@ -261,6 +261,21 @@ app.post('/candidates/ocr-extract', async (req, res) => {
   }
 });
 
+// Extract candidate details from PASTED text (e.g. an email the candidate sent) using Gemini.
+app.post('/candidates/extract-text', async (req, res) => {
+  try {
+    const { text } = req.body || {};
+    if (!text || !text.trim()) return res.status(400).json({ error: 'text is required' });
+    const prompt = 'Extract candidate details from the text below (it may be an email or a pasted resume) and return ONLY valid JSON with keys: full_name, email, phone, role, origin_city, destination_country, skills, experience_years (a number; if unclear use 0). No markdown, only JSON.\n\nTEXT:\n' + String(text).slice(0, 8000);
+    const gen = await genModel.generateContent(prompt);
+    let out = gen.response.candidates[0].content.parts[0].text.trim().replace(/```json/g, '').replace(/```/g, '').trim();
+    let parsed; try { parsed = JSON.parse(out); } catch { parsed = {}; }
+    return res.json({ fields: parsed });
+  } catch (err) {
+    return res.status(500).json({ error: 'Could not read the text', detail: err.message });
+  }
+});
+
 // Create a candidate (with duplicate check by email)
 app.post('/candidates', async (req, res) => {
   try {
@@ -785,6 +800,57 @@ app.post('/submissions', async (req, res) => {
     return res.json({ submission: { submission_id, candidate_id, candidate_name, job_title, client_name, status: 'SUBMITTED' } });
   } catch (err) {
     return res.status(500).json({ error: 'Could not submit candidate', detail: err.message });
+  }
+});
+
+// ---------- OFFLINE ADD: create a brand-new candidate + submit to a job (empty-pool flow) ----------
+// Recruiter found a real candidate offline, has their resume, and adds them to a job.
+// Enters the SAME pipeline: PENDING_HM_APPROVAL -> approve -> (resume already in) -> interviews.
+app.post('/submissions/offline', async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.candidate_name || !b.job_id) return res.status(400).json({ error: 'candidate_name and job_id are required' });
+    // 1) Create the candidate (or reuse a supplied candidate_id)
+    let candidate_id = b.candidate_id;
+    if (!candidate_id) {
+      candidate_id = 'C' + Date.now().toString().slice(-6);
+      const email = b.email || candidateEmail(candidate_id);
+      try {
+        await pool.query(
+          `INSERT INTO candidates (candidate_id, full_name, email, phone, role, origin_city, destination_country, visa_status, consent_given, recruiter, experience_years, created_at, last_updated)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'INTAKE_PENDING',TRUE,$8,$9,NOW(),NOW())`,
+          [candidate_id, b.candidate_name, email, b.phone || '', b.role || '', b.origin_city || '', b.destination_country || '', b.submitted_by || '', b.experience_years ? Number(b.experience_years) : null]
+        );
+      } catch (e) { /* candidate table optional cols — best effort */ }
+    }
+    // 2) Prevent duplicate on this job
+    const dup = await pool.query('SELECT submission_id FROM submissions WHERE candidate_id = $1 AND job_id = $2', [candidate_id, b.job_id]);
+    if (dup.rows.length) return res.status(409).json({ error: 'duplicate', message: 'This candidate is already on this job.' });
+    // 3) Create the submission INTO the approval pipeline.
+    //    Offline add (recruiter has the resume) -> resume already in. Pool pick -> resume still needed.
+    const hasResume = b.has_resume !== false;
+    const submission_id = 'SUB' + Date.now().toString().slice(-10);
+    await pool.query(
+      `INSERT INTO submissions (submission_id, candidate_id, candidate_name, job_id, job_title, client_name, status, screening_notes, submitted_by, resume_received, resume_requested, created_at, last_updated)
+       VALUES ($1,$2,$3,$4,$5,$6,'PENDING_HM_APPROVAL',$7,$8,$9,$9,NOW(),NOW())`,
+      [submission_id, candidate_id, b.candidate_name, b.job_id, b.job_title || '', b.client_name || '', b.screening_notes || '', b.submitted_by || 'recruiter', hasResume]
+    );
+    // 4) Log the offline document/resume (only when the recruiter actually added one)
+    if (hasResume) {
+      await logComm({ submission_id, candidate_id, job_id: b.job_id, channel: 'DOCUMENT', to_role: 'recruiter', to_name: b.submitted_by || 'recruiter',
+        subject: (b.doc_type || 'Resume') + ' added (offline)',
+        body: `${b.doc_type || 'Resume'} for ${b.candidate_name}${b.source ? ' (received via ' + b.source + ')' : ''} added while creating the submission.` + (b.resume_text ? '\n\n--- Pasted content ---\n' + String(b.resume_text).slice(0, 4000) : ''),
+        sent_by: b.submitted_by || 'recruiter' });
+    }
+    // 5) Notify the hiring manager that a new candidate (with resume) needs review
+    let hm = '';
+    try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [b.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
+    const hmMsg = `New candidate for review: ${b.candidate_name} for ${b.job_title || 'a role'}${b.client_name ? ' (' + b.client_name + ')' : ''}${hasResume ? ' — resume attached' : ''}.`;
+    await notify({ candidate_id, recipient: hm || 'hiring_manager', type: 'CANDIDATE_REVIEW', message: hmMsg });
+    await logComm({ submission_id, candidate_id, job_id: b.job_id, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm || 'hiring_manager', subject: 'Candidate needs review — ' + b.candidate_name, body: hmMsg, sent_by: b.submitted_by || 'recruiter' });
+    return res.json({ ok: true, submission: { submission_id, candidate_id, candidate_name: b.candidate_name, status: 'PENDING_HM_APPROVAL' } });
+  } catch (err) {
+    return res.status(500).json({ error: 'Could not add candidate', detail: err.message });
   }
 });
 
