@@ -1801,7 +1801,7 @@ Question: ${question}
 SQL:`;
   const gen = await genModel.generateContent(prompt);
   let sql = gen.response.candidates[0].content.parts[0].text.replace(/^```(?:sql)?|```$/gim, '').trim();
-  if (!_readonlySQL(sql)) return { text: 'That request is blocked (read-only guard).', rows: [] };
+  if (!_readonlySQL(sql)) return { text: 'I could not turn that into a data lookup. Try asking it as a question about candidates, jobs, visas or placements — or say "show it as a table" to reshape the last answer.', rows: [] };
 
   const runAndFormat = (rows) => {
     if (!rows.length) return { text: 'No records match this request in the database. The correct answer is that none were found — I will not invent any.', rows: [] };
@@ -1818,7 +1818,7 @@ SQL:`;
       const fixPrompt = `The following BigQuery SQL failed with this error:\nERROR: ${e1.message}\n\nSQL:\n${sql}\n\n${rules}\nReturn ONLY the corrected SQL (no fences, no explanation).`;
       const fixGen = await genModel.generateContent(fixPrompt);
       let sql2 = fixGen.response.candidates[0].content.parts[0].text.replace(/^```(?:sql)?|```$/gim, '').trim();
-      if (!_readonlySQL(sql2)) return { text: 'Sorry, I could not build a safe query for that. Try rephrasing.', rows: [] };
+      if (!_readonlySQL(sql2)) return { text: 'I could not build a safe query for that. Could you rephrase it — for example, name the role, city or status you want?', rows: [] };
       return runAndFormat(await bqQuery(sql2));
     } catch (e2) {
       return { text: 'Sorry, I could not run that query. Please try rephrasing your question (for example, name the role or the exact field you want).', rows: [] };
@@ -2040,14 +2040,16 @@ async function skillVisaIssues() {
     const rows = await bqQuery(`SELECT c.candidate_id, c.full_name, c.role, c.destination_country, w.rejection_codes
       FROM \`${BQ_DS}.candidates\` c JOIN \`${BQ_DS}.visa_workflows\` w ON w.candidate_id = c.candidate_id
       WHERE w.decision = 'REJECTED' LIMIT 25`);
-    if (!rows.length) return 'No candidates currently have a rejected visa.';
+    if (!rows.length) return { text: 'No candidates currently have a rejected visa.', rows: [] };
+    const out = [];
     const lines = rows.map(r => {
       const codes = String(r.rejection_codes || '').split(';').map(c => c.trim()).filter(Boolean);
       const actions = codes.map(c => REJECTION_FIXES[c] || 'Refer to embassy guidance.').join(' ');
+      out.push({ candidate_id: r.candidate_id, full_name: r.full_name, role: r.role, destination_country: r.destination_country, reason: codes.join(', ') || 'unspecified', action: actions });
       return `- ${r.full_name} (${r.candidate_id}, ${r.role} → ${r.destination_country}) · Reason: ${codes.join(', ') || 'unspecified'} · Action: ${actions}`;
     });
-    return `Candidates with visa rejections (${rows.length}) — reason and action required:\n` + lines.join('\n');
-  } catch (e) { return 'Visa issues lookup failed: ' + e.message; }
+    return { text: `Candidates with visa rejections (${rows.length}) — reason and action required:\n` + lines.join('\n'), rows: out };
+  } catch (e) { return { text: 'Visa issues lookup failed.', rows: [] }; }
 }
 
 // RECRUITER Q3 — "what should I work on today?" (prioritised work queue)
@@ -2146,6 +2148,33 @@ app.post('/assistant/ask', async (req, res) => {
       return res.json({ answer: 'Sure — here’s what I can do. ' + menu, agent: 'Assistant' });
     }
 
+    // --- Formatting / transform follow-ups: reshape the PREVIOUS answer, don't re-query ---
+    // e.g. "give in proper grid view", "list this properly", "summarise", "make it shorter".
+    const hasDataNoun = /(candidate|job|jobs|visa|placement|submission|interview|approv|recruiter|client|billing|training|nurse|engineer|architect|analyst|role|city|country|experience|fresher|senior|urgent|idle|near|likely)/i.test(q);
+    const isReformat = /(grid|table|tabular|column|proper format|properly|reformat|format it|format this|format the|summari[sz]e|give.*summary|shorten|make it short|in detail|expand it|as bullet|as a list|list it|organi[sz]e|nicely|cleaner|clean it|clean this|better format|neat)/i.test(q) && !hasDataNoun;
+    if (isReformat && Array.isArray(history) && history.length) {
+      const lastBot = [...history].reverse().find(h => h && h.role !== 'user' && h.text);
+      if (lastBot) {
+        const wantsTable = /(grid|table|tabular|column)/i.test(q);
+        const instruction = wantsTable
+          ? 'Reformat the previous answer as a clean, aligned text table (a header row, then one record per line with columns separated by " | "). Keep every record. Plain text only.'
+          : 'Reformat the previous answer exactly as the user asks (e.g. shorter, a summary, or a tidy list). Keep the facts identical — do not add or invent anything.';
+        const rp = `You are reformatting your own previous answer for the user. ${instruction}
+Do NOT use markdown asterisks, bold or backticks. Do not add new data. If the previous answer was an error or empty, ask the user to try the question again instead.
+
+USER INSTRUCTION: ${question}
+
+PREVIOUS ANSWER:
+${lastBot.text}
+
+REFORMATTED ANSWER:`;
+        try {
+          const g = await genModel.generateContent(rp);
+          return res.json({ answer: g.response.candidates[0].content.parts[0].text.trim(), agent: 'Formatting' });
+        } catch (e) { /* fall through to normal routing */ }
+      }
+    }
+
     // --- Fast intent detection (reliable keyword routing) ---
     const idMatch = question.match(/\bC\d{4}\b/i);
     const isVisaFix = /(fix|remediat|rejection|what.?s wrong|how to fix|resolve).*(visa)|visa.*(fix|reject)/i.test(q) && idMatch;
@@ -2182,7 +2211,7 @@ app.post('/assistant/ask', async (req, res) => {
       else toolResult = await skillRecruiterQueue();
       agentName = 'My Work Today';
     } else if (isVisaIssues) {
-      toolResult = await skillVisaIssues(); agentName = 'Visa Issues';
+      const r = await skillVisaIssues(); toolResult = r.text; rows = r.rows; agentName = 'Visa Issues';
     } else if (isWhyNoCand) {
       const r = await skillWhyNoCandidates(question);
       if (r) { toolResult = r; agentName = 'Role Feasibility'; }
@@ -2209,8 +2238,9 @@ app.post('/assistant/ask', async (req, res) => {
 
     // Compose a clean answer that faithfully reflects the tool result (no invention).
     const scope = role === 'admin' ? 'admin (full visibility)' : role === 'hiring_manager' ? 'hiring manager' : role === 'recruiter' ? 'recruiter' : 'user';
-    const finalPrompt = `You are the Recruit 360 AI assistant answering a ${scope}. Below is the exact result from the database for the user's question. Answer the user clearly and directly using ONLY this result — never add or invent names, numbers or candidates that are not in it. If the result says none were found, say clearly that there are none. Never output raw column names or aliases like "f0_" or JSON keys — describe the numbers in a plain sentence (e.g. "There are 78 …").
-FORMAT STRICTLY as plain text for a chat bubble: do NOT use markdown, asterisks (*), bold (**), backticks or headings. For a list, put each item on its own line starting with "• ". Keep lines short and clearly aligned. Be concise and professional.
+    const finalPrompt = `You are the Recruit 360 AI assistant answering a ${scope}. Below is the exact result from the database for the user's question. Answer using ONLY this result — never add or invent names, numbers or candidates that are not in it. If the result says none were found, say clearly that there are none. Never output raw column names or aliases like "f0_" or JSON keys — describe the numbers in a plain sentence (e.g. "There are 78 …"). If the result is an internal error or guard message, do NOT repeat it — instead briefly ask the user to rephrase.
+STRUCTURE: open with ONE short summary sentence that answers the question at a glance (e.g. "You have 12 candidates with visa issues — most need document fixes."), then a blank line, then the details. For a list, put each item on its own line starting with "• ". If a value is a probability/score, briefly note it is a model estimate.
+FORMAT as plain text for a chat bubble: do NOT use markdown, asterisks (*), bold (**), backticks or headings. Be concise and professional.
 
 DATABASE RESULT:
 ${toolResult}
@@ -2219,7 +2249,11 @@ USER QUESTION: ${question}
 
 ANSWER:`;
     const finalGen = await genModel.generateContent(finalPrompt);
-    const answer = finalGen.response.candidates[0].content.parts[0].text.trim();
+    let answer = finalGen.response.candidates[0].content.parts[0].text.trim();
+    // Final safety net: never leak internal guard/error phrasing to the user.
+    if (/read-only guard|Query failed|ensureSchema|bqQuery|SELECT \*|\bf0_\b/i.test(answer)) {
+      answer = 'I hit a snag turning that into an answer. Could you rephrase it as a question about candidates, jobs, visas or placements?';
+    }
     // Return rows + agent so the UI can show the "Result data" table and the agent trace.
     return res.json({ answer, agent: agentName, rows: Array.isArray(rows) ? rows.slice(0, 500) : [] });
   } catch (e) { return res.status(500).json({ error: 'Assistant error', detail: e.message }); }
