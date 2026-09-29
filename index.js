@@ -745,12 +745,19 @@ app.post('/submissions/screen', async (req, res) => {
     if (!candidate_id) return res.status(400).json({ error: 'candidate_id is required' });
 
     const cRes = await pool.query('SELECT candidate_id, full_name, role, destination_country, visa_status, experience_years FROM candidates WHERE candidate_id = $1', [candidate_id]);
-    if (!cRes.rows.length) return res.status(404).json({ error: 'Candidate not found' });
-    const c = cRes.rows[0];
+    let c = cRes.rows[0];
+    // Suggested candidates come from the BigQuery pool — fall back there if not in Cloud SQL.
+    if (!c) {
+      try {
+        const rows = await bqQuery(`SELECT candidate_id, full_name, role, destination_country, visa_status, experience_years FROM \`${BQ_DS}.candidates\` WHERE candidate_id = '${(candidate_id || '').replace(/'/g, '')}' LIMIT 1`);
+        if (rows && rows.length) c = rows[0];
+      } catch (e) { /* fall through */ }
+    }
+    if (!c) return res.json({ candidate: { candidate_id }, job: null, checklist: [], readiness: 0, verifiedDocs: 0, note: 'Candidate details not found; you can still submit.' });
 
     let job = null;
     if (job_id) {
-      const jRes = await pool.query('SELECT job_id, title, location, client, openings FROM jobs WHERE job_id = $1', [job_id]);
+      const jRes = await pool.query('SELECT job_id, title, job_location AS location, client, number_of_positions AS openings FROM jobs WHERE job_id = $1', [job_id]);
       if (jRes.rows.length) job = jRes.rows[0];
     }
 
@@ -1867,27 +1874,34 @@ async function agentUrgency(topN) {
 // RECRUITER Q1 — jobs sitting idle >5 days + WHY (blocker classification)
 async function skillIdleJobs() {
   const jobs = (await pool.query(`
-    SELECT j.job_id, j.title, j.client, j.description, j.primary_skills,
+    SELECT j.job_id, j.title, j.client, j.recruiter, j.description, j.primary_skills,
            (CURRENT_DATE - j.created_date::date) AS age_days,
            COUNT(s.submission_id) AS subs,
            COUNT(*) FILTER (WHERE s.status = 'PENDING_HM_APPROVAL') AS pending_hm,
+           COUNT(*) FILTER (WHERE s.status = 'SUBMITTED' AND COALESCE(s.resume_received,FALSE)=FALSE) AS awaiting_resume,
            COUNT(*) FILTER (WHERE s.status = 'CLIENT_INTERVIEW') AS at_client,
+           COUNT(*) FILTER (WHERE s.status = 'PENDING_PLACEMENT_APPROVAL') AS at_placement,
            COUNT(*) FILTER (WHERE s.status IN ('RECRUITER_CALL','HR_INTERVIEW')) AS interviewing
       FROM jobs j
       LEFT JOIN submissions s ON s.job_id = j.job_id
      WHERE COALESCE(j.status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED')
-     GROUP BY j.job_id, j.title, j.client, j.description, j.primary_skills, j.created_date
+     GROUP BY j.job_id, j.title, j.client, j.recruiter, j.description, j.primary_skills, j.created_date
      HAVING (CURRENT_DATE - j.created_date::date) >= 5
      ORDER BY age_days DESC LIMIT 25`)).rows;
   if (!jobs.length) return 'No open jobs have been idle for more than 5 days.';
   const lines = jobs.map(j => {
     let blocker;
-    // JD counts as present if there is a description OR primary skills.
     const hasJD = (j.description && j.description.trim()) || (j.primary_skills && j.primary_skills.trim());
-    if (Number(j.subs) === 0) blocker = !hasJD ? 'Missing JD — add the job description so sourcing can start' : 'No candidates sourced yet — source and submit candidates';
-    else if (Number(j.pending_hm) > 0) blocker = `Waiting on hiring-manager approval for ${j.pending_hm} submission(s)`;
-    else if (Number(j.at_client) > 0) blocker = `Awaiting client feedback on ${j.at_client} candidate(s) in client interview`;
-    else if (Number(j.interviewing) > 0) blocker = 'Interview scheduling in progress — move the interviews forward';
+    const hasRecruiter = j.recruiter && j.recruiter.trim();
+    // Most specific blocker first, so each job reads distinctly.
+    if (!hasJD) blocker = 'Missing JD — add the job description/skills so sourcing can start';
+    else if (Number(j.subs) === 0 && !hasRecruiter) blocker = 'No recruiter assigned — assign a recruiter to start sourcing';
+    else if (Number(j.subs) === 0) blocker = `No candidates sourced in ${j.age_days} days — source & submit candidates`;
+    else if (Number(j.pending_hm) > 0) blocker = `${j.pending_hm} submission(s) waiting on hiring-manager approval`;
+    else if (Number(j.awaiting_resume) > 0) blocker = `${j.awaiting_resume} candidate(s) approved but resume not received`;
+    else if (Number(j.interviewing) > 0) blocker = `${j.interviewing} candidate(s) mid-interview — move the rounds forward`;
+    else if (Number(j.at_client) > 0) blocker = `Awaiting client feedback on ${j.at_client} candidate(s)`;
+    else if (Number(j.at_placement) > 0) blocker = `${j.at_placement} candidate(s) waiting on placement approval`;
     else blocker = 'No active movement — review and push the pipeline';
     return `- ${j.title} (${j.client || '—'}, ${j.job_id}) · idle ${j.age_days} days · Blocker: ${blocker}`;
   });
