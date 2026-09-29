@@ -570,7 +570,14 @@ app.post('/documents/validate', async (req, res) => {
 // ---------- SAVED CHATS (persist assistant conversations) ----------
 app.get('/chats', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT chat_id, chat_name, messages, created_at FROM saved_chats ORDER BY created_at DESC LIMIT 50');
+    const ue = (req.query.user_email || '').trim();
+    let rows;
+    if (ue) {
+      // Per-user chats, plus any legacy chats saved before per-user scoping (user_email IS NULL).
+      ({ rows } = await pool.query('SELECT chat_id, chat_name, messages, created_at FROM saved_chats WHERE user_email = $1 OR user_email IS NULL ORDER BY created_at DESC LIMIT 100', [ue]));
+    } else {
+      ({ rows } = await pool.query('SELECT chat_id, chat_name, messages, created_at FROM saved_chats ORDER BY created_at DESC LIMIT 100'));
+    }
     return res.json({ chats: rows });
   } catch (err) {
     return res.status(500).json({ error: 'Could not fetch chats', detail: err.message });
@@ -579,11 +586,11 @@ app.get('/chats', async (req, res) => {
 
 app.post('/chats', async (req, res) => {
   try {
-    const { chat_name, messages } = req.body;
+    const { chat_name, messages, user_email } = req.body;
     if (!chat_name || !messages) return res.status(400).json({ error: 'chat_name and messages are required' });
     const chat_id = 'CHAT' + Date.now().toString().slice(-10);
-    await pool.query('INSERT INTO saved_chats (chat_id, chat_name, messages, created_at) VALUES ($1,$2,$3,NOW())',
-      [chat_id, chat_name, typeof messages === 'string' ? messages : JSON.stringify(messages)]);
+    await pool.query('INSERT INTO saved_chats (chat_id, chat_name, messages, user_email, created_at) VALUES ($1,$2,$3,$4,NOW())',
+      [chat_id, chat_name, typeof messages === 'string' ? messages : JSON.stringify(messages), (user_email || '').trim() || null]);
     return res.json({ chat: { chat_id, chat_name } });
   } catch (err) {
     return res.status(500).json({ error: 'Could not save chat', detail: err.message });
@@ -607,18 +614,6 @@ app.delete('/chats/:id', async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: 'Could not delete chat', detail: err.message });
-  }
-});
-
-// Rename a saved chat
-app.patch('/chats/:id', async (req, res) => {
-  try {
-    const { chat_name } = req.body;
-    if (!chat_name || !chat_name.trim()) return res.status(400).json({ error: 'chat_name is required' });
-    await pool.query('UPDATE saved_chats SET chat_name = $1 WHERE chat_id = $2', [chat_name.trim(), req.params.id]);
-    return res.json({ ok: true, chat_id: req.params.id, chat_name: chat_name.trim() });
-  } catch (err) {
-    return res.status(500).json({ error: 'Could not rename chat', detail: err.message });
   }
 });
 
@@ -1877,9 +1872,68 @@ async function agentVisaFix(candidateId) {
 async function agentUrgency(topN) {
   try {
     const rows = await bqQuery(`SELECT candidate_id, full_name, role, destination_country, visa_status, urgency_score FROM \`${BQ_DS}.candidates\` WHERE visa_status IN ('VISA_REJECTED','REMEDIATION_IN_PROGRESS','NOT_REPORTED') OR urgency_score >= 75 ORDER BY urgency_score DESC LIMIT ${parseInt(topN||10,10)}`);
-    if (!rows.length) return 'No high-urgency candidates right now.';
-    return 'Top urgent / at-risk candidates:\n' + JSON.stringify(rows, null, 1);
-  } catch (e) { return 'Urgency query failed: ' + e.message; }
+    if (!rows.length) return { text: 'No high-urgency candidates right now.', rows: [] };
+    const lines = rows.map(r => `- ${r.full_name} (${r.candidate_id}) — ${r.role} → ${r.destination_country||'—'} · visa ${(r.visa_status||'').replace(/_/g,' ')} · urgency ${r.urgency_score||0}`);
+    return { text: 'Top urgent / at-risk candidates:\n' + lines.join('\n'), rows };
+  } catch (e) { return { text: 'Urgency query failed.', rows: [] }; }
+}
+
+// PREDICT-SCORE — BigQuery ML model: who is most likely to be placed
+async function agentPredictPlacement(topN) {
+  try {
+    const n = parseInt(topN || 10, 10);
+    const sql = `SELECT candidate_id, ROUND((SELECT prob FROM UNNEST(predicted_is_placed_probs) WHERE label=1),3) AS placement_probability
+      FROM ML.PREDICT(MODEL \`${BQ_DS}.placement_predictor\`, (SELECT * FROM \`${BQ_DS}.candidates\`))
+      ORDER BY placement_probability DESC LIMIT ${n}`;
+    const [rows] = await bq.query({ query: sql, location: 'asia-south1' });
+    if (!rows || !rows.length) return { text: 'No placement predictions are available right now.', rows: [] };
+    const ids = rows.map(r => `'${String(r.candidate_id).replace(/'/g,'')}'`).join(',');
+    let info = [];
+    try { info = await bqQuery(`SELECT candidate_id, full_name, role, destination_country FROM \`${BQ_DS}.candidates\` WHERE candidate_id IN (${ids})`); } catch (e) {}
+    const map = {}; info.forEach(x => { map[x.candidate_id] = x; });
+    const merged = rows.map(r => {
+      const c = map[r.candidate_id] || {};
+      return { candidate_id: r.candidate_id, full_name: c.full_name || r.candidate_id, role: c.role || '', destination_country: c.destination_country || '', placement_probability: r.placement_probability };
+    });
+    const lines = merged.map((r, i) => `${i + 1}. ${r.full_name} (${r.candidate_id}) — ${Math.round((r.placement_probability || 0) * 100)}% likely · ${r.role || '—'} → ${r.destination_country || '—'}`);
+    return { text: 'Candidates most likely to be placed, ranked by a model-estimated probability (0-100%, an estimate — not a guarantee, and not tied to a calendar month):\n' + lines.join('\n'), rows: merged };
+  } catch (e) { return { text: 'The placement-prediction model is not available right now.', rows: [] }; }
+}
+
+// SEMANTIC SEARCH — find candidates by MEANING (Vertex embeddings + BigQuery vector search)
+async function agentSemanticMatch(question) {
+  let desc = (question || '').replace(/^\s*(find|show|get|search|list)\s+(me\s+)?(candidates?|people|profiles?|someone)\s*/i, '')
+    .replace(/^(that\s+are\s+|who\s+are\s+|who\s+|that\s+|like\s+|similar\s+to\s+|matching\s+|with\s+)/i, '').trim();
+  if (!desc) desc = question;
+  try {
+    const sql = `SELECT h.base.candidate_id AS candidate_id, c.full_name, c.role, c.destination_country, c.visa_status, c.experience_years, h.distance
+      FROM VECTOR_SEARCH(TABLE \`${BQ_DS}.candidate_embeddings\`, 'embedding',
+        (SELECT ml_generate_embedding_result AS embedding FROM ML.GENERATE_EMBEDDING(MODEL \`${BQ_DS}.text_embedder\`, (SELECT @q AS content))),
+        top_k => 10) AS h
+      JOIN \`${BQ_DS}.candidates\` c ON c.candidate_id = h.base.candidate_id
+      ORDER BY h.distance`;
+    const [rows] = await bq.query({ query: sql, location: 'asia-south1', params: { q: desc } });
+    let good = (rows || []).filter(r => r.distance <= 0.92);
+    if (!good.length) return { text: `No candidates in the database closely match "${desc}". I won't guess — there is no strong match for this request.`, rows: [] };
+    good = good.map(r => ({ candidate_id: r.candidate_id, full_name: r.full_name, role: r.role, destination_country: r.destination_country, visa_status: r.visa_status, experience_years: r.experience_years, match: Math.max(1, Math.min(99, Math.round((1 - r.distance) * 100))) }));
+    const lines = good.map(r => `- ${r.full_name} (${r.candidate_id}) — ${r.role}, ${r.experience_years || 0} yrs → ${r.destination_country || '—'} · ${r.match}% match`);
+    return { text: `Candidates matching "${desc}" by meaning:\n` + lines.join('\n'), rows: good };
+  } catch (e) { return { text: 'Semantic search is not available right now.', rows: [] }; }
+}
+
+// LOCATION — candidates whose CURRENT city (origin_city) is in/near a named city
+async function agentNearCity(question) {
+  const m = (question || '').match(/(?:near|around|close to|within\s+\d+\s*km(?:\s+of)?)\s+([A-Za-z][\w .'-]+)/i);
+  let city = m ? m[1].trim() : '';
+  city = city.replace(/[.?!,]+$/,'').replace(/\b(right now|now|please|currently|today|area|region)\b/gi,'').trim();
+  if (!city) return { text: 'Please name a city, e.g. "candidates near Bengaluru".', rows: [] };
+  try {
+    const rows = await bqQuery(`SELECT candidate_id, full_name, role, origin_city, destination_country, visa_status FROM \`${BQ_DS}.candidates\` WHERE LOWER(origin_city) LIKE LOWER('%${city.replace(/'/g,'')}%') LIMIT 50`);
+    if (!rows.length) return { text: `No candidates currently live in or near ${city}. (origin_city = where a candidate lives now, an Indian city.)`, rows: [] };
+    const lines = rows.slice(0, 10).map(r => `- ${r.full_name} (${r.candidate_id}) — ${r.role}, currently in ${r.origin_city} → going to ${r.destination_country || '—'}`);
+    const note = rows.length > 10 ? `\n\n(Showing 10 of ${rows.length}. Full list in the table below.)` : '';
+    return { text: `Candidates whose current city is in/near ${city}:\n` + lines.join('\n') + note, rows };
+  } catch (e) { return { text: 'City lookup failed.', rows: [] }; }
 }
 
 // ============================================================
@@ -2073,6 +2127,9 @@ app.post('/assistant/ask', async (req, res) => {
     const isPlacementRisk = /(close to placement|near placement|placement[^.]*(risk|blocker|block)|at risk[^.]*placement|placements? at risk)/i.test(q);
     const isWhyNoCand = /(why[^.]*(no|haven.?t|not)[^.]*candidat|why[^.]*can.?t[^.]*find|feasibility)/i.test(q);
     const isBestFit = /(best fit|best candidate|best.*match|top candidate|good fit|suitable candidate|who.?s? (the )?best|which candidate.*best|candidates? (for|suitable for) (a |the )?[a-z])/i.test(q) && !isVisaIssues && !isWhyNoCand;
+    const isPredict = /(likely to be placed|most likely|placement (probability|likelihood|chance|score)|best prospect|who should i prioriti[sz]e|predict placement|placement predict)/i.test(q);
+    const isNearCity = /\b(near|around|close to|within\s+\d+\s*km)\b/i.test(q) && /candidat/i.test(q);
+    const isSemantic = /(candidates? (like|similar to|matching)|find (me )?(someone|people|candidates?) (like|with|who match|matching)|semantic|profiles? (like|matching)|similar profile)/i.test(q);
 
     if (isVisaFix) {
       toolResult = await agentVisaFix(idMatch[0]); agentName = 'Visa Fix-It';
@@ -2095,13 +2152,19 @@ app.post('/assistant/ask', async (req, res) => {
       const r = await skillWhyNoCandidates(question);
       if (r) { toolResult = r; agentName = 'Role Feasibility'; }
       else { const rr = await agentQueryData(question, role, history); toolResult = rr.text; rows = rr.rows; agentName = 'Candidate Data'; }
+    } else if (isPredict) {
+      const r = await agentPredictPlacement(10); toolResult = r.text; rows = r.rows; agentName = 'Placement Prediction';
+    } else if (isNearCity) {
+      const r = await agentNearCity(question); toolResult = r.text; rows = r.rows; agentName = 'Location Match';
+    } else if (isSemantic) {
+      const r = await agentSemanticMatch(question); toolResult = r.text; rows = r.rows; agentName = 'Semantic Match';
     } else if (isUrgency) {
-      toolResult = await agentUrgency(10); agentName = 'Urgency Watch';
+      const r = await agentUrgency(10); toolResult = r.text; rows = r.rows; agentName = 'Urgency Watch';
     } else if (/(who needs approv|needs approval|pending approv|awaiting approv|to approve|approval queue|whom.*approve)/i.test(q)) {
       // Direct, reliable query for pending approvals
       const pr = await pool.query(`SELECT candidate_name, job_title, client_name FROM submissions WHERE status = 'PENDING_HM_APPROVAL' ORDER BY created_at DESC`);
       toolResult = pr.rows.length ? ('Candidates awaiting approval (' + pr.rows.length + '):\n' + pr.rows.map(x => '- ' + x.candidate_name + ' for ' + x.job_title + (x.client_name ? ' (' + x.client_name + ')' : '')).join('\n')) : 'There are no candidates awaiting approval right now.';
-      agentName = 'Approvals';
+      rows = pr.rows; agentName = 'Approvals';
     } else if (isJobsData) {
       const r = await agentSqlData(question, role); toolResult = r.text; rows = r.rows; agentName = 'Jobs & Submissions';
     } else {
@@ -2122,7 +2185,8 @@ USER QUESTION: ${question}
 ANSWER:`;
     const finalGen = await genModel.generateContent(finalPrompt);
     const answer = finalGen.response.candidates[0].content.parts[0].text.trim();
-    return res.json({ answer, agent: agentName });
+    // Return rows + agent so the UI can show the "Result data" table and the agent trace.
+    return res.json({ answer, agent: agentName, rows: Array.isArray(rows) ? rows.slice(0, 500) : [] });
   } catch (e) { return res.status(500).json({ error: 'Assistant error', detail: e.message }); }
 });
 
@@ -2384,6 +2448,16 @@ async function ensureSchema() {
       created_at    TIMESTAMPTZ DEFAULT NOW()
     )`);
     await pool.query('CREATE INDEX IF NOT EXISTS idx_comm_submission ON communications (submission_id)');
+    // Saved assistant chats (per-user). Self-healing so the AI Assistant works on a fresh DB.
+    await pool.query(`CREATE TABLE IF NOT EXISTS saved_chats (
+      chat_id    TEXT PRIMARY KEY,
+      chat_name  TEXT,
+      messages   TEXT,
+      user_email TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pool.query('ALTER TABLE saved_chats ADD COLUMN IF NOT EXISTS user_email TEXT');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_saved_chats_user ON saved_chats (user_email)');
     console.log('Schema ensured.');
   } catch (e) { console.log('ensureSchema warning:', e.message); }
 }
