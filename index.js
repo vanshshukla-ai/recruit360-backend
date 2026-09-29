@@ -1867,7 +1867,7 @@ async function agentUrgency(topN) {
 // RECRUITER Q1 — jobs sitting idle >5 days + WHY (blocker classification)
 async function skillIdleJobs() {
   const jobs = (await pool.query(`
-    SELECT j.job_id, j.title, j.client, j.description,
+    SELECT j.job_id, j.title, j.client, j.description, j.primary_skills,
            (CURRENT_DATE - j.created_date::date) AS age_days,
            COUNT(s.submission_id) AS subs,
            COUNT(*) FILTER (WHERE s.status = 'PENDING_HM_APPROVAL') AS pending_hm,
@@ -1876,13 +1876,15 @@ async function skillIdleJobs() {
       FROM jobs j
       LEFT JOIN submissions s ON s.job_id = j.job_id
      WHERE COALESCE(j.status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED')
-     GROUP BY j.job_id, j.title, j.client, j.description, j.created_date
+     GROUP BY j.job_id, j.title, j.client, j.description, j.primary_skills, j.created_date
      HAVING (CURRENT_DATE - j.created_date::date) >= 5
      ORDER BY age_days DESC LIMIT 25`)).rows;
   if (!jobs.length) return 'No open jobs have been idle for more than 5 days.';
   const lines = jobs.map(j => {
     let blocker;
-    if (Number(j.subs) === 0) blocker = (!j.description || !j.description.trim()) ? 'Missing JD — add the job description so sourcing can start' : 'No candidates sourced yet — source and submit candidates';
+    // JD counts as present if there is a description OR primary skills.
+    const hasJD = (j.description && j.description.trim()) || (j.primary_skills && j.primary_skills.trim());
+    if (Number(j.subs) === 0) blocker = !hasJD ? 'Missing JD — add the job description so sourcing can start' : 'No candidates sourced yet — source and submit candidates';
     else if (Number(j.pending_hm) > 0) blocker = `Waiting on hiring-manager approval for ${j.pending_hm} submission(s)`;
     else if (Number(j.at_client) > 0) blocker = `Awaiting client feedback on ${j.at_client} candidate(s) in client interview`;
     else if (Number(j.interviewing) > 0) blocker = 'Interview scheduling in progress — move the interviews forward';
@@ -2053,7 +2055,8 @@ app.post('/assistant/ask', async (req, res) => {
 
     // Compose a clean answer that faithfully reflects the tool result (no invention).
     const scope = role === 'admin' ? 'admin (full visibility)' : role === 'hiring_manager' ? 'hiring manager' : role === 'recruiter' ? 'recruiter' : 'user';
-    const finalPrompt = `You are the Recruit 360 AI assistant answering a ${scope}. Below is the exact result from the database for the user's question. Answer the user clearly and directly using ONLY this result — never add or invent names, numbers or candidates that are not in it. If the result says none were found, say clearly that there are none. Never output raw column names or aliases like "f0_" or JSON keys — describe the numbers in a plain sentence (e.g. "There are 78 …"). Keep it concise and professional. If the result is a list, present it readably.
+    const finalPrompt = `You are the Recruit 360 AI assistant answering a ${scope}. Below is the exact result from the database for the user's question. Answer the user clearly and directly using ONLY this result — never add or invent names, numbers or candidates that are not in it. If the result says none were found, say clearly that there are none. Never output raw column names or aliases like "f0_" or JSON keys — describe the numbers in a plain sentence (e.g. "There are 78 …").
+FORMAT STRICTLY as plain text for a chat bubble: do NOT use markdown, asterisks (*), bold (**), backticks or headings. For a list, put each item on its own line starting with "• ". Keep lines short and clearly aligned. Be concise and professional.
 
 DATABASE RESULT:
 ${toolResult}
@@ -2071,7 +2074,7 @@ ANSWER:`;
 // Given a submission's current status, it knows exactly what the recruiter should do next.
 app.get('/submissions/:id/next-action', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, interview_link, resume_received, resume_requested FROM submissions WHERE submission_id = $1', [req.params.id]);
+    const { rows } = await pool.query('SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, interview_link, resume_received, resume_requested, current_ctc, expected_ctc FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     const s = rows[0];
     // SUBMITTED depends on the resume state: received -> schedule; already requested -> waiting; else -> request.
