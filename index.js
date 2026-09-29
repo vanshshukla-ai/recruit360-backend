@@ -1798,21 +1798,37 @@ async function agentQueryData(question, role, history) {
   const listLimit = wantAll ? 500 : 50;
   const roleHint = role === 'recruiter' ? 'The user is a recruiter asking about candidates/jobs.' : role === 'hiring_manager' ? 'The user is a hiring manager.' : role === 'admin' ? 'The user is an admin with full access.' : '';
   const ctx = (history || []).slice(-4).map(h => `${h.role}: ${h.text}`).join(' | ');
+  const rules = `Rules: select only needed columns (never SELECT *). ALWAYS alias aggregates with a readable name (e.g. COUNT(*) AS count, never a bare COUNT(*)). NEVER combine DISTINCT with ORDER BY inside an aggregate such as STRING_AGG/ARRAY_AGG — if you need distinct ordered values, use a subquery (SELECT DISTINCT … then aggregate). For a list, add LIMIT ${listLimit} at the end. For a count/total use COUNT(*) AS count with no LIMIT. Use COUNT/SUM/AVG for totals, GROUP BY for 'per/by/each/breakdown'. Use ORDER BY DESC + LIMIT for 'top/most/highest'. Text filters use LOWER(col) LIKE LOWER('%v%'). Map pipeline stages to visa_status IN(...). Use candidates.experience_years for experience. Prefix tables with \`${BQ_DS}.\`.`;
   const prompt = `Write ONE efficient BigQuery SELECT (only SQL, no fences). ${roleHint}${ctx ? ' Recent context: ' + ctx : ''}
-Rules: select only needed columns (never SELECT *). ALWAYS alias aggregates with a readable name (e.g. COUNT(*) AS count, never a bare COUNT(*)). For a list, add LIMIT ${listLimit} at the end. For a count/total use COUNT(*) AS count with no LIMIT. Use COUNT/SUM/AVG for totals, GROUP BY for 'per/by/each/breakdown'. Use ORDER BY DESC + LIMIT for 'top/most/highest'. Text filters use LOWER(col) LIKE LOWER('%v%'). Map pipeline stages to visa_status IN(...). Use candidates.experience_years for experience. Prefix tables with \`${BQ_DS}.\`.
+${rules}
 ${BQ_SCHEMA}
 Question: ${question}
 SQL:`;
   const gen = await genModel.generateContent(prompt);
   let sql = gen.response.candidates[0].content.parts[0].text.replace(/^```(?:sql)?|```$/gim, '').trim();
   if (!_readonlySQL(sql)) return { text: 'That request is blocked (read-only guard).', rows: [] };
-  try {
-    const rows = await bqQuery(sql);
+
+  const runAndFormat = (rows) => {
     if (!rows.length) return { text: 'No records match this request in the database. The correct answer is that none were found — I will not invent any.', rows: [] };
     const shown = rows.slice(0, wantAll ? 25 : 8);
     const note = rows.length > shown.length ? `\n\n(Showing ${shown.length} of ${rows.length}.)` : '';
     return { text: `Result (${rows.length} found):\n${JSON.stringify(shown, null, 1)}${note}`, rows };
-  } catch (e) { return { text: 'Query failed: ' + e.message, rows: [] }; }
+  };
+
+  try {
+    return runAndFormat(await bqQuery(sql));
+  } catch (e1) {
+    // One auto-repair pass: give the model the error and ask for corrected SQL.
+    try {
+      const fixPrompt = `The following BigQuery SQL failed with this error:\nERROR: ${e1.message}\n\nSQL:\n${sql}\n\n${rules}\nReturn ONLY the corrected SQL (no fences, no explanation).`;
+      const fixGen = await genModel.generateContent(fixPrompt);
+      let sql2 = fixGen.response.candidates[0].content.parts[0].text.replace(/^```(?:sql)?|```$/gim, '').trim();
+      if (!_readonlySQL(sql2)) return { text: 'Sorry, I could not build a safe query for that. Try rephrasing.', rows: [] };
+      return runAndFormat(await bqQuery(sql2));
+    } catch (e2) {
+      return { text: 'Sorry, I could not run that query. Please try rephrasing your question (for example, name the role or the exact field you want).', rows: [] };
+    }
+  }
 }
 
 
