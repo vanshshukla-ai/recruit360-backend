@@ -1900,24 +1900,59 @@ async function agentPredictPlacement(topN) {
   } catch (e) { return { text: 'The placement-prediction model is not available right now.', rows: [] }; }
 }
 
-// SEMANTIC SEARCH — find candidates by MEANING (Vertex embeddings + BigQuery vector search)
+// SEMANTIC SEARCH — find candidates by MEANING (Vertex embeddings + BigQuery vector search).
+// Fit score mirrors the Job Board: strong role/destination signals dominate, with a small
+// semantic nudge — so an obviously right candidate reads as a high match, not a raw distance.
 async function agentSemanticMatch(question) {
   let desc = (question || '').replace(/^\s*(find|show|get|search|list)\s+(me\s+)?(candidates?|people|profiles?|someone)\s*/i, '')
     .replace(/^(that\s+are\s+|who\s+are\s+|who\s+|that\s+|like\s+|similar\s+to\s+|matching\s+|with\s+)/i, '').trim();
   if (!desc) desc = question;
+  const qL = desc.toLowerCase();
+  const COUNTRIES = ['Germany','Sweden','Ireland','Netherlands','France','Norway','Denmark','Finland','Canada','Australia','United Kingdom','United States'];
+  const wantCountry = COUNTRIES.find(c => qL.includes(c.toLowerCase())) || '';
+  const roleWords = (qL.match(/\b(software|backend|frontend|full.?stack|developer|engineer|nurse|architect|analyst|devops|data|mechanical|cloud|qa|quality)\b/g) || []);
+  const norm = (s) => (s || '').toLowerCase();
+  const roleHit = (candRole) => {
+    const cr = norm(candRole);
+    return roleWords.some(w => {
+      if (w === 'developer' || w === 'backend' || w === 'frontend' || w === 'full-stack' || w === 'fullstack' || w === 'software') return cr.includes('software') || cr.includes('data engineer');
+      if (w === 'qa' || w === 'quality') return cr.includes('qa');
+      if (w === 'devops') return cr.includes('devops');
+      if (w === 'data') return cr.includes('data');
+      if (w === 'cloud') return cr.includes('cloud');
+      if (w === 'mechanical') return cr.includes('mechanical');
+      if (w === 'nurse') return cr.includes('nurse');
+      if (w === 'architect') return cr.includes('architect');
+      if (w === 'analyst') return cr.includes('analyst');
+      if (w === 'engineer') return cr.includes('engineer');
+      return false;
+    });
+  };
   try {
     const sql = `SELECT h.base.candidate_id AS candidate_id, c.full_name, c.role, c.destination_country, c.visa_status, c.experience_years, h.distance
       FROM VECTOR_SEARCH(TABLE \`${BQ_DS}.candidate_embeddings\`, 'embedding',
         (SELECT ml_generate_embedding_result AS embedding FROM ML.GENERATE_EMBEDDING(MODEL \`${BQ_DS}.text_embedder\`, (SELECT @q AS content))),
-        top_k => 10) AS h
+        top_k => 15) AS h
       JOIN \`${BQ_DS}.candidates\` c ON c.candidate_id = h.base.candidate_id
       ORDER BY h.distance`;
     const [rows] = await bq.query({ query: sql, location: 'asia-south1', params: { q: desc } });
     let good = (rows || []).filter(r => r.distance <= 0.92);
     if (!good.length) return { text: `No candidates in the database closely match "${desc}". I won't guess — there is no strong match for this request.`, rows: [] };
-    good = good.map(r => ({ candidate_id: r.candidate_id, full_name: r.full_name, role: r.role, destination_country: r.destination_country, visa_status: r.visa_status, experience_years: r.experience_years, match: Math.max(1, Math.min(99, Math.round((1 - r.distance) * 100))) }));
+    good = good.map(r => {
+      const sameRole = roleHit(r.role);
+      const sameCountry = wantCountry ? norm(r.destination_country) === norm(wantCountry) : false;
+      let fit;
+      if (sameRole || sameCountry) {
+        fit = (sameRole ? 66 : 0) + (sameCountry ? 25 : 0) + Math.round((1 - r.distance) * 8);
+      } else {
+        // no explicit role/country in the query — score on semantic closeness, readably scaled
+        fit = 45 + Math.round((1 - r.distance) * 45);
+      }
+      fit = Math.max(1, Math.min(99, fit));
+      return { candidate_id: r.candidate_id, full_name: r.full_name, role: r.role, destination_country: r.destination_country, visa_status: r.visa_status, experience_years: r.experience_years, match: fit };
+    }).sort((a, b) => b.match - a.match).slice(0, 10);
     const lines = good.map(r => `- ${r.full_name} (${r.candidate_id}) — ${r.role}, ${r.experience_years || 0} yrs → ${r.destination_country || '—'} · ${r.match}% match`);
-    return { text: `Candidates matching "${desc}" by meaning:\n` + lines.join('\n'), rows: good };
+    return { text: `Candidates matching "${desc}" by meaning (ranked by fit):\n` + lines.join('\n'), rows: good };
   } catch (e) { return { text: 'Semantic search is not available right now.', rows: [] }; }
 }
 
