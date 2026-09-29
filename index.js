@@ -1908,6 +1908,27 @@ async function skillIdleJobs() {
   return `Open jobs idle 5+ days (${jobs.length}), each with what is blocking it:\n` + lines.join('\n');
 }
 
+// BEST FIT — rank candidates for a named role (role match + readiness + experience)
+async function skillBestFit(question) {
+  const roles = ['Software Engineer','Registered Nurse','Data Engineer','Cloud Architect','DevOps Engineer','Data Analyst','QA Engineer','Mechanical Engineer'];
+  const found = roles.find(r => question.toLowerCase().includes(r.toLowerCase()))
+    || (/\bqa\b/i.test(question) ? 'QA Engineer' : null)
+    || (/\bnurse\b/i.test(question) ? 'Registered Nurse' : null)
+    || (/\bdevops\b/i.test(question) ? 'DevOps Engineer' : null);
+  if (!found) return null; // let the fallback handle it
+  try {
+    const rows = await bqQuery(`SELECT candidate_id, full_name, role, destination_country, visa_status, experience_years
+      FROM \`${BQ_DS}.candidates\` WHERE LOWER(role) = LOWER('${found.replace(/'/g,'')}')
+      ORDER BY
+        CASE WHEN visa_status IN ('VISA_APPROVED','PLACEMENT_ACTIVE','TRAINING_COMPLETE','VISA_SUBMITTED','TRAVEL_CONFIRMED') THEN 0 ELSE 1 END,
+        experience_years DESC
+      LIMIT 6`);
+    if (!rows.length) return `No candidates found for ${found} in the pool.`;
+    const lines = rows.map((r, i) => `${i + 1}. ${r.full_name} (${r.candidate_id}) — ${r.experience_years || 0} yrs · ${r.destination_country || '—'} · visa ${(r.visa_status || '').replace(/_/g, ' ')}`);
+    return `Best-fit ${found} candidates (ranked by visa readiness, then experience):\n` + lines.join('\n');
+  } catch (e) { return null; }
+}
+
 // RECRUITER Q2 — candidates with visa issues / rejections + reason + action
 async function skillVisaIssues() {
   try {
@@ -2035,9 +2056,14 @@ app.post('/assistant/ask', async (req, res) => {
     const isWorkToday = /(work on today|what should i (do|work)|my (work|queue|priorities|priority|tasks|pending)|today.?s (work|priorities|tasks)|prioriti[sz]e[^.]*today|need[^.]*my attention|what needs my attention|pending work|what.?s pending|whats pending|summary of (my )?(work|pending|tasks)|work summary|summari[sz]e (my )?(work|pending|tasks|day))/i.test(q);
     const isPlacementRisk = /(close to placement|near placement|placement[^.]*(risk|blocker|block)|at risk[^.]*placement|placements? at risk)/i.test(q);
     const isWhyNoCand = /(why[^.]*(no|haven.?t|not)[^.]*candidat|why[^.]*can.?t[^.]*find|feasibility)/i.test(q);
+    const isBestFit = /(best fit|best candidate|best.*match|top candidate|good fit|suitable candidate|who.?s? (the )?best|which candidate.*best|candidates? (for|suitable for) (a |the )?[a-z])/i.test(q) && !isVisaIssues && !isWhyNoCand;
 
     if (isVisaFix) {
       toolResult = await agentVisaFix(idMatch[0]); agentName = 'Visa Fix-It';
+    } else if (isBestFit) {
+      const r = await skillBestFit(question);
+      if (r) { toolResult = r; agentName = 'Best-Fit Match'; }
+      else { const rr = await agentQueryData(question, role, history); toolResult = rr.text; rows = rr.rows; agentName = 'Candidate Data'; }
     } else if (isIdleJobs) {
       toolResult = await skillIdleJobs(); agentName = 'Idle & Blocked Jobs';
     } else if (isPlacementRisk) {
