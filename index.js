@@ -2275,6 +2275,7 @@ ANSWER:`;
 // Given a submission's current status, it knows exactly what the recruiter should do next.
 app.get('/submissions/:id/next-action', async (req, res) => {
   try {
+    await ensureSlots();
     const { rows } = await pool.query('SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, interview_link, interview_date, resume_received, resume_requested, resume_summary, client_panel, current_ctc, expected_ctc FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     const s = rows[0];
@@ -2304,6 +2305,7 @@ app.get('/submissions/:id/next-action', async (req, res) => {
 app.post('/submissions/:id/context-action', async (req, res) => {
   try {
     const { action } = req.body;
+    await ensureSlots();
     const { rows } = await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, status FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     const s = rows[0];
@@ -2490,6 +2492,7 @@ async function slotClashes(candidateId, proposedBy, isoTime, durationMin) {
 // Propose slots for a submission (recruiter call or client interview). Auto-suggests if none given.
 app.post('/submissions/:id/slots/propose', async (req, res) => {
   try {
+    await ensureSlots();
     const { kind = 'recruiter', slots, proposed_by, duration_min } = req.body || {};
     const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
     if (!s) return res.status(404).json({ error: 'not found' });
@@ -2520,6 +2523,7 @@ app.post('/submissions/:id/slots/propose', async (req, res) => {
 // List slots for a submission
 app.get('/submissions/:id/slots', async (req, res) => {
   try {
+    await ensureSlots();
     const { rows } = await pool.query('SELECT slot_id, kind, slot_time, duration_min, status, meet_link, proposed_by FROM interview_slots WHERE submission_id = $1 ORDER BY slot_time ASC', [req.params.id]);
     return res.json({ slots: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
@@ -2528,6 +2532,7 @@ app.get('/submissions/:id/slots', async (req, res) => {
 // Confirm one slot -> books it, cancels the other proposed options, creates the meet link.
 app.post('/slots/:slotId/confirm', async (req, res) => {
   try {
+    await ensureSlots();
     const slot = (await pool.query('SELECT * FROM interview_slots WHERE slot_id = $1', [req.params.slotId])).rows[0];
     if (!slot) return res.status(404).json({ error: 'slot not found' });
     if (await slotClashes(slot.candidate_id, slot.proposed_by, slot.slot_time, slot.duration_min)) {
@@ -2554,6 +2559,7 @@ app.post('/slots/:slotId/confirm', async (req, res) => {
 app.post('/slots/:slotId/cancel', async (req, res) => {
   try {
     const { reason, by } = req.body || {};
+    await ensureSlots();
     const slot = (await pool.query('SELECT * FROM interview_slots WHERE slot_id = $1', [req.params.slotId])).rows[0];
     if (!slot) return res.status(404).json({ error: 'slot not found' });
     await pool.query("UPDATE interview_slots SET status = 'CANCELLED' WHERE slot_id = $1", [req.params.slotId]);
@@ -2572,6 +2578,7 @@ app.post('/slots/:slotId/cancel', async (req, res) => {
 app.post('/submissions/:id/client/request-panel', async (req, res) => {
   try {
     const { requested_by } = req.body || {};
+    await ensureSlots();
     const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, resume_summary FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
     if (!s) return res.status(404).json({ error: 'not found' });
     const clientEmail = (String(s.client_name || 'client').toLowerCase().replace(/[^a-z0-9]+/g, '') || 'client') + '@client.com';
@@ -2587,6 +2594,7 @@ app.post('/submissions/:id/client/request-panel', async (req, res) => {
 app.post('/submissions/:id/client/panel', async (req, res) => {
   try {
     const { panel, saved_by } = req.body || {};
+    await ensureSlots();
     const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, client_name FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
     if (!s) return res.status(404).json({ error: 'not found' });
     await pool.query('UPDATE submissions SET client_panel = $1, last_updated = NOW() WHERE submission_id = $2', [panel || '', req.params.id]).catch(() => {});
@@ -2661,6 +2669,35 @@ ${text.slice(0, 4000)}`;
 });
 
 // ---------- Self-healing schema: make sure supporting tables/columns exist ----------
+// Lazy self-heal for the newer flow tables/columns — guarantees they exist on first use,
+// even if the startup ensureSchema() was interrupted by a cold-start DB blip.
+let _slotsReady = false;
+async function ensureSlots() {
+  if (_slotsReady) return;
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS interview_slots (
+      slot_id       TEXT PRIMARY KEY,
+      submission_id TEXT,
+      candidate_id  TEXT,
+      job_id        TEXT,
+      kind          TEXT,
+      slot_time     TIMESTAMPTZ,
+      duration_min  INTEGER DEFAULT 30,
+      status        TEXT DEFAULT 'PROPOSED',
+      proposed_by   TEXT,
+      meet_link     TEXT,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_slots_submission ON interview_slots (submission_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_slots_time ON interview_slots (slot_time)');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_text TEXT');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_summary TEXT');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS client_panel TEXT');
+    _slotsReady = true;
+    console.log('Slot schema ensured (lazy).');
+  } catch (e) { console.log('ensureSlots warn:', e.message); }
+}
+
 async function ensureSchema() {
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS notifications (
