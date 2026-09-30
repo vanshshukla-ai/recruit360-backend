@@ -2370,6 +2370,17 @@ app.post('/submissions/:id/context-action', async (req, res) => {
       return res.json({ ok: true, done: 'request_placement', status: 'PENDING_PLACEMENT_APPROVAL', message: 'Sent to the hiring manager for placement approval.' });
     }
 
+    // Recruiter call finished -> move to the client-interview stage (no extra email/link; the call was already scheduled via slots).
+    if (action === 'complete_recruiter_call') {
+      if (s.status !== 'RECRUITER_CALL') return res.status(400).json({ error: 'The candidate is not at the recruiter-call stage.' });
+      await pool.query("UPDATE submissions SET status = 'CLIENT_INTERVIEW', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
+      let hm = '';
+      try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
+      await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'STAGE', message: `${s.candidate_name} moved to the client interview — request the client panel.` });
+      await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Recruiter call complete — ' + s.candidate_name, body: 'Recruiter call completed. Proceeding to the client interview (request the panel from the client).', sent_by: 'recruiter' });
+      return res.json({ ok: true, done: 'complete_recruiter_call', status: 'CLIENT_INTERVIEW', message: 'Recruiter call complete — moved to the client interview.' });
+    }
+
     // Schedule actions advance the pipeline forward (HR round removed — recruiter call then client interview).
     const ADVANCE = { schedule_call: 'CLIENT_INTERVIEW', schedule_client: 'CLIENT_INTERVIEW' };
     if (ADVANCE[action]) {
@@ -2438,9 +2449,9 @@ app.patch('/submissions/:id/placement-approval', async (req, res) => {
       const recMsg = `Placement APPROVED: ${s.candidate_name} for ${s.job_title || 'a role'}. Proceed to onboarding.`;
       await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACEMENT_APPROVED', message: recMsg });
       await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Placement approved — ' + s.candidate_name, body: recMsg });
-      // Congratulations email to the candidate
+      // Congratulations + onboarding email to the candidate (document verification, application, visa documents)
       const congratsSubject = 'Congratulations — you have been placed for ' + (s.job_title || 'a role');
-      const congratsBody = 'Dear ' + s.candidate_name + ',\n\nWe are pleased to confirm your placement for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '. Our team will contact you shortly with the onboarding steps.\n\nCongratulations and welcome aboard!\n\nBest regards,\nRecruit 360 Team';
+      const congratsBody = 'Dear ' + s.candidate_name + ',\n\nWe are pleased to confirm your placement for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '.\n\nTo begin onboarding, our team will guide you through the next steps:\n1. Document verification — please keep your identity and education documents ready.\n2. Application forms — we will share the joining application for you to complete.\n3. Visa documentation — where applicable, our visa partner will collect and process the required documents.\n\nWe will contact you shortly with the details. Congratulations and welcome aboard!\n\nBest regards,\nRecruit 360 Team';
       await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'PLACED', message: 'Congratulations! You have been placed for ' + (s.job_title || 'a role') + '.' });
       await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: congratsSubject, body: congratsBody });
       return res.json({ ok: true, status: 'PLACED', candidateEmail: candEmail, emailSubject: congratsSubject, emailBody: congratsBody });
@@ -2497,7 +2508,7 @@ app.post('/submissions/:id/slots/propose', async (req, res) => {
     const { kind = 'recruiter', slots, proposed_by, duration_min } = req.body || {};
     const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
     if (!s) return res.status(404).json({ error: 'not found' });
-    const dur = parseInt(duration_min, 10) || 30;
+    const dur = parseInt(duration_min, 10) || (kind === 'client' ? 60 : 45);
     let wanted = Array.isArray(slots) && slots.length ? slots : suggestSlots(3);
     // clear previous still-PROPOSED slots of this kind (re-propose replaces them)
     await pool.query("UPDATE interview_slots SET status = 'CANCELLED' WHERE submission_id = $1 AND kind = $2 AND status = 'PROPOSED'", [req.params.id, kind]);
@@ -2519,6 +2530,52 @@ app.post('/submissions/:id/slots/propose', async (req, res) => {
     await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'SLOTS', message: `Please choose a time for your ${label}.` });
     return res.json({ ok: true, kind, proposed: accepted, skipped_overlaps: skipped, emailSubject, emailBody, candidateEmail: candEmail });
   } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// Directly FIX a manual slot (recruiter sets the exact time) — no candidate choosing.
+// Books it as CONFIRMED, creates the meeting link, and emails the candidate the fixed time + link.
+app.post('/submissions/:id/slots/fix', async (req, res) => {
+  try {
+    await ensureSlots();
+    const { kind = 'recruiter', slot_time, fixed_by, duration_min } = req.body || {};
+    if (!slot_time) return res.status(400).json({ error: 'slot_time is required' });
+    const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (!s) return res.status(404).json({ error: 'not found' });
+    const dur = parseInt(duration_min, 10) || (kind === 'client' ? 60 : 45);
+    if (await slotClashes(s.candidate_id, fixed_by, slot_time, dur)) {
+      return res.status(409).json({ error: 'That time clashes with an existing confirmed interview. Pick a different time.' });
+    }
+    // clear any pending proposed options of this kind, then book the fixed one as CONFIRMED
+    await pool.query("UPDATE interview_slots SET status = 'CANCELLED' WHERE submission_id = $1 AND kind = $2 AND status = 'PROPOSED'", [req.params.id, kind]);
+    const link = meetLink();
+    const slot_id = 'SLOT' + Date.now().toString(36).slice(-6) + Math.random().toString(36).slice(2, 5);
+    await pool.query(`INSERT INTO interview_slots (slot_id, submission_id, candidate_id, job_id, kind, slot_time, duration_min, status, proposed_by, meet_link) VALUES ($1,$2,$3,$4,$5,$6,$7,'CONFIRMED',$8,$9)`,
+      [slot_id, req.params.id, s.candidate_id, s.job_id, kind, slot_time, dur, fixed_by || 'recruiter', link]);
+    await pool.query('UPDATE submissions SET interview_link = $1, interview_date = $2, last_updated = NOW() WHERE submission_id = $3', [link, slot_time, req.params.id]).catch(() => {});
+    const candEmail = candidateEmail(s.candidate_id);
+    const label = kind === 'client' ? 'client interview' : 'recruiter call';
+    const when = new Date(slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+    const emailSubject = `Your ${label} is scheduled — ${s.job_title || 'a role'}`;
+    const emailBody = 'Dear ' + s.candidate_name + ',\n\nYour ' + label + (s.client_name && kind === 'client' ? ' with ' + s.client_name : '') + ' has been scheduled for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nNo reply is needed — please join at the scheduled time.\n\nBest regards,\nRecruit 360 Team';
+    await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody, sent_by: fixed_by || 'recruiter' });
+    await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: `Your ${label} is fixed for ${when}. Link: ${link}` });
+    if (s.submitted_by) await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by, type: 'INTERVIEW', message: `${s.candidate_name}'s ${label} fixed for ${when}.` });
+    return res.json({ ok: true, slot_id, status: 'CONFIRMED', meet_link: link, slot_time, emailSubject, emailBody, candidateEmail: candEmail });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// Taken (already-booked) slot times for a date — so a booked slot is hidden from every candidate.
+app.get('/slots/taken', async (req, res) => {
+  try {
+    await ensureSlots();
+    const date = (req.query.date || '').trim();
+    if (!date) return res.json({ taken: [] });
+    const params = [date];
+    let sql = "SELECT slot_time FROM interview_slots WHERE status = 'CONFIRMED' AND slot_time::date = $1";
+    if (req.query.kind) { sql += ' AND kind = $2'; params.push(req.query.kind); }
+    const { rows } = await pool.query(sql, params);
+    return res.json({ taken: rows.map(r => new Date(r.slot_time).toISOString()) });
+  } catch (e) { return res.status(500).json({ error: e.message, taken: [] }); }
 });
 
 // List slots for a submission
@@ -2580,12 +2637,13 @@ app.post('/submissions/:id/client/request-panel', async (req, res) => {
   try {
     const { requested_by } = req.body || {};
     await ensureSlots();
-    const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, resume_summary FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, resume_summary, current_ctc, expected_ctc FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
     if (!s) return res.status(404).json({ error: 'not found' });
     const clientEmail = (String(s.client_name || 'client').toLowerCase().replace(/[^a-z0-9]+/g, '') || 'client') + '@client.com';
     const summary = s.resume_summary || (s.candidate_name + ' — strong candidate for ' + (s.job_title || 'the role') + '.');
+    const ctcLine = (s.current_ctc || s.expected_ctc) ? `\nCompensation: current ${s.current_ctc || 'n/a'}, expected ${s.expected_ctc || 'n/a'}.\n` : '\n';
     const emailSubject = `Candidate for ${s.job_title || 'your role'} — please set up the interview panel`;
-    const emailBody = 'Dear ' + (s.client_name || 'Client') + ' team,\n\nFor the ' + (s.job_title || 'role') + ', we have identified a suitable candidate, ' + s.candidate_name + '. We would like to request you to set up the interview panel and share your available interview slots.\n\nCandidate summary:\n' + summary + '\n\nPlease reply with the panel members and a few available time slots, and we will coordinate with the candidate.\n\nBest regards,\nRecruit 360 Team';
+    const emailBody = 'Dear ' + (s.client_name || 'Client') + ' team,\n\nFor the ' + (s.job_title || 'role') + ', we have identified a suitable candidate, ' + s.candidate_name + ', who has cleared our internal recruiter screening. We would like to request you to set up the interview panel and share your available interview slots.\n\nCandidate summary:\n' + summary + ctcLine + '\nPlease reply with:\n1. The interview panel members.\n2. A few available interview time slots.\n\nWe will then coordinate the interview with the candidate and share the confirmed schedule. After the interview, please let us know your decision (selected / not selected).\n\nBest regards,\nRecruit 360 Team';
     await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'CLIENT', to_role: 'client', to_name: s.client_name || 'client', to_email: clientEmail, subject: emailSubject, body: emailBody, sent_by: requested_by || 'recruiter' });
     return res.json({ ok: true, emailSubject, emailBody, clientEmail });
   } catch (e) { return res.status(500).json({ error: e.message }); }
@@ -2611,6 +2669,7 @@ app.post('/submissions/bulk-approval', async (req, res) => {
   try {
     const { submission_ids, decision, approver } = req.body; // decision: APPROVED | REJECTED
     if (!Array.isArray(submission_ids) || !submission_ids.length) return res.status(400).json({ error: 'submission_ids required' });
+    const emails = [];
     for (const id of submission_ids) {
       const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [id])).rows[0];
       if (!sub) continue;
@@ -2623,12 +2682,14 @@ app.post('/submissions/bulk-approval', async (req, res) => {
         await logComm({ submission_id: id, candidate_id: sub.candidate_id, job_id: sub.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: sub.candidate_name, to_email: candEmail, subject, body, sent_by: approver || 'hiring_manager' });
         await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'SHORTLISTED', message: 'You have been shortlisted for ' + (sub.job_title || 'a role') + '.' });
         await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by || 'recruiter', type: 'APPROVED', message: sub.candidate_name + ' approved for ' + (sub.job_title || 'a role') + ' — schedule the recruiter call.' });
+        emails.push({ name: sub.candidate_name, email: candEmail, subject, body });
       } else {
         await pool.query("UPDATE submissions SET status = 'REJECTED', last_updated = NOW() WHERE submission_id = $1", [id]);
         await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by || 'recruiter', type: 'CANDIDATE_REJECTED', message: sub.candidate_name + ' was not approved for ' + (sub.job_title || 'a role') + '.' });
       }
     }
-    return res.json({ ok: true, count: submission_ids.length, decision, invites: [] });
+    // `emails` = the shortlisting emails just sent (shown to the HM); `invites` kept for compatibility.
+    return res.json({ ok: true, count: submission_ids.length, decision, emails, invites: [] });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
