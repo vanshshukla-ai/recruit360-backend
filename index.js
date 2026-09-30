@@ -2277,7 +2277,7 @@ ANSWER:`;
 app.get('/submissions/:id/next-action', async (req, res) => {
   try {
     await ensureSlots();
-    const { rows } = await pool.query('SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, interview_link, interview_date, resume_received, resume_requested, resume_summary, client_panel, current_ctc, expected_ctc FROM submissions WHERE submission_id = $1', [req.params.id]);
+    const { rows } = await pool.query('SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, interview_link, interview_date, resume_received, resume_requested, resume_summary, client_panel, current_ctc, expected_ctc, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     const s = rows[0];
     // New flow: resume + AI summary come BEFORE hiring-manager approval.
@@ -2448,15 +2448,18 @@ app.patch('/submissions/:id/placement-approval', async (req, res) => {
     if (decision === 'APPROVED') {
       await pool.query("UPDATE submissions SET status = 'PLACED', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
       try { await pool.query("UPDATE candidates SET visa_status = 'PLACEMENT_ACTIVE', last_updated = NOW() WHERE candidate_id = $1", [s.candidate_id]); } catch (e) {}
-      const recMsg = `Placement APPROVED: ${s.candidate_name} for ${s.job_title || 'a role'}. Proceed to onboarding.`;
+      // Position is filled — set the job status so recruiters stop sourcing for it.
+      try { await pool.query("UPDATE jobs SET status = 'Filled' WHERE job_id = $1", [s.job_id]); } catch (e) {}
+      const recMsg = `Placement APPROVED: ${s.candidate_name} for ${s.job_title || 'a role'}. Proceed to onboarding. Visa processing is now in progress.`;
       await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACEMENT_APPROVED', message: recMsg });
       await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Placement approved — ' + s.candidate_name, body: recMsg });
-      // Congratulations + onboarding email to the candidate (document verification, application, visa documents)
-      const congratsSubject = 'Congratulations — you have been placed for ' + (s.job_title || 'a role');
-      const congratsBody = 'Dear ' + s.candidate_name + ',\n\nWe are pleased to confirm your placement for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '.\n\nTo begin onboarding, our team will guide you through the next steps:\n1. Document verification — please keep your identity and education documents ready.\n2. Application forms — we will share the joining application for you to complete.\n3. Visa documentation — where applicable, our visa partner will collect and process the required documents.\n\nWe will contact you shortly with the details. Congratulations and welcome aboard!\n\nBest regards,\nRecruit 360 Team';
-      await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'PLACED', message: 'Congratulations! You have been placed for ' + (s.job_title || 'a role') + '.' });
+      // Congratulations + onboarding email to the candidate; CC recruiter + visa application team.
+      const cc = [s.submitted_by ? 'recruiter' : null, VISA_TEAM_EMAIL].filter(Boolean).join(', ');
+      const congratsSubject = 'Congratulations — You Have Been Placed for ' + (s.job_title || 'a role');
+      const congratsBody = 'Dear ' + s.candidate_name + ',\n\nWe are pleased to confirm your placement for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '.\n\nTo begin onboarding, our team will guide you through the next steps:\n1. Document Verification — please keep your identity and education documents ready.\n2. Application Forms — we will share the joining application for you to complete.\n3. Visa Documentation — our visa partner (Fragman) will collect and process the required documents and keep you updated.\n\nWe will contact you shortly with the details. Congratulations and welcome aboard!\n\nBest regards,\nRecruit 360 Team\n\nCc: Recruiter (' + (s.submitted_by || 'assigned recruiter') + '), Visa Application Team (' + VISA_TEAM_EMAIL + ')';
+      await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'PLACED', message: 'Congratulations! You have been placed for ' + (s.job_title || 'a role') + '. Visa processing will begin.' });
       await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: congratsSubject, body: congratsBody });
-      return res.json({ ok: true, status: 'PLACED', candidateEmail: candEmail, emailSubject: congratsSubject, emailBody: congratsBody });
+      return res.json({ ok: true, status: 'PLACED', candidateEmail: candEmail, emailSubject: congratsSubject, emailBody: congratsBody, cc: VISA_TEAM_EMAIL, jobFilled: true });
     }
     // Rejected -> send it back to the recruiter at the client-interview stage with a reason
     await pool.query("UPDATE submissions SET status = 'CLIENT_INTERVIEW', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
@@ -2475,6 +2478,8 @@ function meetLink() {
   const p = () => Math.random().toString(36).slice(2, 6);
   return 'https://meet.google.com/' + p().slice(0, 3) + '-' + p() + '-' + p().slice(0, 3);
 }
+function clientEmailFor(name) { return (String(name || 'client').toLowerCase().replace(/[^a-z0-9]+/g, '') || 'client') + '@client.com'; }
+const VISA_TEAM_EMAIL = 'visa-team@fragman.com'; // third-party visa agency (Fragman) placeholder
 // Suggest N future business slots (skips weekends), at 10:00 / 12:00 / 15:00 / 17:00 IST-ish.
 function suggestSlots(n = 3) {
   const hours = [10, 12, 15, 17];
@@ -2557,12 +2562,13 @@ app.post('/submissions/:id/slots/fix', async (req, res) => {
     const candEmail = candidateEmail(s.candidate_id);
     const label = kind === 'client' ? 'client interview' : 'recruiter call';
     const when = new Date(slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+    const clientCc = kind === 'client' ? clientEmailFor(s.client_name) : '';
     const emailSubject = `Your ${label} is scheduled — ${s.job_title || 'a role'}`;
-    const emailBody = 'Dear ' + s.candidate_name + ',\n\nYour ' + label + (s.client_name && kind === 'client' ? ' with ' + s.client_name : '') + ' has been scheduled for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nNo reply is needed — please join at the scheduled time.\n\nBest regards,\nRecruit 360 Team';
-    await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody, sent_by: fixed_by || 'recruiter' });
+    const emailBody = 'Dear ' + s.candidate_name + ',\n\nYour ' + label + (s.client_name && kind === 'client' ? ' with ' + s.client_name : '') + ' has been scheduled for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nNo reply is needed — please join at the scheduled time.\n\nBest regards,\nRecruit 360 Team' + (clientCc ? '\n\n(The client interview panel is copied on this invite.)' : '');
+    await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody + (clientCc ? '\nCc: ' + clientCc : ''), sent_by: fixed_by || 'recruiter' });
     await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: `Your ${label} is fixed for ${when}. Link: ${link}` });
     if (s.submitted_by) await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by, type: 'INTERVIEW', message: `${s.candidate_name}'s ${label} fixed for ${when}.` });
-    return res.json({ ok: true, slot_id, status: 'CONFIRMED', meet_link: link, slot_time, emailSubject, emailBody, candidateEmail: candEmail });
+    return res.json({ ok: true, slot_id, status: 'CONFIRMED', meet_link: link, slot_time, emailSubject, emailBody, candidateEmail: candEmail, cc: clientCc });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -2606,12 +2612,13 @@ app.post('/slots/:slotId/confirm', async (req, res) => {
     const candEmail = candidateEmail(slot.candidate_id);
     const label = slot.kind === 'client' ? 'client interview' : 'recruiter call';
     const when = new Date(slot.slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+    const clientCc = slot.kind === 'client' ? clientEmailFor(s.client_name) : '';
     const emailSubject = `Your ${label} is confirmed — ${s.job_title || 'a role'}`;
-    const emailBody = 'Dear ' + (s.candidate_name || 'Candidate') + ',\n\nYour ' + label + ' is confirmed for ' + when + '.\n\nJoin using this link:\n' + link + '\n\nBest regards,\nRecruit 360 Team';
-    await logComm({ submission_id: slot.submission_id, candidate_id: slot.candidate_id, job_id: slot.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody, sent_by: 'recruiter' });
+    const emailBody = 'Dear ' + (s.candidate_name || 'Candidate') + ',\n\nYour ' + label + (s.client_name && slot.kind === 'client' ? ' with ' + s.client_name : '') + ' is confirmed for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nBest regards,\nRecruit 360 Team' + (clientCc ? '\n\n(The client interview panel is copied on this invite.)' : '');
+    await logComm({ submission_id: slot.submission_id, candidate_id: slot.candidate_id, job_id: slot.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody + (clientCc ? '\nCc: ' + clientCc : ''), sent_by: 'recruiter' });
     await notify({ candidate_id: slot.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: `Your ${label} is confirmed for ${when}. Link: ${link}` });
     if (s.submitted_by) await notify({ candidate_id: slot.candidate_id, recipient: s.submitted_by, type: 'INTERVIEW', message: `${s.candidate_name}'s ${label} confirmed for ${when}.` });
-    return res.json({ ok: true, slot_id: req.params.slotId, status: 'CONFIRMED', meet_link: link, slot_time: slot.slot_time, emailSubject, emailBody, candidateEmail: candEmail });
+    return res.json({ ok: true, slot_id: req.params.slotId, status: 'CONFIRMED', meet_link: link, slot_time: slot.slot_time, emailSubject, emailBody, candidateEmail: candEmail, cc: clientCc });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
