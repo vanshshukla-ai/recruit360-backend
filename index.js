@@ -1249,8 +1249,9 @@ app.patch('/submissions/:id/approval', async (req, res) => {
 // ---------- Submissions PENDING approval (for the hiring manager) ----------
 app.get('/submissions/pending-approval', async (req, res) => {
   try {
+    await ensureSlots();
     const { rows } = await pool.query(
-      `SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, current_ctc, expected_ctc, submitted_by, created_at
+      `SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, current_ctc, expected_ctc, resume_summary, submitted_by, created_at
          FROM submissions WHERE status = 'PENDING_HM_APPROVAL' ORDER BY created_at DESC`);
     return res.json({ pending: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
@@ -2604,27 +2605,30 @@ app.post('/submissions/:id/client/panel', async (req, res) => {
 });
 
 // ---------- BULK APPROVALS (hiring manager) ----------
+// NEW FLOW: resume + summary already done -> APPROVED shortlists the candidate, moves to the
+// recruiter-call stage, and emails the shortlisting note. No resume-upload invite here.
 app.post('/submissions/bulk-approval', async (req, res) => {
   try {
     const { submission_ids, decision, approver } = req.body; // decision: APPROVED | REJECTED
     if (!Array.isArray(submission_ids) || !submission_ids.length) return res.status(400).json({ error: 'submission_ids required' });
-    const newStatus = decision === 'APPROVED' ? 'SUBMITTED' : 'REJECTED';
-    const invites = [];
     for (const id of submission_ids) {
-      if (decision === 'APPROVED') await pool.query('UPDATE submissions SET status = $1, resume_requested = TRUE, last_updated = NOW() WHERE submission_id = $2', [newStatus, id]);
-      else await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [newStatus, id]);
+      const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [id])).rows[0];
+      if (!sub) continue;
+      const candEmail = candidateEmail(sub.candidate_id);
       if (decision === 'APPROVED') {
-        const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name FROM submissions WHERE submission_id = $1', [id])).rows[0];
-        if (sub) {
-          const token = 'INV-' + Math.random().toString(36).slice(2, 10).toUpperCase();
-          const candEmail = candidateEmail(sub.candidate_id);
-          try { await pool.query(`INSERT INTO candidate_onboarding (candidate_id, job_id, candidate_name, email, invite_token, onboarding_status) VALUES ($1,$2,$3,$4,$5,'INVITED')`, [sub.candidate_id, sub.job_id || '', sub.candidate_name, candEmail, token]); } catch(e){}
-          const link = (process.env.PORTAL_URL || 'https://direct-tribute-502305-q5.web.app') + '/#/candidate-upload?token=' + token;
-          invites.push({ name: sub.candidate_name, email: candEmail, subject: 'Please upload your resume — ' + (sub.job_title || 'a role'), body: 'Dear ' + sub.candidate_name + ',\n\nYou have been shortlisted for ' + (sub.job_title || 'a role') + '. Please upload your resume here:\n' + link + '\n\nBest regards,\nRecruit 360 Team' });
-        }
+        await pool.query("UPDATE submissions SET status = 'RECRUITER_CALL', last_updated = NOW() WHERE submission_id = $1", [id]);
+        const recruiterName = sub.submitted_by || 'your recruiter';
+        const subject = 'You have been shortlisted — ' + (sub.job_title || 'a role');
+        const body = 'Dear ' + sub.candidate_name + ',\n\nCongratulations! You have been shortlisted for the next rounds for ' + (sub.job_title || 'a role') + (sub.client_name ? ' at ' + sub.client_name : '') + '. ' + recruiterName + ' will guide you through the upcoming interviews and next steps, and will be in touch shortly to arrange your recruiter call.\n\nBest regards,\nRecruit 360 Team';
+        await logComm({ submission_id: id, candidate_id: sub.candidate_id, job_id: sub.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: sub.candidate_name, to_email: candEmail, subject, body, sent_by: approver || 'hiring_manager' });
+        await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'SHORTLISTED', message: 'You have been shortlisted for ' + (sub.job_title || 'a role') + '.' });
+        await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by || 'recruiter', type: 'APPROVED', message: sub.candidate_name + ' approved for ' + (sub.job_title || 'a role') + ' — schedule the recruiter call.' });
+      } else {
+        await pool.query("UPDATE submissions SET status = 'REJECTED', last_updated = NOW() WHERE submission_id = $1", [id]);
+        await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by || 'recruiter', type: 'CANDIDATE_REJECTED', message: sub.candidate_name + ' was not approved for ' + (sub.job_title || 'a role') + '.' });
       }
     }
-    return res.json({ ok: true, count: submission_ids.length, decision, invites });
+    return res.json({ ok: true, count: submission_ids.length, decision, invites: [] });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
