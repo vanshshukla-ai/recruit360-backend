@@ -2329,16 +2329,15 @@ app.post('/submissions/:id/context-action', async (req, res) => {
       // pull resume text (if stored) + candidate profile to ground the summary
       let resumeText = '';
       try { resumeText = (await pool.query('SELECT resume_text FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0]?.resume_text || ''; } catch (e) {}
-      let prof = {};
-      try { prof = (await pool.query('SELECT role, origin_city, destination_country, experience_years FROM candidates WHERE candidate_id = $1', [s.candidate_id])).rows[0] || {}; } catch (e) {}
-      const basis = resumeText
-        ? ('Resume content:\n' + resumeText.slice(0, 6000))
-        : ('Candidate profile — role: ' + (prof.role || s.job_title || 'n/a') + ', experience: ' + (prof.experience_years != null ? prof.experience_years + ' years' : 'n/a') + ', current city: ' + (prof.origin_city || 'n/a') + ', destination: ' + (prof.destination_country || 'n/a') + '.');
+      // The summary must be grounded in a real resume. If none is on file, ask for it first.
+      if (!resumeText || resumeText.trim().length < 20) {
+        return res.status(400).json({ error: 'No resume on file yet. Add the candidate’s resume (request it and mark received, with the resume text) before sending the summary to the hiring manager.' });
+      }
       let summary = '';
       try {
-        const gen = await genModel.generateContent('You are a recruiter preparing a concise candidate summary for a hiring manager to approve. Candidate: ' + s.candidate_name + ' for the role ' + (s.job_title || '') + (s.client_name ? ' at ' + s.client_name : '') + '.\n' + basis + '\n\nWrite 4-5 short lines: fit for the role, experience, location/destination, and any strength or gap. Plain text, no markdown.');
+        const gen = await genModel.generateContent('You are a recruiter preparing a concise candidate summary for a hiring manager to approve, based ONLY on the resume below. Candidate: ' + s.candidate_name + ' for the role ' + (s.job_title || '') + (s.client_name ? ' at ' + s.client_name : '') + '.\n\nResume:\n' + resumeText.slice(0, 6000) + '\n\nWrite 4-5 short lines: fit for the role, experience, key skills, and any strength or gap. Plain text, no markdown.');
         summary = gen.response.candidates[0].content.parts[0].text.trim();
-      } catch (e) { summary = `${s.candidate_name} — candidate for ${s.job_title || 'the role'}. Resume received and reviewed by the recruiter.`; }
+      } catch (e) { summary = `${s.candidate_name} — resume reviewed by the recruiter for ${s.job_title || 'the role'}.`; }
       try { await pool.query('UPDATE submissions SET status = $1, resume_summary = $2, last_updated = NOW() WHERE submission_id = $3', ['PENDING_HM_APPROVAL', summary, req.params.id]); }
       catch (e) { await pool.query("UPDATE submissions SET status = 'PENDING_HM_APPROVAL', last_updated = NOW() WHERE submission_id = $1", [req.params.id]); }
       let hm = '';
@@ -2422,9 +2421,12 @@ app.get('/placements/pending-approval', async (req, res) => {
 app.patch('/submissions/:id/resume', async (req, res) => {
   try {
     const { filename, doc_type, pasted_text, source, added_by } = req.body || {};
+    await ensureSlots();
     const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
     if (!s) return res.status(404).json({ error: 'not found' });
-    await pool.query('UPDATE submissions SET resume_received = TRUE, resume_requested = TRUE, last_updated = NOW() WHERE submission_id = $1', [req.params.id]);
+    // Store the actual resume text so the AI summary to the hiring manager is grounded in the real resume.
+    await pool.query('UPDATE submissions SET resume_received = TRUE, resume_requested = TRUE, resume_text = COALESCE($2, resume_text), last_updated = NOW() WHERE submission_id = $1',
+      [req.params.id, pasted_text ? String(pasted_text).slice(0, 8000) : null]);
     const tag = doc_type || 'Resume';
     const via = source ? ' (received via ' + source + ')' : '';
     const body = `${tag} received for ${s.candidate_name}${filename ? ' — ' + filename : ''}${via} and added manually by the recruiter.`
