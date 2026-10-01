@@ -2208,7 +2208,10 @@ REFORMATTED ANSWER:`;
 
     // --- Use-case skills (sir's exact questions) — checked first for reliable answers ---
     const isIdleJobs = /((idle|sitting idle|stuck|blocked|blocker|not moving|no movement|aging|ageing)[^.]*\b(job|jobs|requisition)|which jobs[^.]*(idle|blocked|stuck|blocking))/i.test(q);
-    const isVisaIssues = /(visa (issue|problem|reject)|rejections?|who[^.]*visa|candidates[^.]*visa[^.]*(issue|reject))/i.test(q) && !idMatch;
+    // "how many / count / total" questions go to the data agent for the clean number (e.g. 78),
+    // not the visa-issues list skill (which only counts formal rejection workflows).
+    const isCountQ = /\b(how many|count|number of|total|how much)\b/i.test(q);
+    const isVisaIssues = /(visa (issue|problem|reject)|rejections?|who[^.]*visa|candidates[^.]*visa[^.]*(issue|reject))/i.test(q) && !idMatch && !isCountQ;
     const isWorkToday = /(work on today|what should i (do|work)|my (work|queue|priorities|priority|tasks|pending)|today.?s (work|priorities|tasks)|prioriti[sz]e[^.]*today|need[^.]*my attention|what needs my attention|pending work|what.?s pending|whats pending|summary of (my )?(work|pending|tasks)|work summary|summari[sz]e (my )?(work|pending|tasks|day))/i.test(q);
     const isPlacementRisk = /(close to placement|near placement|placement[^.]*(risk|blocker|block)|at risk[^.]*placement|placements? at risk)/i.test(q);
     const isWhyNoCand = /(why[^.]*(no|haven.?t|not)[^.]*candidat|why[^.]*can.?t[^.]*find|feasibility)/i.test(q);
