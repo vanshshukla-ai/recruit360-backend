@@ -2204,7 +2204,8 @@ REFORMATTED ANSWER:`;
 
     let toolResult = '', agentName = '', rows = [];
     // Route: jobs/submissions/approvals/placements -> Cloud SQL (live website data). Candidates/visa -> BigQuery.
-    const isJobsData = /(open job|jobs\b|job posting|requisition|submission|submitted|approv|pending|awaiting|assigned|my job|placement|placed|offer|interview|recruiter call|hr round|shortlist|reject)/i.test(q);
+    // Jobs/submissions live in Cloud SQL; candidates/visa live in BigQuery — never send a "visa" question here.
+    const isJobsData = /(open job|jobs\b|job posting|requisition|submission|submitted|approv|pending|awaiting|assigned|my job|placement|placed|offer|interview|recruiter call|hr round|shortlist|reject)/i.test(q) && !/\bvisa\b/i.test(q);
 
     // --- Use-case skills (sir's exact questions) — checked first for reliable answers ---
     const isIdleJobs = /((idle|sitting idle|stuck|blocked|blocker|not moving|no movement|aging|ageing)[^.]*\b(job|jobs|requisition)|which jobs[^.]*(idle|blocked|stuck|blocking))/i.test(q);
