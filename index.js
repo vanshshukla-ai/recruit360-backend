@@ -2154,11 +2154,19 @@ app.post('/assistant/ask', async (req, res) => {
       : (role === 'admin')
       ? 'I can help with:\n• Which jobs are idle more than 5 days and what is blocking each?\n• What needs attention today?\n• Which candidates have visa issues?\n• Which placements are at risk?'
       : 'I can help with:\n• What should I work on today?\n• Which jobs are idle more than 5 days and what is blocking each?\n• Which candidates have visa issues and what is the action?\n• Which of my placements are at risk?';
-    if (/^(hi|hello|hey|yo|hii+|namaste)\b/i.test(q)) {
+    if (/^(hi+|hello|hey|yo|namaste|good (morning|afternoon|evening))\b/i.test(q)) {
       return res.json({ answer: 'Hello! I’m the Recruit 360 assistant. ' + menu, agent: 'Assistant' });
     }
-    if (q.length < 6 || /^(anything else|what else|more|ok(ay)?|yes|no|hmm+|and\??|next|continue|thanks?|thank you)$/i.test(q)) {
-      return res.json({ answer: 'Sure — here’s what I can do. ' + menu, agent: 'Assistant' });
+    // Gratitude — always reply politely, never error.
+    if (/\b(thanks|thank you|thankyou|thx|thnx|ty)\b/i.test(q) && q.length < 40) {
+      return res.json({ answer: 'You’re welcome! Is there anything else I can help you with about your recruitment data?', agent: 'Assistant' });
+    }
+    // Acknowledgements / sign-offs / tiny messages — reply gently instead of running a query.
+    if (/^(bye|goodbye|see you|that'?s all|that is all|nothing|no)\b/i.test(q)) {
+      return res.json({ answer: 'Alright — I’m here whenever you need anything about candidates, jobs, approvals, visas or placements.', agent: 'Assistant' });
+    }
+    if (q.length < 6 || /^(anything else|what else|more|ok(ay)?|k|cool|great|nice|good|awesome|perfect|got it|fine|done|yes|hmm+|and\??|next|continue)\b[\s\S]{0,15}$/i.test(q)) {
+      return res.json({ answer: 'Sure — here’s what I can help with. ' + menu, agent: 'Assistant' });
     }
 
     // --- Formatting / transform follow-ups: reshape the PREVIOUS answer, don't re-query ---
@@ -2190,7 +2198,8 @@ REFORMATTED ANSWER:`;
 
     // --- Fast intent detection (reliable keyword routing) ---
     const idMatch = question.match(/\bC\d{4}\b/i);
-    const isVisaFix = /(fix|remediat|rejection|what.?s wrong|how to fix|resolve).*(visa)|visa.*(fix|reject)/i.test(q) && idMatch;
+    // Any question about a SPECIFIC candidate's rejection / reason / fix -> visa remediation tool.
+    const isVisaFix = !!idMatch && /(fix|remediat|reject|rejection|reason|what.?s wrong|how to fix|how do i fix|resolve|why)/i.test(q);
     const isUrgency = /(urgent|urgency|at.?risk|awol|not reported|priority candidates|who needs attention)/i.test(q);
 
     let toolResult = '', agentName = '', rows = [];
@@ -2269,7 +2278,10 @@ ANSWER:`;
     }
     // Return rows + agent so the UI can show the "Result data" table and the agent trace.
     return res.json({ answer, agent: agentName, rows: Array.isArray(rows) ? rows.slice(0, 500) : [] });
-  } catch (e) { return res.status(500).json({ error: 'Assistant error', detail: e.message }); }
+  } catch (e) {
+    // Never surface a raw "Assistant error" — always answer gracefully.
+    return res.json({ answer: 'Sorry, I had trouble with that one. Please try rephrasing it — for example, ask about candidates, jobs, approvals, visas or placements.', agent: 'Assistant', rows: [] });
+  }
 });
 
 // ---------- CONTEXTUAL RECRUITER AGENT: suggest & execute the next action per candidate ----------
@@ -2329,15 +2341,23 @@ app.post('/submissions/:id/context-action', async (req, res) => {
       // pull resume text (if stored) + candidate profile to ground the summary
       let resumeText = '';
       try { resumeText = (await pool.query('SELECT resume_text FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0]?.resume_text || ''; } catch (e) {}
-      // The summary must be grounded in a real resume. If none is on file, ask for it first.
-      if (!resumeText || resumeText.trim().length < 20) {
-        return res.status(400).json({ error: 'No resume on file yet. Add the candidate’s resume (request it and mark received, with the resume text) before sending the summary to the hiring manager.' });
+      // Summary is grounded in whatever we already have: the resume text if on file,
+      // otherwise the candidate's SAVED profile (pool candidates are already in our database).
+      let basis = '', basisNote = '';
+      if (resumeText && resumeText.trim().length >= 20) {
+        basis = 'Resume:\n' + resumeText.slice(0, 6000); basisNote = 'from the resume on file';
+      } else {
+        let prof = {};
+        try { prof = (await pool.query('SELECT role, origin_city, destination_country, experience_years FROM candidates WHERE candidate_id = $1', [s.candidate_id])).rows[0] || {}; } catch (e) {}
+        if (!prof || !prof.role) { try { const b = await bqQuery(`SELECT role, origin_city, destination_country, experience_years FROM \`${BQ_DS}.candidates\` WHERE candidate_id = '${(s.candidate_id || '').replace(/'/g, '')}'`); if (b && b[0]) prof = b[0]; } catch (e) {} }
+        basis = 'Candidate profile on file — role: ' + (prof.role || s.job_title || 'n/a') + ', experience: ' + (prof.experience_years != null ? prof.experience_years + ' years' : 'n/a') + ', current city: ' + (prof.origin_city || 'n/a') + ', destination: ' + (prof.destination_country || 'n/a') + '.';
+        basisNote = 'from the candidate’s saved profile';
       }
       let summary = '';
       try {
-        const gen = await genModel.generateContent('You are a recruiter preparing a concise candidate summary for a hiring manager to approve, based ONLY on the resume below. Candidate: ' + s.candidate_name + ' for the role ' + (s.job_title || '') + (s.client_name ? ' at ' + s.client_name : '') + '.\n\nResume:\n' + resumeText.slice(0, 6000) + '\n\nWrite 4-5 short lines: fit for the role, experience, key skills, and any strength or gap. Plain text, no markdown.');
+        const gen = await genModel.generateContent('You are a recruiter preparing a concise candidate summary for a hiring manager to approve. Candidate: ' + s.candidate_name + ' for the role ' + (s.job_title || '') + (s.client_name ? ' at ' + s.client_name : '') + '. Base it ONLY on the data below (' + basisNote + ').\n' + basis + '\n\nWrite 4-5 short lines: fit for the role, experience, key points, and any strength or gap. Plain text, no markdown.');
         summary = gen.response.candidates[0].content.parts[0].text.trim();
-      } catch (e) { summary = `${s.candidate_name} — resume reviewed by the recruiter for ${s.job_title || 'the role'}.`; }
+      } catch (e) { summary = `${s.candidate_name} — candidate for ${s.job_title || 'the role'}, summarized from the profile on file.`; }
       try { await pool.query('UPDATE submissions SET status = $1, resume_summary = $2, last_updated = NOW() WHERE submission_id = $3', ['PENDING_HM_APPROVAL', summary, req.params.id]); }
       catch (e) { await pool.query("UPDATE submissions SET status = 'PENDING_HM_APPROVAL', last_updated = NOW() WHERE submission_id = $1", [req.params.id]); }
       let hm = '';
@@ -2448,8 +2468,12 @@ app.patch('/submissions/:id/placement-approval', async (req, res) => {
     if (decision === 'APPROVED') {
       await pool.query("UPDATE submissions SET status = 'PLACED', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
       try { await pool.query("UPDATE candidates SET visa_status = 'PLACEMENT_ACTIVE', last_updated = NOW() WHERE candidate_id = $1", [s.candidate_id]); } catch (e) {}
-      // Position is filled — set the job status so recruiters stop sourcing for it.
-      try { await pool.query("UPDATE jobs SET status = 'Filled' WHERE job_id = $1", [s.job_id]); } catch (e) {}
+      // Close the job only when all openings are filled (count placements vs number_of_positions).
+      try {
+        const placedCount = Number((await pool.query("SELECT COUNT(*) AS n FROM submissions WHERE job_id = $1 AND status = 'PLACED'", [s.job_id])).rows[0]?.n || 0);
+        const openings = Number((await pool.query('SELECT number_of_positions FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.number_of_positions || 1);
+        if (placedCount >= openings) await pool.query("UPDATE jobs SET status = 'Filled' WHERE job_id = $1", [s.job_id]);
+      } catch (e) {}
       const recMsg = `Placement APPROVED: ${s.candidate_name} for ${s.job_title || 'a role'}. Proceed to onboarding. Visa processing is now in progress.`;
       await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACEMENT_APPROVED', message: recMsg });
       await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Placement approved — ' + s.candidate_name, body: recMsg });
@@ -2480,6 +2504,16 @@ function meetLink() {
 }
 function clientEmailFor(name) { return (String(name || 'client').toLowerCase().replace(/[^a-z0-9]+/g, '') || 'client') + '@client.com'; }
 const VISA_TEAM_EMAIL = 'visa-team@fragman.com'; // third-party visa agency (Fragman) placeholder
+// A REAL, clickable Google Calendar event link (prefilled title/time/details; adding it creates a Google Meet).
+function calendarLink(startISO, durationMin, title, details) {
+  try {
+    const start = new Date(startISO);
+    const end = new Date(start.getTime() + (durationMin || 30) * 60000);
+    const fmt = (d) => d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+    const p = new URLSearchParams({ action: 'TEMPLATE', text: title || 'Interview', dates: fmt(start) + '/' + fmt(end), details: details || '', add: '' });
+    return 'https://calendar.google.com/calendar/render?' + p.toString();
+  } catch (e) { return ''; }
+}
 // Suggest N future business slots (skips weekends), at 10:00 / 12:00 / 15:00 / 17:00 IST-ish.
 function suggestSlots(n = 3) {
   const hours = [10, 12, 15, 17];
@@ -2563,8 +2597,9 @@ app.post('/submissions/:id/slots/fix', async (req, res) => {
     const label = kind === 'client' ? 'client interview' : 'recruiter call';
     const when = new Date(slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
     const clientCc = kind === 'client' ? clientEmailFor(s.client_name) : '';
+    const calLink = calendarLink(slot_time, dur, label.replace(/^./, c => c.toUpperCase()) + ' — ' + (s.job_title || 'role'), 'Candidate: ' + s.candidate_name + (s.client_name ? ' | Client: ' + s.client_name : '') + ' | Join: ' + link);
     const emailSubject = `Your ${label} is scheduled — ${s.job_title || 'a role'}`;
-    const emailBody = 'Dear ' + s.candidate_name + ',\n\nYour ' + label + (s.client_name && kind === 'client' ? ' with ' + s.client_name : '') + ' has been scheduled for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nNo reply is needed — please join at the scheduled time.\n\nBest regards,\nRecruit 360 Team' + (clientCc ? '\n\n(The client interview panel is copied on this invite.)' : '');
+    const emailBody = 'Dear ' + s.candidate_name + ',\n\nYour ' + label + (s.client_name && kind === 'client' ? ' with ' + s.client_name : '') + ' has been scheduled for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nAdd it to your calendar (with Google Meet):\n' + calLink + '\n\nNo reply is needed — please join at the scheduled time.\n\nBest regards,\nRecruit 360 Team' + (clientCc ? '\n\n(The client interview panel is copied on this invite.)' : '');
     await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody + (clientCc ? '\nCc: ' + clientCc : ''), sent_by: fixed_by || 'recruiter' });
     await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: `Your ${label} is fixed for ${when}. Link: ${link}` });
     if (s.submitted_by) await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by, type: 'INTERVIEW', message: `${s.candidate_name}'s ${label} fixed for ${when}.` });
@@ -2613,8 +2648,9 @@ app.post('/slots/:slotId/confirm', async (req, res) => {
     const label = slot.kind === 'client' ? 'client interview' : 'recruiter call';
     const when = new Date(slot.slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
     const clientCc = slot.kind === 'client' ? clientEmailFor(s.client_name) : '';
+    const calLink = calendarLink(slot.slot_time, slot.duration_min, label.replace(/^./, c => c.toUpperCase()) + ' — ' + (s.job_title || 'role'), 'Candidate: ' + (s.candidate_name || '') + (s.client_name ? ' | Client: ' + s.client_name : '') + ' | Join: ' + link);
     const emailSubject = `Your ${label} is confirmed — ${s.job_title || 'a role'}`;
-    const emailBody = 'Dear ' + (s.candidate_name || 'Candidate') + ',\n\nYour ' + label + (s.client_name && slot.kind === 'client' ? ' with ' + s.client_name : '') + ' is confirmed for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nBest regards,\nRecruit 360 Team' + (clientCc ? '\n\n(The client interview panel is copied on this invite.)' : '');
+    const emailBody = 'Dear ' + (s.candidate_name || 'Candidate') + ',\n\nYour ' + label + (s.client_name && slot.kind === 'client' ? ' with ' + s.client_name : '') + ' is confirmed for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nAdd it to your calendar (with Google Meet):\n' + calLink + '\n\nBest regards,\nRecruit 360 Team' + (clientCc ? '\n\n(The client interview panel is copied on this invite.)' : '');
     await logComm({ submission_id: slot.submission_id, candidate_id: slot.candidate_id, job_id: slot.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody + (clientCc ? '\nCc: ' + clientCc : ''), sent_by: 'recruiter' });
     await notify({ candidate_id: slot.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: `Your ${label} is confirmed for ${when}. Link: ${link}` });
     if (s.submitted_by) await notify({ candidate_id: slot.candidate_id, recipient: s.submitted_by, type: 'INTERVIEW', message: `${s.candidate_name}'s ${label} confirmed for ${when}.` });
