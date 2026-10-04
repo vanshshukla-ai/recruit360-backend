@@ -1,9 +1,62 @@
 import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
+import crypto from 'crypto';
 import { VertexAI } from '@google-cloud/vertexai';
 import { DocumentProcessorServiceClient } from '@google-cloud/documentai';
 import { BigQuery } from '@google-cloud/bigquery';
+
+// ---------- AUTH HELPERS (scrypt; no external deps) ----------
+function hashPassword(password, salt) {
+  salt = salt || crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return { salt, hash };
+}
+function verifyPassword(password, salt, hash) {
+  try {
+    if (!salt || !hash) return false;
+    const h = crypto.scryptSync(String(password), salt, 64).toString('hex');
+    const a = Buffer.from(h), b = Buffer.from(hash);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (e) { return false; }
+}
+let _authReady = false;
+async function ensureAuth() {
+  if (_authReady) return;
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS app_users (
+      user_id TEXT PRIMARY KEY, full_name TEXT, email TEXT, role TEXT, user_group TEXT, phone TEXT,
+      active BOOLEAN DEFAULT TRUE, password_hash TEXT, password_salt TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pool.query('ALTER TABLE app_users ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE');
+    await pool.query('ALTER TABLE app_users ADD COLUMN IF NOT EXISTS email TEXT');
+    await pool.query('ALTER TABLE app_users ADD COLUMN IF NOT EXISTS password_hash TEXT');
+    await pool.query('ALTER TABLE app_users ADD COLUMN IF NOT EXISTS password_salt TEXT');
+    await pool.query('ALTER TABLE app_users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()');
+    // Seed the testing accounts (idempotent). Password only set if the account has none yet.
+    const def = process.env.SEED_PASSWORD || 'Avanciers@360';
+    const seed = [
+      ['USR-ADMIN1', 'Parv', 'parv@avanciers.com', 'admin'],
+      ['USR-HM-PARIKSHITH', 'Parikshith Upadhyaya', 'parikshith.upadhyaya@avanciers.com', 'hiring_manager'],
+      ['USR-HM-PUSHPAM', 'Pushpam Singh', 'pushpam.singh@avanciers.com', 'hiring_manager'],
+      ['USR-REC-NEHA', 'Neha Das', 'neha.das@avanciers.com', 'recruiter'],
+      ['USR-REC-SHUBHAM', 'Shubham Swarup', 'shubham.swarup@avanciers.com', 'recruiter'],
+    ];
+    for (const [uid, name, email, role] of seed) {
+      const { salt, hash } = hashPassword(def);
+      await pool.query(
+        `INSERT INTO app_users (user_id, full_name, email, role, active, password_hash, password_salt)
+         VALUES ($1,$2,$3,$4,TRUE,$5,$6)
+         ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, email = EXCLUDED.email, role = EXCLUDED.role, active = TRUE,
+           password_hash = COALESCE(app_users.password_hash, EXCLUDED.password_hash),
+           password_salt = COALESCE(app_users.password_salt, EXCLUDED.password_salt)`,
+        [uid, name, email, role, hash, salt]
+      );
+    }
+    _authReady = true;
+    console.log('Auth schema + seed ensured.');
+  } catch (e) { console.log('ensureAuth warn:', e.message); }
+}
 
 const app = express();
 app.use(cors());
@@ -1300,17 +1353,75 @@ async function notify({ candidate_id, recipient, type, message }) {
 // Every email/update in the recruitment flow is recorded here so the full
 // communication trail (to candidate, recruiter, hiring manager, client) is
 // visible and demonstrable in the app.
-async function logComm({ submission_id, candidate_id, job_id, channel, to_role, to_name, to_email, subject, body, sent_by }) {
+// ---------- REAL EMAIL (SendGrid) ----------
+// Gated on SENDGRID_API_KEY. No key => demo mode (nothing sends; UI/logs unchanged).
+// MAIL_FROM = your verified SendGrid sender. MAIL_REDIRECT (optional) = send every email to this
+// one inbox during testing (so sir receives them all) while the app still shows the real recipient.
+async function sendEmail({ to, cc, subject, body }) {
   try {
+    const key = process.env.SENDGRID_API_KEY;
+    const from = process.env.MAIL_FROM;
+    if (!key || !from || !to) return { sent: false, reason: 'not-configured' };
+    if (typeof fetch !== 'function') return { sent: false, reason: 'no-fetch' };
+    const redirect = process.env.MAIL_REDIRECT; // optional single test inbox
+    const realTo = redirect || to;
+    const subj = redirect ? `[to: ${to}] ${subject}` : subject;
+    const personalization = { to: [{ email: realTo }] };
+    if (!redirect && cc) {
+      const ccList = String(cc).split(',').map(s => s.trim()).filter(e => /.+@.+\..+/.test(e)).map(email => ({ email }));
+      if (ccList.length) personalization.cc = ccList;
+    }
+    const payload = {
+      personalizations: [personalization],
+      from: { email: from, name: process.env.MAIL_FROM_NAME || 'Recruit 360' },
+      subject: subj || '(no subject)',
+      content: [{ type: 'text/plain', value: body || '' }],
+    };
+    const r = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (r.status >= 200 && r.status < 300) return { sent: true };
+    const errTxt = await r.text().catch(() => '');
+    console.log('SendGrid error', r.status, errTxt.slice(0, 300));
+    return { sent: false, reason: 'sendgrid-' + r.status };
+  } catch (e) { console.log('sendEmail warn:', e.message); return { sent: false, reason: e.message }; }
+}
+
+async function logComm({ submission_id, candidate_id, job_id, channel, to_role, to_name, to_email, subject, body, sent_by, cc }) {
+  try {
+    // Resolve the REAL candidate email so emails reach the actual person (what the recruiter entered),
+    // not a demo inbox. Falls back to whatever was passed if no real address is on file.
+    let dest = to_email || '';
+    if ((channel || 'EMAIL') === 'EMAIL' && to_role === 'candidate' && candidate_id) {
+      try {
+        const r = (await pool.query('SELECT email FROM candidates WHERE candidate_id = $1', [candidate_id])).rows[0];
+        if (r && r.email && /.+@.+\..+/.test(r.email) && !/@example\.com$/i.test(r.email)) dest = r.email;
+      } catch (e) {}
+    }
     const comm_id = 'CM' + Date.now().toString().slice(-10) + Math.floor(Math.random()*1000);
     await pool.query(
       `INSERT INTO communications (comm_id, submission_id, candidate_id, job_id, channel, to_role, to_name, to_email, subject, body, sent_by, created_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())`,
-      [comm_id, submission_id || null, candidate_id || null, job_id || null, channel || 'EMAIL', to_role || '', to_name || '', to_email || '', subject || '', body || '', sent_by || 'system']
+      [comm_id, submission_id || null, candidate_id || null, job_id || null, channel || 'EMAIL', to_role || '', to_name || '', dest || '', subject || '', body || '', sent_by || 'system']
     );
+    // Real send for actual emails (best-effort; never blocks the workflow).
+    if ((channel || 'EMAIL') === 'EMAIL' && dest) { sendEmail({ to: dest, cc, subject, body }).catch(() => {}); }
     return comm_id;
   } catch (e) { /* best-effort, never block the main action */ return null; }
 }
+
+// Test the email configuration: GET /mail/test?to=you@example.com
+app.get('/mail/test', async (req, res) => {
+  try {
+    const to = req.query.to || process.env.MAIL_FROM;
+    const configured = !!(process.env.SENDGRID_API_KEY && process.env.MAIL_FROM);
+    if (!configured) return res.json({ configured: false, message: 'Set SENDGRID_API_KEY and MAIL_FROM env vars to enable real email.' });
+    const r = await sendEmail({ to, subject: 'Recruit 360 — email test', body: 'This is a test email from Recruit 360. If you received this, SendGrid is wired correctly.' });
+    return res.json({ configured: true, to, redirectedTo: process.env.MAIL_REDIRECT || null, result: r });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
 
 // List the communication trail for a submission (or a whole job)
 app.get('/communications', async (req, res) => {
@@ -1505,21 +1616,55 @@ app.get('/admin/users', async (req, res) => {
 });
 app.post('/admin/users', async (req, res) => {
   try {
+    await ensureAuth();
     const b = req.body;
     if (!b.full_name || !b.full_name.trim() || !b.role) return res.status(400).json({ error: 'full_name and role required' });
     const user_id = b.user_id || ('USR-' + Date.now().toString().slice(-6));
+    // Give every new user a login password so they can sign in and (for recruiters) appear in the assign dropdown.
+    const pw = b.password || process.env.SEED_PASSWORD || 'Avanciers@360';
+    const { salt, hash } = hashPassword(pw);
     await pool.query(
-      `INSERT INTO app_users (user_id, full_name, email, role, user_group, phone) VALUES ($1,$2,$3,$4,$5,$6)
-       ON CONFLICT (user_id) DO NOTHING`,
-      [user_id, b.full_name, b.email || '', b.role, b.user_group || '', b.phone || '']
+      `INSERT INTO app_users (user_id, full_name, email, role, user_group, phone, active, password_hash, password_salt)
+       VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7,$8)
+       ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, email = EXCLUDED.email, role = EXCLUDED.role, active = TRUE`,
+      [user_id, b.full_name, b.email || '', b.role, b.user_group || '', b.phone || '', hash, salt]
     );
-    return res.json({ ok: true, user_id });
+    return res.json({ ok: true, user_id, email: b.email || '', password: pw });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- AUTH: single login, role resolved from the email ----------
+app.post('/auth/login', async (req, res) => {
+  try {
+    await ensureAuth();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
+    const { rows } = await pool.query(
+      `SELECT user_id, full_name, email, role, password_hash, password_salt FROM app_users
+        WHERE LOWER(email) = $1 AND active = TRUE
+        ORDER BY (password_hash IS NOT NULL) DESC, created_at DESC LIMIT 1`, [email]);
+    const u = rows[0];
+    if (!u || !u.password_hash || !verifyPassword(password, u.password_salt, u.password_hash)) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+    const initials = String(u.full_name || u.email).split(/\s+/).map(s => s[0]).join('').slice(0, 2).toUpperCase();
+    return res.json({ user: { name: u.full_name, email: u.email, role: u.role, userId: u.user_id, initials } });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- AUTH: list users (admin) ----------
+app.get('/auth/users', async (req, res) => {
+  try {
+    await ensureAuth();
+    const { rows } = await pool.query("SELECT user_id, full_name, email, role, active FROM app_users ORDER BY role, full_name");
+    return res.json({ users: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
 // Recruiters list (for the assign dropdown)
 app.get('/recruiters', async (req, res) => {
-  try { const { rows } = await pool.query("SELECT user_id, full_name FROM app_users WHERE role='recruiter' AND active=TRUE ORDER BY full_name"); return res.json({ recruiters: rows }); }
+  try { await ensureAuth(); const { rows } = await pool.query("SELECT user_id, full_name, email FROM app_users WHERE role='recruiter' AND active=TRUE ORDER BY full_name"); return res.json({ recruiters: rows }); }
   catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -2783,7 +2928,7 @@ app.post('/submissions/:id/offer/accept', async (req, res) => {
     const congratsBody = 'Dear ' + s.candidate_name + ',\n\nThank you for accepting your offer with ' + COMPANY_NAME + ' for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '. We are thrilled to have you join us.\n\nTo begin onboarding, our team will guide you through:\n1. Document Verification — please keep your identity and education documents ready.\n2. Application Forms — we will share the joining application for you to complete.\n3. Visa Documentation — our visa partner (' + VISA_PARTNER_NAME + ') will collect and process the required documents and keep you updated.\n\nWe will contact you shortly with the details. Congratulations and welcome aboard!\n\nBest regards,\n' + COMPANY_NAME + ' Talent Team\n\nCc: Recruiter (' + (s.submitted_by || 'assigned recruiter') + '), Visa Application Team (' + VISA_TEAM_EMAIL + ')';
     await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'PLACED', message: 'Offer accepted — you have been placed for ' + (s.job_title || 'a role') + '. Visa processing will begin.' });
     await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACED', message: s.candidate_name + ' accepted the offer and is now placed for ' + (s.job_title || 'a role') + '.' });
-    await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: congratsSubject, body: congratsBody });
+    await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: congratsSubject, body: congratsBody, cc: VISA_TEAM_EMAIL });
     return res.json({ ok: true, status: 'PLACED', offer_status: 'ACCEPTED', candidateEmail: candEmail, emailSubject: congratsSubject, emailBody: congratsBody, cc: VISA_TEAM_EMAIL, jobFilled });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
