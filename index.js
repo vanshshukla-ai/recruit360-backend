@@ -2309,9 +2309,10 @@ app.get('/submissions/:id/next-action', async (req, res) => {
       RECRUITER_CALL:             { action: 'schedule_call', label: 'Schedule recruiter call', can: true, hint: 'Shortlisted — propose slots for the recruiter call and capture CTC there.' },
       CLIENT_INTERVIEW:           { action: 'request_placement', label: 'Send for placement approval', can: true, hint: 'Request the client panel, schedule the client interview, then send to the hiring manager for placement approval.' },
       PENDING_PLACEMENT_APPROVAL: { action: 'await_placement', label: 'Awaiting placement approval', can: false, hint: 'Placement approval is pending with the hiring manager.' },
-      OFFER:                      { action: 'await_placement', label: 'Awaiting placement approval', can: false, hint: 'Placement approval is pending with the hiring manager.' },
+      OFFER:                      { action: 'prepare_offer', label: 'Prepare & send the offer letter', can: false, hint: 'Approved to hire — prepare the offer letter below, get it signed by an admin, then send it to the candidate.' },
       PLACED:                     { action: 'done', label: 'Placed', can: false, hint: 'This candidate is placed.' },
       REJECTED:                   { action: 'done', label: 'Rejected', can: false, hint: 'This candidate was rejected.' },
+      OFFER_DECLINED:             { action: 'done', label: 'Offer declined', can: false, hint: 'The candidate declined the offer.' },
     };
     const next = MAP[s.status] || { action: 'review', label: 'Review', can: true, hint: 'Review this candidate.' };
     return res.json({ submission: s, next });
@@ -2470,24 +2471,18 @@ app.patch('/submissions/:id/placement-approval', async (req, res) => {
     const cArgs = { submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, sent_by: approver || 'hiring_manager' };
     const candEmail = candidateEmail(s.candidate_id);
     if (decision === 'APPROVED') {
-      await pool.query("UPDATE submissions SET status = 'PLACED', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
-      try { await pool.query("UPDATE candidates SET visa_status = 'PLACEMENT_ACTIVE', last_updated = NOW() WHERE candidate_id = $1", [s.candidate_id]); } catch (e) {}
-      // Close the job only when all openings are filled (count placements vs number_of_positions).
-      try {
-        const placedCount = Number((await pool.query("SELECT COUNT(*) AS n FROM submissions WHERE job_id = $1 AND status = 'PLACED'", [s.job_id])).rows[0]?.n || 0);
-        const openings = Number((await pool.query('SELECT number_of_positions FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.number_of_positions || 1);
-        if (placedCount >= openings) await pool.query("UPDATE jobs SET status = 'Filled' WHERE job_id = $1", [s.job_id]);
-      } catch (e) {}
-      const recMsg = `Placement APPROVED: ${s.candidate_name} for ${s.job_title || 'a role'}. Proceed to onboarding. Visa processing is now in progress.`;
+      // Stage 6: HM gives internal approval to hire -> move to the OFFER stage (prepare offer letter).
+      // The candidate is NOT placed yet; placement (onboarding + visa email + job-fill) happens once the
+      // admin-signed offer is accepted (see /offer/accept below).
+      await ensureSlots();
+      await pool.query("UPDATE submissions SET status = 'OFFER', offer_status = 'PENDING', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
+      const recMsg = `Approved to hire: ${s.candidate_name} for ${s.job_title || 'a role'}. Next step: prepare the offer letter for admin signature.`;
       await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACEMENT_APPROVED', message: recMsg });
-      await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Placement approved — ' + s.candidate_name, body: recMsg });
-      // Congratulations + onboarding email to the candidate; CC recruiter + visa application team.
-      const cc = [s.submitted_by ? 'recruiter' : null, VISA_TEAM_EMAIL].filter(Boolean).join(', ');
-      const congratsSubject = 'Congratulations — You Have Been Placed for ' + (s.job_title || 'a role');
-      const congratsBody = 'Dear ' + s.candidate_name + ',\n\nWe are pleased to confirm your placement for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '.\n\nTo begin onboarding, our team will guide you through the next steps:\n1. Document Verification — please keep your identity and education documents ready.\n2. Application Forms — we will share the joining application for you to complete.\n3. Visa Documentation — our visa partner (Fragman) will collect and process the required documents and keep you updated.\n\nWe will contact you shortly with the details. Congratulations and welcome aboard!\n\nBest regards,\nRecruit 360 Team\n\nCc: Recruiter (' + (s.submitted_by || 'assigned recruiter') + '), Visa Application Team (' + VISA_TEAM_EMAIL + ')';
-      await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'PLACED', message: 'Congratulations! You have been placed for ' + (s.job_title || 'a role') + '. Visa processing will begin.' });
-      await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: congratsSubject, body: congratsBody });
-      return res.json({ ok: true, status: 'PLACED', candidateEmail: candEmail, emailSubject: congratsSubject, emailBody: congratsBody, cc: VISA_TEAM_EMAIL, jobFilled: true });
+      let hm = '';
+      try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
+      await notify({ candidate_id: s.candidate_id, recipient: hm || 'hiring_manager', type: 'OFFER_PREP', message: `Prepare the offer letter for ${s.candidate_name} (${s.job_title || 'a role'}).` });
+      await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm || 'hiring_manager', subject: 'Approved to hire — prepare offer: ' + s.candidate_name, body: recMsg });
+      return res.json({ ok: true, status: 'OFFER', next: 'prepare_offer', message: 'Approved to hire. Prepare the offer letter next, then send it to admin for signature.' });
     }
     // Rejected -> send it back to the recruiter at the client-interview stage with a reason
     await pool.query("UPDATE submissions SET status = 'CLIENT_INTERVIEW', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
@@ -2495,6 +2490,315 @@ app.patch('/submissions/:id/placement-approval', async (req, res) => {
     await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACEMENT_REJECTED', message: rejMsg });
     await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Placement not approved — ' + s.candidate_name, body: rejMsg });
     return res.json({ ok: true, status: 'CLIENT_INTERVIEW' });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ============================================================
+// OFFER LETTER (Stage 6 & 7) — HM prepares final terms, AI drafts the letter,
+// ADMIN (authorized signatory) signs/seals, then it is sent to the candidate.
+// Region-aware (India / Germany / Poland). No infra deps: a branded, print-ready
+// HTML letter the UI renders and downloads as a PDF.
+// ============================================================
+const COMPANY_NAME = 'Avanciers';
+// Default authorized signatory (admin). Can be overridden per-sign from the UI.
+const DEFAULT_SIGNATORY = { name: process.env.SIGNATORY_NAME || 'Authorized Signatory', title: process.env.SIGNATORY_TITLE || 'Director, Avanciers' };
+
+// Region presets: currency, statutory leave, service-commitment norms and payroll cadence hints.
+function offerRegionDefaults(region) {
+  const r = String(region || 'India').trim().toLowerCase();
+  if (r === 'germany' || r === 'de') {
+    return { region: 'Germany', country: 'Germany', currency: '€', currency_code: 'EUR', locale: 'de-DE',
+      vacation_days: 28, min_stay_months: 12, repayment_cap: '€8,000', pay_type: 'biweekly',
+      note: 'European salary standards apply; figures are gross before tax, social security and statutory contributions.' };
+  }
+  if (r === 'poland' || r === 'pl') {
+    return { region: 'Poland', country: 'Poland', currency: 'zł', currency_code: 'PLN', locale: 'pl-PL',
+      vacation_days: 26, min_stay_months: 12, repayment_cap: 'zł30,000', pay_type: 'monthly',
+      note: 'Figures are gross and aligned to the applicable Polish national minimum-wage baseline and statutory contributions.' };
+  }
+  return { region: 'India', country: 'India', currency: '₹', currency_code: 'INR', locale: 'en-IN',
+    vacation_days: 24, min_stay_months: 6, repayment_cap: '₹400,000', pay_type: 'annual',
+    note: 'Figures are gross before tax, statutory deductions and employer contributions as applicable in India.' };
+}
+
+function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+
+function payLine(d) {
+  const a = esc(d.pay_amount || '');
+  const c = d.currency || '';
+  if (!a) return 'As discussed and confirmed on the recruiter call.';
+  switch (d.pay_type) {
+    case 'hourly':   return `${c}${a} per hour` + (d.annualized ? `, annualizing to approximately ${c}${esc(d.annualized)} gross per year` : '');
+    case 'monthly':  return `${c}${a} gross per month` + (d.annualized ? `, i.e. approximately ${c}${esc(d.annualized)} gross per year` : '');
+    case 'biweekly': return `${c}${a} gross every two weeks (bi-weekly)` + (d.annualized ? `, i.e. approximately ${c}${esc(d.annualized)} gross per year` : '');
+    default:         return `${c}${a} gross per year` + (d.monthly ? ` (approx. ${c}${esc(d.monthly)} gross per month, indicative, before tax and deductions)` : '');
+  }
+}
+
+// Build the full, print-ready offer letter. `signed` adds the authorized-signatory block + seal.
+function buildOfferHtml(d) {
+  const today = new Date().toLocaleDateString(d.locale || 'en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+  const startDate = d.start_date ? new Date(d.start_date).toLocaleDateString(d.locale || 'en-IN', { day: 'numeric', month: 'long', year: 'numeric' }) : 'to be confirmed';
+  const resp = (d.responsibilities || '').trim();
+  const respHtml = resp
+    ? resp.split(/\n+/).filter(Boolean).map(x => `<li>${esc(x.replace(/^[-•]\s*/, ''))}</li>`).join('')
+    : '<li>Deliver the responsibilities of the role as directed by your reporting manager.</li>';
+  const signedBlock = d.signed ? `
+      <div class="sign">
+        <div class="seal">AUTHORIZED<br/>&bull; ${esc(COMPANY_NAME).toUpperCase()} &bull;<br/>SIGNATORY</div>
+        <div class="sigline">
+          <div class="signame">${esc(d.signatory_name || DEFAULT_SIGNATORY.name)}</div>
+          <div class="sigtitle">${esc(d.signatory_title || DEFAULT_SIGNATORY.title)}</div>
+          <div class="sigdate">Signed on ${esc(d.signed_at ? new Date(d.signed_at).toLocaleDateString(d.locale || 'en-IN', { day: 'numeric', month: 'long', year: 'numeric' }) : today)}</div>
+        </div>
+      </div>` : `
+      <div class="sign pending"><div class="sigpending">Pending authorized-signatory approval (admin)</div></div>`;
+  return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  @page { size: A4; margin: 18mm; }
+  * { box-sizing: border-box; }
+  body { font-family: Georgia, 'Times New Roman', serif; color: #1f2430; line-height: 1.5; font-size: 12.5px; margin: 0; background: #fff; }
+  .page { max-width: 760px; margin: 0 auto; padding: 28px 30px; }
+  .brandbar { display:flex; justify-content:space-between; align-items:flex-end; border-bottom: 3px solid #4f46e5; padding-bottom: 10px; margin-bottom: 4px; }
+  .brand { font-family: Arial, Helvetica, sans-serif; font-weight: 800; letter-spacing: 2px; font-size: 20px; color:#312e81; }
+  .brand small { display:block; font-size: 9px; letter-spacing: 3px; color:#6b7280; font-weight:600; margin-top:2px; }
+  .conf { font-family: Arial, sans-serif; font-size: 9px; color:#9ca3af; text-transform: uppercase; letter-spacing: 1px; text-align:right; }
+  h1 { font-family: Arial, Helvetica, sans-serif; font-size: 15px; letter-spacing: 1px; text-align:center; margin: 16px 0 2px; color:#111827; }
+  .sub { text-align:center; font-family: Arial, sans-serif; font-size: 10.5px; color:#6b7280; margin-bottom: 14px; }
+  table.meta { width:100%; border-collapse: collapse; margin: 10px 0 16px; font-size: 11.5px; }
+  table.meta td { border:1px solid #e5e7eb; padding: 6px 9px; vertical-align: top; }
+  table.meta td.k { background:#f8fafc; font-family: Arial, sans-serif; font-weight:700; color:#374151; width: 38%; }
+  h2 { font-family: Arial, Helvetica, sans-serif; font-size: 12px; color:#312e81; margin: 16px 0 4px; }
+  ul { margin: 4px 0 4px 18px; padding:0; }
+  li { margin: 2px 0; }
+  p { margin: 6px 0; }
+  .greeting { margin-top: 10px; }
+  .footnote { font-size: 10px; color:#6b7280; font-style: italic; margin-top:4px; }
+  .sign { margin-top: 30px; display:flex; align-items:center; gap: 26px; }
+  .sign.pending { justify-content:flex-start; }
+  .seal { width: 92px; height: 92px; border: 2px dashed #4f46e5; border-radius: 50%; display:flex; align-items:center; justify-content:center; text-align:center; font-family: Arial, sans-serif; font-size: 8px; font-weight:800; color:#4f46e5; letter-spacing:1px; transform: rotate(-9deg); }
+  .sigline { }
+  .signame { font-family: 'Segoe Script', 'Brush Script MT', cursive; font-size: 24px; color:#1e3a8a; border-bottom:1px solid #9ca3af; padding-bottom:3px; min-width: 240px; }
+  .sigtitle { font-family: Arial, sans-serif; font-size: 11px; color:#374151; margin-top:4px; font-weight:700; }
+  .sigdate { font-family: Arial, sans-serif; font-size: 10px; color:#6b7280; margin-top:2px; }
+  .sigpending { font-family: Arial, sans-serif; font-size: 11px; color:#b45309; background:#fffbeb; border:1px solid #fde68a; border-radius:6px; padding:8px 12px; }
+  .foot { margin-top: 26px; border-top:1px solid #e5e7eb; padding-top:8px; font-family: Arial, sans-serif; font-size: 9px; color:#9ca3af; text-align:center; }
+</style></head>
+<body><div class="page">
+  <div class="brandbar">
+    <div class="brand">${esc(COMPANY_NAME).toUpperCase()}<small>EMPLOYMENT OFFER</small></div>
+    <div class="conf">Confidential<br/>Offer reference draft</div>
+  </div>
+  <h1>EMPLOYMENT OFFER LETTER</h1>
+  <div class="sub">${esc(d.location || d.region || '')}${d.role_title ? ' &nbsp;|&nbsp; ' + esc(d.role_title) : ''}</div>
+
+  <p>Date: ${esc(today)}</p>
+  <p>To: <strong>${esc(d.candidate_name || 'Candidate')}</strong></p>
+  <p>Proposed start date: ${esc(startDate)}</p>
+
+  <p class="greeting">Dear ${esc((d.candidate_name || 'Candidate').split(' ')[0])},</p>
+  <p>${esc(d.opening || `We are pleased to offer you employment with ${COMPANY_NAME} (the “Company”) as ${d.role_title || 'a member of our team'}${d.client_name ? ', on assignment with ' + d.client_name : ''}. This letter summarizes the principal terms of the proposed employment. Your employment will be governed by the definitive local employment agreement, Company policies, and all mandatory laws applicable in ${d.country || d.region || 'your work location'}.`)}</p>
+
+  <table class="meta">
+    <tr><td class="k">Position</td><td>${esc(d.role_title || '')}</td></tr>
+    <tr><td class="k">Primary work location</td><td>${esc(d.location || d.region || '')}</td></tr>
+    <tr><td class="k">Reporting manager</td><td>${esc(d.reporting_manager || 'To be confirmed')}</td></tr>
+    <tr><td class="k">Assignment / engagement</td><td>${esc(d.assignment_duration || 'Ongoing, subject to performance and business need')}</td></tr>
+    <tr><td class="k">Compensation</td><td>${payLine(d)}</td></tr>
+    <tr><td class="k">Paid leave</td><td>${esc(d.vacation_days || offerRegionDefaults(d.region).vacation_days)} paid working days per calendar year, plus statutory holidays</td></tr>
+  </table>
+
+  <h2>1. Compensation and payroll</h2>
+  <p>Your compensation will be ${payLine(d)}. ${esc(d.note || '')} Actual payroll may vary with approved hours, unpaid absence, overtime treatment, the payroll calendar, taxes, social contributions, pension obligations and other lawful deductions. Overtime or additional-hours payments, where applicable, are handled under local law and Company policy.</p>
+
+  <h2>2. Health insurance and statutory benefits</h2>
+  <p>${esc(d.benefits || `Coverage under the Company's group medical policy and statutory benefits, subject to insurer terms and the applicable ${d.country || d.region || 'local'} benefits schedule.`)} Final eligibility, contribution levels, waiting periods, dependent coverage and exclusions will be set out in the local benefits documentation.</p>
+
+  <h2>3. Vacation and leave</h2>
+  <p>You will be eligible for <strong>${esc(d.vacation_days || offerRegionDefaults(d.region).vacation_days)} paid working days</strong> per calendar year, plus applicable public holidays and statutory leave. Sick leave, parental leave, family leave and other protected leave will be provided in accordance with applicable law and Company policy. Leave scheduling requires reasonable advance approval except in emergencies.</p>
+  ${d.relocation ? `<h2>4. Relocation support</h2><p>${esc(d.relocation)}</p>` : ''}
+
+  <h2>${d.relocation ? '5' : '4'}. Roles and responsibilities</h2>
+  <ul>${respHtml}</ul>
+
+  <h2>${d.relocation ? '6' : '5'}. Initial service commitment and cost repayment</h2>
+  <p>The Company expects you to remain employed for at least <strong>${esc(d.min_stay_months || offerRegionDefaults(d.region).min_stay_months)} months</strong> after your start date. If you voluntarily resign before completing that period, you may be required to repay actual, documented and legally recoverable Company-paid costs relating to joining travel, temporary accommodation and employer-paid training, up to a maximum of <strong>${esc(d.repayment_cap || offerRegionDefaults(d.region).repayment_cap)}</strong>. This is intended as reimbursement of specified costs, not as a penalty for resigning. Any repayment will be prorated where required by law or Company policy, will not include ordinary wages, and will not be deducted from salary or final pay unless such deduction is lawful and you have provided any authorization required by local law. No repayment will be sought where prohibited by law, and the Company may waive repayment in cases such as redundancy, Company-initiated termination without cause, serious illness, or other circumstances approved by HR.</p>
+
+  <h2>${d.relocation ? '7' : '6'}. Point of contact</h2>
+  <p>For employment, travel, relocation or workplace-support matters, contact: ${esc(d.hr_name || 'HR Business Partner')}${d.hr_phone ? ' | ' + esc(d.hr_phone) : ''}${d.hr_email ? ' | ' + esc(d.hr_email) : ''}.</p>
+
+  <h2>${d.relocation ? '8' : '7'}. Conditions of offer</h2>
+  <p>This offer is conditional upon satisfactory identity and right-to-work verification, reference/background checks where lawful, any required visa or work authorization, and execution of the Company's confidentiality, intellectual-property and data-protection agreements. This letter is a summary; the definitive local employment agreement will control.</p>
+
+  <p style="margin-top:14px">We look forward to welcoming you to ${esc(COMPANY_NAME)}.</p>
+  <p>Yours sincerely,</p>
+  ${signedBlock}
+
+  <div class="foot">${esc(COMPANY_NAME)} &bull; Confidential draft employment offer &bull; This document is not valid until signed by an authorized signatory.</div>
+</div></body></html>`;
+}
+
+// Assemble the offer data object from request body + region presets + submission/candidate context.
+async function assembleOfferData(s, body) {
+  const defs = offerRegionDefaults(body.region);
+  const data = {
+    submission_id: s.submission_id, candidate_id: s.candidate_id, candidate_name: s.candidate_name,
+    job_title: s.job_title, client_name: s.client_name,
+    region: defs.region, country: defs.country, locale: defs.locale, note: defs.note,
+    currency: body.currency || defs.currency, currency_code: body.currency_code || defs.currency_code,
+    pay_type: body.pay_type || defs.pay_type,
+    pay_amount: body.pay_amount || '', annualized: body.annualized || '', monthly: body.monthly || '',
+    role_title: body.role_title || s.job_title || '',
+    responsibilities: body.responsibilities || '',
+    benefits: body.benefits || '',
+    vacation_days: body.vacation_days || defs.vacation_days,
+    relocation: body.relocation || '',
+    assignment_duration: body.assignment_duration || '',
+    location: body.location || '',
+    start_date: body.start_date || '',
+    min_stay_months: body.min_stay_months || defs.min_stay_months,
+    repayment_cap: body.repayment_cap || defs.repayment_cap,
+    reporting_manager: body.reporting_manager || '',
+    hr_name: body.hr_name || '', hr_phone: body.hr_phone || '', hr_email: body.hr_email || '',
+    gen_at: new Date().toISOString(),
+  };
+  // AI assist (opening + responsibilities) — grounded, never invents numbers. Safe fallback on any error.
+  try {
+    const want = [];
+    if (!data.responsibilities) want.push('responsibilities');
+    want.push('opening');
+    const prompt = `You are drafting parts of a formal employment offer letter for ${COMPANY_NAME}. Region: ${data.region}. Candidate: ${data.candidate_name}. Role: ${data.role_title}${data.client_name ? ' (assignment with ' + data.client_name + ')' : ''}. Location: ${data.location || data.region}.\n`
+      + `Return a strict JSON object with keys ${want.map(w => '"' + w + '"').join(' and ')}.\n`
+      + `"opening": 2-3 sentence professional opening paragraph welcoming the candidate and framing this as a summary of principal terms; do NOT state any salary number.\n`
+      + (want.includes('responsibilities') ? `"responsibilities": 4-6 concise role responsibilities for a ${data.role_title}, as a single string with each item on its own line, no bullets characters.\n` : '')
+      + `Plain professional English. Output ONLY the JSON, nothing else.`;
+    const gen = await genModel.generateContent(prompt);
+    let txt = gen.response.candidates[0].content.parts[0].text.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
+    const j = JSON.parse(txt);
+    if (j.opening) data.opening = String(j.opening).trim();
+    if (!data.responsibilities && j.responsibilities) data.responsibilities = String(j.responsibilities).trim();
+  } catch (e) { /* deterministic template fallback is used */ }
+  return data;
+}
+
+// GET the current offer for a submission
+app.get('/submissions/:id/offer', async (req, res) => {
+  try {
+    await ensureSlots();
+    const r = (await pool.query('SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, offer_status, offer_json, offer_html, offer_region, offer_signed_by, offer_signed_at, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (!r) return res.status(404).json({ error: 'not found' });
+    let offer = null; try { offer = r.offer_json ? JSON.parse(r.offer_json) : null; } catch (e) {}
+    return res.json({ submission_id: r.submission_id, status: r.status, offer_status: r.offer_status || (r.status === 'OFFER' ? 'PENDING' : null), offer, html: r.offer_html || '', region: r.offer_region || '', signed_by: r.offer_signed_by || '', signed_at: r.offer_signed_at || null, candidate_name: r.candidate_name, job_title: r.job_title, client_name: r.client_name, submitted_by: r.submitted_by });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// GENERATE (hiring manager or admin) — AI drafts, template guarantees the numbers/clauses.
+app.post('/submissions/:id/offer/generate', async (req, res) => {
+  try {
+    await ensureSlots();
+    const by = req.body?.by || 'hiring_manager';
+    if (!['hiring_manager', 'admin'].includes(by)) return res.status(403).json({ error: 'Only the hiring manager or admin can prepare an offer.' });
+    const s = (await pool.query('SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, status, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (!s) return res.status(404).json({ error: 'not found' });
+    if (!['OFFER', 'PENDING_PLACEMENT_APPROVAL'].includes(s.status)) return res.status(400).json({ error: 'An offer can only be prepared after placement is approved (approved to hire).' });
+    const data = await assembleOfferData(s, req.body || {});
+    const html = buildOfferHtml({ ...data, signed: false });
+    await pool.query("UPDATE submissions SET status = 'OFFER', offer_status = 'DRAFT', offer_json = $2, offer_html = $3, offer_region = $4, offer_signed_by = NULL, offer_signed_at = NULL, last_updated = NOW() WHERE submission_id = $1",
+      [req.params.id, JSON.stringify(data), html, data.region]);
+    await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'DOCUMENT', to_role: 'admin', to_name: 'Authorized signatory', subject: 'Offer letter drafted — ' + s.candidate_name, body: 'Offer letter prepared for ' + s.candidate_name + ' (' + data.region + '). Awaiting admin signature.', sent_by: by });
+    return res.json({ ok: true, offer_status: 'DRAFT', offer: data, html });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// SIGN (ADMIN ONLY — authorized signatory). Seals the letter.
+app.post('/submissions/:id/offer/sign', async (req, res) => {
+  try {
+    await ensureSlots();
+    const by = req.body?.by || '';
+    if (by !== 'admin') return res.status(403).json({ error: 'Only an admin (authorized signatory) can sign the offer letter.' });
+    const r = (await pool.query('SELECT candidate_id, candidate_name, job_id, offer_json, offer_status FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (!r) return res.status(404).json({ error: 'not found' });
+    if (!r.offer_json) return res.status(400).json({ error: 'No offer has been prepared yet.' });
+    let data = {}; try { data = JSON.parse(r.offer_json); } catch (e) {}
+    const signatory_name = req.body?.signatory_name || DEFAULT_SIGNATORY.name;
+    const signatory_title = req.body?.signatory_title || DEFAULT_SIGNATORY.title;
+    const signed_at = new Date().toISOString();
+    data = { ...data, signatory_name, signatory_title, signed_at };
+    const html = buildOfferHtml({ ...data, signed: true });
+    await pool.query("UPDATE submissions SET offer_status = 'SIGNED', offer_json = $2, offer_html = $3, offer_signed_by = $4, offer_signed_at = $5, last_updated = NOW() WHERE submission_id = $1",
+      [req.params.id, JSON.stringify(data), html, signatory_name, signed_at]);
+    await logComm({ submission_id: req.params.id, candidate_id: r.candidate_id, job_id: r.job_id, channel: 'DOCUMENT', to_role: 'hiring_manager', to_name: 'Hiring manager', subject: 'Offer letter signed — ' + r.candidate_name, body: 'Offer letter signed by ' + signatory_name + ' (' + signatory_title + '). Ready to send to the candidate.', sent_by: 'admin' });
+    return res.json({ ok: true, offer_status: 'SIGNED', signatory_name, signatory_title, signed_at, html });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// SEND the signed offer to the candidate (DEMO-routed email; CC recruiter).
+app.post('/submissions/:id/offer/send', async (req, res) => {
+  try {
+    await ensureSlots();
+    const r = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, offer_status, offer_json, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (!r) return res.status(404).json({ error: 'not found' });
+    if (r.offer_status !== 'SIGNED') return res.status(400).json({ error: 'The offer must be signed by an admin before it can be sent.' });
+    let data = {}; try { data = JSON.parse(r.offer_json); } catch (e) {}
+    const candEmail = candidateEmail(r.candidate_id);
+    const emailSubject = 'Your Employment Offer — ' + (r.job_title || 'a role') + ' at ' + COMPANY_NAME;
+    const emailBody = 'Dear ' + (r.candidate_name || 'Candidate') + ',\n\nCongratulations! On behalf of ' + COMPANY_NAME + ', we are delighted to extend a formal offer of employment for the role of ' + (data.role_title || r.job_title || 'the position') + (r.client_name ? ' (assignment with ' + r.client_name + ')' : '') + '.\n\nYour signed offer letter is attached. It sets out your compensation, benefits, leave, the initial service commitment and the conditions of the offer. Please review it carefully.\n\nTo accept, kindly confirm by replying to this email. On acceptance, we will begin onboarding and will need the following documents to proceed:\n1. Identity & address proof (passport / national ID).\n2. Education and experience certificates.\n3. Recent photographs and completed joining forms (we will share these).\n4. Any documents required for visa processing — our visa partner (' + VISA_PARTNER_NAME + ') will guide you.\n\nIf you have any questions, our team is happy to help. We look forward to welcoming you aboard.\n\nBest regards,\n' + COMPANY_NAME + ' Talent Team';
+    const cc = [r.submitted_by ? 'recruiter (' + r.submitted_by + ')' : null].filter(Boolean).join(', ');
+    await pool.query("UPDATE submissions SET offer_status = 'SENT', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
+    await notify({ candidate_id: r.candidate_id, recipient: 'candidate', type: 'OFFER', message: 'You have received an employment offer for ' + (r.job_title || 'a role') + '. Please review and confirm.' });
+    await logComm({ submission_id: req.params.id, candidate_id: r.candidate_id, job_id: r.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: r.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody, sent_by: req.body?.by || 'hiring_manager' });
+    return res.json({ ok: true, offer_status: 'SENT', emailSubject, emailBody, candidateEmail: candEmail, cc });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ACCEPT -> PLACED (candidate accepted). Fires onboarding + visa email, marks placement, fills the job.
+app.post('/submissions/:id/offer/accept', async (req, res) => {
+  try {
+    await ensureSlots();
+    const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, submitted_by, offer_status FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (!s) return res.status(404).json({ error: 'not found' });
+    const candEmail = candidateEmail(s.candidate_id);
+    const cArgs = { submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, sent_by: req.body?.by || 'recruiter' };
+    await pool.query("UPDATE submissions SET status = 'PLACED', offer_status = 'ACCEPTED', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
+    try { await pool.query("UPDATE candidates SET visa_status = 'PLACEMENT_ACTIVE', last_updated = NOW() WHERE candidate_id = $1", [s.candidate_id]); } catch (e) {}
+    // Close the job only when all openings are filled.
+    let jobFilled = false;
+    try {
+      const placedCount = Number((await pool.query("SELECT COUNT(*) AS n FROM submissions WHERE job_id = $1 AND status = 'PLACED'", [s.job_id])).rows[0]?.n || 0);
+      const openings = Number((await pool.query('SELECT number_of_positions FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.number_of_positions || 1);
+      if (placedCount >= openings) { await pool.query("UPDATE jobs SET status = 'Filled' WHERE job_id = $1", [s.job_id]); jobFilled = true; }
+    } catch (e) {}
+    const congratsSubject = 'Welcome Aboard — Onboarding Next Steps for ' + (s.job_title || 'a role');
+    const congratsBody = 'Dear ' + s.candidate_name + ',\n\nThank you for accepting your offer with ' + COMPANY_NAME + ' for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '. We are thrilled to have you join us.\n\nTo begin onboarding, our team will guide you through:\n1. Document Verification — please keep your identity and education documents ready.\n2. Application Forms — we will share the joining application for you to complete.\n3. Visa Documentation — our visa partner (' + VISA_PARTNER_NAME + ') will collect and process the required documents and keep you updated.\n\nWe will contact you shortly with the details. Congratulations and welcome aboard!\n\nBest regards,\n' + COMPANY_NAME + ' Talent Team\n\nCc: Recruiter (' + (s.submitted_by || 'assigned recruiter') + '), Visa Application Team (' + VISA_TEAM_EMAIL + ')';
+    await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'PLACED', message: 'Offer accepted — you have been placed for ' + (s.job_title || 'a role') + '. Visa processing will begin.' });
+    await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACED', message: s.candidate_name + ' accepted the offer and is now placed for ' + (s.job_title || 'a role') + '.' });
+    await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: congratsSubject, body: congratsBody });
+    return res.json({ ok: true, status: 'PLACED', offer_status: 'ACCEPTED', candidateEmail: candEmail, emailSubject: congratsSubject, emailBody: congratsBody, cc: VISA_TEAM_EMAIL, jobFilled });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// DECLINE
+app.post('/submissions/:id/offer/decline', async (req, res) => {
+  try {
+    await ensureSlots();
+    const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (!s) return res.status(404).json({ error: 'not found' });
+    await pool.query("UPDATE submissions SET status = 'OFFER_DECLINED', offer_status = 'DECLINED', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
+    const reason = req.body?.reason || '';
+    await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'OFFER_DECLINED', message: s.candidate_name + ' declined the offer for ' + (s.job_title || 'a role') + (reason ? ': ' + reason : '') + '.' });
+    await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Offer declined — ' + s.candidate_name, body: 'Offer declined' + (reason ? ': ' + reason : '') + '.', sent_by: req.body?.by || 'recruiter' });
+    return res.json({ ok: true, status: 'OFFER_DECLINED', offer_status: 'DECLINED' });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ADMIN signature queue — offers drafted by the hiring manager, awaiting the authorized signatory.
+app.get('/offers/pending-signature', async (req, res) => {
+  try {
+    await ensureSlots();
+    const { rows } = await pool.query(
+      `SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, offer_region, offer_status, submitted_by, last_updated
+         FROM submissions WHERE offer_status = 'DRAFT' AND status = 'OFFER' ORDER BY last_updated DESC`);
+    return res.json({ pending: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -2507,7 +2811,8 @@ function meetLink() {
   return 'https://meet.google.com/' + p().slice(0, 3) + '-' + p() + '-' + p().slice(0, 3);
 }
 function clientEmailFor(name) { return (String(name || 'client').toLowerCase().replace(/[^a-z0-9]+/g, '') || 'client') + '@client.com'; }
-const VISA_TEAM_EMAIL = 'visa-team@fragman.com'; // third-party visa agency (Fragman) placeholder
+const VISA_TEAM_EMAIL = 'visa-team@fragomen.com'; // third-party visa agency (Fragomen) placeholder
+const VISA_PARTNER_NAME = 'Fragomen';
 // A REAL, clickable Google Calendar event link (prefilled title/time/details; adding it creates a Google Meet).
 function calendarLink(startISO, durationMin, title, details) {
   try {
@@ -2807,6 +3112,13 @@ async function ensureSlots() {
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_text TEXT');
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_summary TEXT');
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS client_panel TEXT');
+    // Offer letter (Stage 6-7): AI-generated letter, admin signature, region-aware terms.
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS offer_status TEXT');   // PENDING | DRAFT | SIGNED | SENT | ACCEPTED | DECLINED
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS offer_json TEXT');     // structured terms (JSON string)
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS offer_html TEXT');     // rendered letter (print-ready)
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS offer_region TEXT');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS offer_signed_by TEXT');
+    await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS offer_signed_at TIMESTAMPTZ');
     _slotsReady = true;
     console.log('Slot schema ensured (lazy).');
   } catch (e) { console.log('ensureSlots warn:', e.message); }
