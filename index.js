@@ -53,8 +53,17 @@ async function ensureAuth() {
         [uid, name, email, role, hash, salt]
       );
     }
+    // Clean up so only the intended testers (plus anyone the admin adds) are active.
+    // 1) Deactivate known legacy demo accounts.
+    const legacy = ['admin@avanciers.com', 'rajesh.kumar@avanciers.com', 'riya.sharma@avanciers.com', 'amit.verma@avanciers.com', 'sofia.rossi@avanciers.com'];
+    await pool.query('UPDATE app_users SET active = FALSE WHERE LOWER(email) = ANY($1)', [legacy]);
+    // 2) Deactivate duplicate rows that share a seeded email but are NOT the seeded account
+    //    (e.g. an old "Neha Das" row created as a hiring manager).
+    const seededEmails = seed.map(s => s[2].toLowerCase());
+    const seededIds = seed.map(s => s[0]);
+    await pool.query('UPDATE app_users SET active = FALSE WHERE LOWER(email) = ANY($1) AND user_id <> ALL($2)', [seededEmails, seededIds]);
     _authReady = true;
-    console.log('Auth schema + seed ensured.');
+    console.log('Auth schema + seed + cleanup ensured.');
   } catch (e) { console.log('ensureAuth warn:', e.message); }
 }
 
@@ -1657,7 +1666,7 @@ app.post('/auth/login', async (req, res) => {
 app.get('/auth/users', async (req, res) => {
   try {
     await ensureAuth();
-    const { rows } = await pool.query("SELECT user_id, full_name, email, role, active FROM app_users ORDER BY role, full_name");
+    const { rows } = await pool.query("SELECT user_id, full_name, email, role, active FROM app_users WHERE active = TRUE ORDER BY role, full_name");
     return res.json({ users: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
