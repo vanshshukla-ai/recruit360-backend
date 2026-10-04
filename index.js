@@ -334,7 +334,7 @@ app.post('/candidates/ask', async (req, res) => {
 
     if (good.length === 0) {
       return res.json({
-        answer: 'No candidates in the database match that request. I won\'t guess â€” there is no strong match.',
+        answer: 'No candidates in the database match that request. I won\'t guess — there is no strong match.',
         candidates: [],
         interpreted: { role, destination_country, skills },
         timing: { seconds: (ms/1000).toFixed(1) },
@@ -369,7 +369,7 @@ app.post('/jobs/parse-text', async (req, res) => {
   }
 });
 
-// Job Feasibility Check â€” availability + visa-readiness + verdict (before posting)
+// Job Feasibility Check — availability + visa-readiness + verdict (before posting)
 app.post('/jobs/feasibility', async (req, res) => {
   try {
     const { title, destination_country, skills, openings } = req.body;
@@ -412,13 +412,13 @@ app.post('/jobs/feasibility', async (req, res) => {
         : 'No matching candidates found for this role. Consider external sourcing.';
       level = 'red';
     } else if (realisticPool >= need * 3 && visaReadyPool >= need) {
-      verdict = 'Strong pipeline â€” you can likely fill all ' + need + ' opening' + (need > 1 ? 's' : '') + ' from existing candidates.';
+      verdict = 'Strong pipeline — you can likely fill all ' + need + ' opening' + (need > 1 ? 's' : '') + ' from existing candidates.';
       level = 'green';
     } else if (realisticPool >= need) {
-      verdict = 'Moderate pipeline â€” ' + realisticPool + ' candidate' + (realisticPool === 1 ? '' : 's') + ' fit, but the pool is limited. You may need external sourcing too.';
+      verdict = 'Moderate pipeline — ' + realisticPool + ' candidate' + (realisticPool === 1 ? '' : 's') + ' fit, but the pool is limited. You may need external sourcing too.';
       level = 'amber';
     } else {
-      verdict = 'Thin pipeline â€” only ' + realisticPool + ' matching candidate' + (realisticPool === 1 ? '' : 's') + ' for this destination. Consider widening the destination or external sourcing.';
+      verdict = 'Thin pipeline — only ' + realisticPool + ' matching candidate' + (realisticPool === 1 ? '' : 's') + ' for this destination. Consider widening the destination or external sourcing.';
       level = 'amber';
     }
 
@@ -520,7 +520,7 @@ app.patch('/documents/:docId/verify', async (req, res) => {
   }
 });
 
-// Validate a document with Document AI â€” check it matches the expected type
+// Validate a document with Document AI — check it matches the expected type
 app.post('/documents/validate', async (req, res) => {
   try {
     const { fileBase64, mimeType, expectedType, candidateName } = req.body;
@@ -532,7 +532,7 @@ app.post('/documents/validate', async (req, res) => {
     const ocrMs = Date.now() - t0;
     const docText = (result.document && result.document.text) ? result.document.text : '';
 
-    // A photograph is an image with no text â€” that's expected, so accept it.
+    // A photograph is an image with no text — that's expected, so accept it.
     const isPhoto = /photo|image|picture/i.test(expectedType);
     const isImageFile = (mimeType || '').startsWith('image/');
     if (!docText.trim()) {
@@ -694,7 +694,7 @@ app.get('/pipeline/stage', async (req, res) => {
 
 // ---------- ADVANCE CANDIDATE STAGE (move through the journey) ----------
 // The ordered journey of statuses
-// CSR 'getting ready' journey â€” stops at TRAINING_COMPLETE (candidate is READY).
+// CSR 'getting ready' journey — stops at TRAINING_COMPLETE (candidate is READY).
 // Placement, visa and travel are driven by the job application (Job Board) + later steps, not the CSR advance.
 const JOURNEY = [
   'INTAKE_PENDING', 'STAKEHOLDERS_ASSIGNED', 'TERMS_LOCKED',
@@ -741,7 +741,7 @@ app.post('/submissions/screen', async (req, res) => {
 
     const cRes = await pool.query('SELECT candidate_id, full_name, role, destination_country, visa_status, experience_years FROM candidates WHERE candidate_id = $1', [candidate_id]);
     let c = cRes.rows[0];
-    // Suggested candidates come from the BigQuery pool â€” fall back there if not in Cloud SQL.
+    // Suggested candidates come from the BigQuery pool — fall back there if not in Cloud SQL.
     if (!c) {
       try {
         const rows = await bqQuery(`SELECT candidate_id, full_name, role, destination_country, visa_status, experience_years FROM \`${BQ_DS}.candidates\` WHERE candidate_id = '${(candidate_id || '').replace(/'/g, '')}' LIMIT 1`);
@@ -768,8 +768,8 @@ app.post('/submissions/screen', async (req, res) => {
     const destMatch = job ? contains(c.destination_country, job.location) : null;
 
     const checklist = [
-      { label: 'Role match', pass: job ? roleMatch : null, detail: job ? `${c.role || 'â€”'} vs ${job.title || 'â€”'}` : `Candidate role: ${c.role || 'â€”'}` },
-      { label: 'Destination match', pass: job ? destMatch : null, detail: job ? `${c.destination_country || 'â€”'} vs ${job.location || 'â€”'}` : `Destination: ${c.destination_country || 'â€”'}` },
+      { label: 'Role match', pass: job ? roleMatch : null, detail: job ? `${c.role || '—'} vs ${job.title || '—'}` : `Candidate role: ${c.role || '—'}` },
+      { label: 'Destination match', pass: job ? destMatch : null, detail: job ? `${c.destination_country || '—'} vs ${job.location || '—'}` : `Destination: ${c.destination_country || '—'}` },
       { label: 'Documents verified', pass: verifiedDocs >= 4, detail: `${verifiedDocs} of 4 verified` },
       { label: 'Visa progress', pass: readyStatuses.includes(c.visa_status), detail: (c.visa_status || '').replace(/_/g, ' ') },
       { label: 'Experience', pass: (c.experience_years || 0) >= 2, detail: `${c.experience_years || 0} years` },
@@ -823,7 +823,7 @@ app.post('/submissions/offline', async (req, res) => {
            VALUES ($1,$2,$3,$4,$5,$6,$7,'INTAKE_PENDING',TRUE,$8,$9,NOW(),NOW())`,
           [candidate_id, b.candidate_name, email, b.phone || '', b.role || '', b.origin_city || '', b.destination_country || '', b.submitted_by || '', b.experience_years ? Number(b.experience_years) : null]
         );
-      } catch (e) { /* candidate table optional cols â€” best effort */ }
+      } catch (e) { /* candidate table optional cols — best effort */ }
     }
     // 2) Prevent duplicate on this job
     const dup = await pool.query('SELECT submission_id FROM submissions WHERE candidate_id = $1 AND job_id = $2', [candidate_id, b.job_id]);
@@ -849,8 +849,8 @@ app.post('/submissions/offline', async (req, res) => {
     }
     // 5) Guide the recruiter on the next step (HM is looped in later, after the summary).
     const recMsg = hasResume
-      ? `${b.candidate_name} added for ${b.job_title || 'a role'} â€” review the resume and send the summary to the hiring manager.`
-      : `${b.candidate_name} added for ${b.job_title || 'a role'} â€” request the resume from the candidate.`;
+      ? `${b.candidate_name} added for ${b.job_title || 'a role'} — review the resume and send the summary to the hiring manager.`
+      : `${b.candidate_name} added for ${b.job_title || 'a role'} — request the resume from the candidate.`;
     await notify({ candidate_id, recipient: b.submitted_by || 'recruiter', type: 'CANDIDATE_ADDED', message: recMsg });
     return res.json({ ok: true, submission: { submission_id, candidate_id, candidate_name: b.candidate_name, status: 'SUBMITTED' } });
   } catch (err) {
@@ -988,7 +988,7 @@ app.patch('/submissions/:id/interview', async (req, res) => {
     // Which round is this? (label for the emails)
     const roundLabel = sub.status === 'CLIENT_INTERVIEW' ? 'client interview' : sub.status === 'HR_INTERVIEW' ? 'HR interview' : sub.status === 'RECRUITER_CALL' ? 'recruiter call' : 'interview';
 
-    // Generate a meeting link (Google Meet style) â€” do NOT change the stage; stages advance via the step buttons.
+    // Generate a meeting link (Google Meet style) — do NOT change the stage; stages advance via the step buttons.
     const meetCode = Math.random().toString(36).slice(2, 5) + '-' + Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 5);
     const interview_link = 'https://meet.google.com/' + meetCode;
 
@@ -996,9 +996,9 @@ app.patch('/submissions/:id/interview', async (req, res) => {
     let hm = '';
     try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [sub.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
 
-    // Build the CANDIDATE email (link + notes) â€” returned so the UI can open mailto AND logged.
+    // Build the CANDIDATE email (link + notes) — returned so the UI can open mailto AND logged.
     const candEmail = candidateEmail(sub.candidate_id);
-    const emailSubject = 'Your ' + roundLabel + ' is scheduled â€” ' + (sub.job_title || 'a role');
+    const emailSubject = 'Your ' + roundLabel + ' is scheduled — ' + (sub.job_title || 'a role');
     const emailBody = 'Dear ' + (sub.candidate_name || 'Candidate') + ',\n\n'
       + 'Your ' + roundLabel + (sub.client_name ? ' with ' + sub.client_name : '') + ' for ' + (sub.job_title || 'a role') + ' has been scheduled' + (interview_date ? ' for ' + interview_date : '') + '.\n\n'
       + 'Join using this link:\n' + interview_link + '\n\n'
@@ -1013,9 +1013,9 @@ app.patch('/submissions/:id/interview', async (req, res) => {
     // Record & notify: candidate (email), recruiter + hiring manager (update)
     const commArgs = { submission_id: req.params.id, candidate_id: sub.candidate_id, job_id: sub.job_id, sent_by: sub.submitted_by || 'recruiter' };
     await logComm({ ...commArgs, channel: 'EMAIL', to_role: 'candidate', to_name: sub.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody });
-    const updateMsg = sub.candidate_name + 'â€™s ' + roundLabel + ' for ' + (sub.job_title || 'a role') + (interview_date ? ' is set for ' + interview_date : ' has been scheduled') + '. Link: ' + interview_link;
-    if (sub.submitted_by) { await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by, type: 'INTERVIEW', message: updateMsg }); await logComm({ ...commArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: sub.submitted_by, subject: 'Interview scheduled â€” ' + sub.candidate_name, body: updateMsg }); }
-    if (hm) { await notify({ candidate_id: sub.candidate_id, recipient: hm, type: 'INTERVIEW', message: updateMsg }); await logComm({ ...commArgs, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm, subject: 'Interview scheduled â€” ' + sub.candidate_name, body: updateMsg }); }
+    const updateMsg = sub.candidate_name + '’s ' + roundLabel + ' for ' + (sub.job_title || 'a role') + (interview_date ? ' is set for ' + interview_date : ' has been scheduled') + '. Link: ' + interview_link;
+    if (sub.submitted_by) { await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by, type: 'INTERVIEW', message: updateMsg }); await logComm({ ...commArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: sub.submitted_by, subject: 'Interview scheduled — ' + sub.candidate_name, body: updateMsg }); }
+    if (hm) { await notify({ candidate_id: sub.candidate_id, recipient: hm, type: 'INTERVIEW', message: updateMsg }); await logComm({ ...commArgs, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm, subject: 'Interview scheduled — ' + sub.candidate_name, body: updateMsg }); }
     await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: 'Your ' + roundLabel + ' is scheduled' + (interview_date ? ' on ' + interview_date : '') + '. Link: ' + interview_link });
 
     return res.json({ ok: true, submission_id: req.params.id, interview_link, email_sent: true, emailSubject, emailBody, candidateEmail: candEmail, notified: { recruiter: sub.submitted_by || null, hiring_manager: hm || null } });
@@ -1190,7 +1190,7 @@ app.get('/jobs/:jobId/board', async (req, res) => {
   }
 });
 
-// Manually add a candidate (by id) as a submission to a job â€” bypasses AI sourcing
+// Manually add a candidate (by id) as a submission to a job — bypasses AI sourcing
 app.post('/jobs/:jobId/submit-candidate', async (req, res) => {
   try {
     const { candidate_id, submitted_by, screening_notes, current_ctc, expected_ctc } = req.body;
@@ -1205,7 +1205,7 @@ app.post('/jobs/:jobId/submit-candidate', async (req, res) => {
     // Ensure CTC columns exist
     try { await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS current_ctc TEXT'); await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS expected_ctc TEXT'); } catch(e){}
     const submission_id = 'SUB' + Date.now().toString().slice(-10);
-    // Sir's flow: start at PENDING_HM_APPROVAL â€” the hiring manager must approve before the candidate is emailed.
+    // Sir's flow: start at PENDING_HM_APPROVAL — the hiring manager must approve before the candidate is emailed.
     await pool.query(
       'INSERT INTO submissions (submission_id, candidate_id, candidate_name, job_id, job_title, client_name, status, screening_notes, submitted_by, current_ctc, expected_ctc, created_at, last_updated) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())',
       [submission_id, candidate_id, cRes.rows[0].full_name, req.params.jobId, job.title, job.client || '', 'PENDING_HM_APPROVAL', screening_notes || '', submitted_by || '', current_ctc || '', expected_ctc || '']
@@ -1237,11 +1237,11 @@ app.patch('/submissions/:id/approval', async (req, res) => {
     // shortlisting email to the candidate (naming the recruiter who will guide them).
     await pool.query("UPDATE submissions SET status = 'RECRUITER_CALL', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
     const recruiterName = sub.submitted_by || 'your recruiter';
-    const emailSubject = 'You have been shortlisted â€” ' + (sub.job_title || 'a role');
+    const emailSubject = 'You have been shortlisted — ' + (sub.job_title || 'a role');
     const emailBody = 'Dear ' + sub.candidate_name + ',\n\nCongratulations! You have been shortlisted for the next rounds for ' + (sub.job_title || 'a role') + (sub.client_name ? ' at ' + sub.client_name : '') + '. ' + recruiterName + ' will guide you through the upcoming interviews and next steps, and will be in touch shortly to arrange your recruiter call.\n\nBest regards,\nRecruit 360 Team';
     await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: sub.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody });
     await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'SHORTLISTED', message: 'You have been shortlisted for ' + (sub.job_title || 'a role') + '.' });
-    await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by || 'recruiter', type: 'APPROVED', message: `${sub.candidate_name} approved for ${sub.job_title || 'a role'} â€” schedule the recruiter call.` });
+    await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by || 'recruiter', type: 'APPROVED', message: `${sub.candidate_name} approved for ${sub.job_title || 'a role'} — schedule the recruiter call.` });
     return res.json({ ok: true, status: 'RECRUITER_CALL', candidate: sub, emailSubject, emailBody, candidateEmail: candEmail });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -1438,7 +1438,7 @@ app.get('/jobs/:jobId/full', async (req, res) => {
       [req.params.jobId]
     );
 
-    // 3) Interviews â€” any submission that has entered the interview stages
+    // 3) Interviews — any submission that has entered the interview stages
     const iRes = await pool.query(
       `SELECT submission_id, candidate_name, interview_date, interview_notes, status
          FROM submissions WHERE job_id = $1
@@ -1447,7 +1447,7 @@ app.get('/jobs/:jobId/full', async (req, res) => {
       [req.params.jobId]
     );
 
-    // 4) Placements â€” placed candidates + those awaiting the HM's placement approval
+    // 4) Placements — placed candidates + those awaiting the HM's placement approval
     const pRes = await pool.query(
       `SELECT submission_id, candidate_name, status, created_at
          FROM submissions WHERE job_id = $1
@@ -1757,22 +1757,22 @@ app.get('/validations', async (req, res) => {
 
 
 // ============================================================
-// RECRUIT 360 AI ASSISTANT â€” ported from the Streamlit agent (BigQuery + Gemini)
+// RECRUIT 360 AI ASSISTANT — ported from the Streamlit agent (BigQuery + Gemini)
 // Role-aware, grounded, with the guardrail rules + chat memory.
 // ============================================================
 const BQ_DS = 'direct-tribute-502305-q5.recruit360';
 
 const REJECTION_FIXES = {
-  'R-01':'Incomplete application form â€” complete all mandatory fields and resubmit.',
-  'R-02':'Invalid/expired passport â€” renew passport (min 6 months validity) and attach a clear copy.',
-  'R-03':'Insufficient financial proof â€” provide bank statements or a sponsorship letter meeting the threshold.',
-  'R-04':'Missing employer sponsorship â€” obtain a signed sponsorship letter and employment contract.',
-  'R-05':'Photograph does not meet spec â€” submit a biometric photo per the embassy specification.',
-  'R-06':'Missing/invalid qualifications â€” attach attested degree/certificates with certified translation.',
-  'R-07':'Medical certificate missing â€” complete the panel medical and attach the report.',
-  'R-08':'Travel/health insurance missing â€” purchase a compliant policy and attach it.',
-  'R-09':'Inconsistent personal details â€” correct mismatched details across all documents.',
-  'R-10':'Interview/extra docs required â€” schedule the embassy interview or provide the requested documents.'
+  'R-01':'Incomplete application form — complete all mandatory fields and resubmit.',
+  'R-02':'Invalid/expired passport — renew passport (min 6 months validity) and attach a clear copy.',
+  'R-03':'Insufficient financial proof — provide bank statements or a sponsorship letter meeting the threshold.',
+  'R-04':'Missing employer sponsorship — obtain a signed sponsorship letter and employment contract.',
+  'R-05':'Photograph does not meet spec — submit a biometric photo per the embassy specification.',
+  'R-06':'Missing/invalid qualifications — attach attested degree/certificates with certified translation.',
+  'R-07':'Medical certificate missing — complete the panel medical and attach the report.',
+  'R-08':'Travel/health insurance missing — purchase a compliant policy and attach it.',
+  'R-09':'Inconsistent personal details — correct mismatched details across all documents.',
+  'R-10':'Interview/extra docs required — schedule the embassy interview or provide the requested documents.'
 };
 
 const BQ_SCHEMA = `Tables in ${BQ_DS} (join on ids):
@@ -1800,13 +1800,13 @@ async function bqQuery(sql) {
   return rows;
 }
 
-// The main data agent â€” LLM writes SQL, we run it on BigQuery.
+// The main data agent — LLM writes SQL, we run it on BigQuery.
 async function agentQueryData(question, role, history) {
   const wantAll = /(show all|list all|all of them|everyone|every candidate|full list|show more|all candidates|complete list|entire list|see all|view all)/i.test(question);
   const listLimit = wantAll ? 500 : 50;
   const roleHint = role === 'recruiter' ? 'The user is a recruiter asking about candidates/jobs.' : role === 'hiring_manager' ? 'The user is a hiring manager.' : role === 'admin' ? 'The user is an admin with full access.' : '';
   const ctx = (history || []).slice(-4).map(h => `${h.role}: ${h.text}`).join(' | ');
-  const rules = `Rules: select only needed columns (never SELECT *). ALWAYS alias aggregates with a readable name (e.g. COUNT(*) AS count, never a bare COUNT(*)). NEVER combine DISTINCT with ORDER BY inside an aggregate such as STRING_AGG/ARRAY_AGG â€” if you need distinct ordered values, use a subquery (SELECT DISTINCT â€¦ then aggregate). For a list, add LIMIT ${listLimit} at the end. For a count/total use COUNT(*) AS count with no LIMIT. Use COUNT/SUM/AVG for totals, GROUP BY for 'per/by/each/breakdown'. Use ORDER BY DESC + LIMIT for 'top/most/highest'. Text filters use LOWER(col) LIKE LOWER('%v%'). Map pipeline stages to visa_status IN(...). Use candidates.experience_years for experience. Prefix tables with \`${BQ_DS}.\`.`;
+  const rules = `Rules: select only needed columns (never SELECT *). ALWAYS alias aggregates with a readable name (e.g. COUNT(*) AS count, never a bare COUNT(*)). NEVER combine DISTINCT with ORDER BY inside an aggregate such as STRING_AGG/ARRAY_AGG — if you need distinct ordered values, use a subquery (SELECT DISTINCT … then aggregate). For a list, add LIMIT ${listLimit} at the end. For a count/total use COUNT(*) AS count with no LIMIT. Use COUNT/SUM/AVG for totals, GROUP BY for 'per/by/each/breakdown'. Use ORDER BY DESC + LIMIT for 'top/most/highest'. Text filters use LOWER(col) LIKE LOWER('%v%'). Map pipeline stages to visa_status IN(...). Use candidates.experience_years for experience. Prefix tables with \`${BQ_DS}.\`.`;
   const prompt = `Write ONE efficient BigQuery SELECT (only SQL, no fences). ${roleHint}${ctx ? ' Recent context: ' + ctx : ''}
 ${rules}
 ${BQ_SCHEMA}
@@ -1814,10 +1814,10 @@ Question: ${question}
 SQL:`;
   const gen = await genModel.generateContent(prompt);
   let sql = gen.response.candidates[0].content.parts[0].text.replace(/^```(?:sql)?|```$/gim, '').trim();
-  if (!_readonlySQL(sql)) return { text: 'I could not turn that into a data lookup. Try asking it as a question about candidates, jobs, visas or placements â€” or say "show it as a table" to reshape the last answer.', rows: [] };
+  if (!_readonlySQL(sql)) return { text: 'I could not turn that into a data lookup. Try asking it as a question about candidates, jobs, visas or placements — or say "show it as a table" to reshape the last answer.', rows: [] };
 
   const runAndFormat = (rows) => {
-    if (!rows.length) return { text: 'No records match this request in the database. The correct answer is that none were found â€” I will not invent any.', rows: [] };
+    if (!rows.length) return { text: 'No records match this request in the database. The correct answer is that none were found — I will not invent any.', rows: [] };
     const shown = rows.slice(0, wantAll ? 25 : 8);
     const note = rows.length > shown.length ? `\n\n(Showing ${shown.length} of ${rows.length}.)` : '';
     return { text: `Result (${rows.length} found):\n${JSON.stringify(shown, null, 1)}${note}`, rows };
@@ -1831,7 +1831,7 @@ SQL:`;
       const fixPrompt = `The following BigQuery SQL failed with this error:\nERROR: ${e1.message}\n\nSQL:\n${sql}\n\n${rules}\nReturn ONLY the corrected SQL (no fences, no explanation).`;
       const fixGen = await genModel.generateContent(fixPrompt);
       let sql2 = fixGen.response.candidates[0].content.parts[0].text.replace(/^```(?:sql)?|```$/gim, '').trim();
-      if (!_readonlySQL(sql2)) return { text: 'I could not build a safe query for that. Could you rephrase it â€” for example, name the role, city or status you want?', rows: [] };
+      if (!_readonlySQL(sql2)) return { text: 'I could not build a safe query for that. Could you rephrase it — for example, name the role, city or status you want?', rows: [] };
       return runAndFormat(await bqQuery(sql2));
     } catch (e2) {
       return { text: 'Sorry, I could not run that query. Please try rephrasing your question (for example, name the role or the exact field you want).', rows: [] };
@@ -1840,7 +1840,7 @@ SQL:`;
 }
 
 
-// Cloud SQL data agent â€” for jobs, submissions, approvals, placements (the live website data)
+// Cloud SQL data agent — for jobs, submissions, approvals, placements (the live website data)
 async function agentSqlData(question, role) {
   const schema = `Cloud SQL (PostgreSQL) tables:
 jobs(job_id, title, client, hiring_manager, recruiter, assigned_recruiter_id, country, job_location, number_of_positions, priority, status, created_date)
@@ -1852,7 +1852,7 @@ submissions(submission_id, candidate_id, candidate_name, job_id, job_title, clie
   -- "rejected" = status='REJECTED". Count questions use COUNT(*).
 app_users(user_id, full_name, email, role, user_group)  -- roles: admin, hiring_manager, recruiter
 clients(client_id, client_name, country, industry)`;
-  const prompt = `Write ONE plain PostgreSQL SELECT statement only â€” no explanation, no code fences, no trailing semicolon, no ':' named parameters, no '::' type casts. Use COUNT(*) for counts and ALWAYS alias aggregates with a readable name (e.g. COUNT(*) AS count, never a bare COUNT(*)). Use ILIKE for text matching, and LIMIT 50 for lists (never SELECT *). Write real literal values directly in the WHERE clause.
+  const prompt = `Write ONE plain PostgreSQL SELECT statement only — no explanation, no code fences, no trailing semicolon, no ':' named parameters, no '::' type casts. Use COUNT(*) for counts and ALWAYS alias aggregates with a readable name (e.g. COUNT(*) AS count, never a bare COUNT(*)). Use ILIKE for text matching, and LIMIT 50 for lists (never SELECT *). Write real literal values directly in the WHERE clause.
 ${schema}
 Question: ${question}
 SQL:`;
@@ -1886,12 +1886,12 @@ async function agentUrgency(topN) {
   try {
     const rows = await bqQuery(`SELECT candidate_id, full_name, role, destination_country, visa_status, urgency_score FROM \`${BQ_DS}.candidates\` WHERE visa_status IN ('VISA_REJECTED','REMEDIATION_IN_PROGRESS','NOT_REPORTED') OR urgency_score >= 75 ORDER BY urgency_score DESC LIMIT ${parseInt(topN||10,10)}`);
     if (!rows.length) return { text: 'No high-urgency candidates right now.', rows: [] };
-    const lines = rows.map(r => `- ${r.full_name} (${r.candidate_id}) â€” ${r.role} â†’ ${r.destination_country||'â€”'} Â· visa ${(r.visa_status||'').replace(/_/g,' ')} Â· urgency ${r.urgency_score||0}`);
+    const lines = rows.map(r => `- ${r.full_name} (${r.candidate_id}) — ${r.role} → ${r.destination_country||'—'} · visa ${(r.visa_status||'').replace(/_/g,' ')} · urgency ${r.urgency_score||0}`);
     return { text: 'Top urgent / at-risk candidates:\n' + lines.join('\n'), rows };
   } catch (e) { return { text: 'Urgency query failed.', rows: [] }; }
 }
 
-// PREDICT-SCORE â€” BigQuery ML model: who is most likely to be placed
+// PREDICT-SCORE — BigQuery ML model: who is most likely to be placed
 async function agentPredictPlacement(topN) {
   try {
     const n = parseInt(topN || 10, 10);
@@ -1908,14 +1908,14 @@ async function agentPredictPlacement(topN) {
       const c = map[r.candidate_id] || {};
       return { candidate_id: r.candidate_id, full_name: c.full_name || r.candidate_id, role: c.role || '', destination_country: c.destination_country || '', placement_probability: r.placement_probability };
     });
-    const lines = merged.map((r, i) => `${i + 1}. ${r.full_name} (${r.candidate_id}) â€” ${Math.round((r.placement_probability || 0) * 100)}% likely Â· ${r.role || 'â€”'} â†’ ${r.destination_country || 'â€”'}`);
-    return { text: 'Candidates most likely to be placed, ranked by a model-estimated probability (0-100%, an estimate â€” not a guarantee, and not tied to a calendar month):\n' + lines.join('\n'), rows: merged };
+    const lines = merged.map((r, i) => `${i + 1}. ${r.full_name} (${r.candidate_id}) — ${Math.round((r.placement_probability || 0) * 100)}% likely · ${r.role || '—'} → ${r.destination_country || '—'}`);
+    return { text: 'Candidates most likely to be placed, ranked by a model-estimated probability (0-100%, an estimate — not a guarantee, and not tied to a calendar month):\n' + lines.join('\n'), rows: merged };
   } catch (e) { return { text: 'The placement-prediction model is not available right now.', rows: [] }; }
 }
 
-// SEMANTIC SEARCH â€” find candidates by MEANING (Vertex embeddings + BigQuery vector search).
+// SEMANTIC SEARCH — find candidates by MEANING (Vertex embeddings + BigQuery vector search).
 // Fit score mirrors the Job Board: strong role/destination signals dominate, with a small
-// semantic nudge â€” so an obviously right candidate reads as a high match, not a raw distance.
+// semantic nudge — so an obviously right candidate reads as a high match, not a raw distance.
 async function agentSemanticMatch(question) {
   let desc = (question || '').replace(/^\s*(find|show|get|search|list)\s+(me\s+)?(candidates?|people|profiles?|someone)\s*/i, '')
     .replace(/^(that\s+are\s+|who\s+are\s+|who\s+|that\s+|like\s+|similar\s+to\s+|matching\s+|with\s+)/i, '').trim();
@@ -1950,7 +1950,7 @@ async function agentSemanticMatch(question) {
       ORDER BY h.distance`;
     const [rows] = await bq.query({ query: sql, location: 'asia-south1', params: { q: desc } });
     let good = (rows || []).filter(r => r.distance <= 0.92);
-    if (!good.length) return { text: `No candidates in the database closely match "${desc}". I won't guess â€” there is no strong match for this request.`, rows: [] };
+    if (!good.length) return { text: `No candidates in the database closely match "${desc}". I won't guess — there is no strong match for this request.`, rows: [] };
     good = good.map(r => {
       const sameRole = roleHit(r.role);
       const sameCountry = wantCountry ? norm(r.destination_country) === norm(wantCountry) : false;
@@ -1958,18 +1958,18 @@ async function agentSemanticMatch(question) {
       if (sameRole || sameCountry) {
         fit = (sameRole ? 66 : 0) + (sameCountry ? 25 : 0) + Math.round((1 - r.distance) * 8);
       } else {
-        // no explicit role/country in the query â€” score on semantic closeness, readably scaled
+        // no explicit role/country in the query — score on semantic closeness, readably scaled
         fit = 45 + Math.round((1 - r.distance) * 45);
       }
       fit = Math.max(1, Math.min(99, fit));
       return { candidate_id: r.candidate_id, full_name: r.full_name, role: r.role, destination_country: r.destination_country, visa_status: r.visa_status, experience_years: r.experience_years, match: fit };
     }).sort((a, b) => b.match - a.match).slice(0, 10);
-    const lines = good.map(r => `- ${r.full_name} (${r.candidate_id}) â€” ${r.role}, ${r.experience_years || 0} yrs â†’ ${r.destination_country || 'â€”'} Â· ${r.match}% match`);
+    const lines = good.map(r => `- ${r.full_name} (${r.candidate_id}) — ${r.role}, ${r.experience_years || 0} yrs → ${r.destination_country || '—'} · ${r.match}% match`);
     return { text: `Candidates matching "${desc}" by meaning (ranked by fit):\n` + lines.join('\n'), rows: good };
   } catch (e) { return { text: 'Semantic search is not available right now.', rows: [] }; }
 }
 
-// LOCATION â€” candidates whose CURRENT city (origin_city) is in/near a named city
+// LOCATION — candidates whose CURRENT city (origin_city) is in/near a named city
 async function agentNearCity(question) {
   const m = (question || '').match(/(?:near|around|close to|within\s+\d+\s*km(?:\s+of)?)\s+([A-Za-z][\w .'-]+)/i);
   let city = m ? m[1].trim() : '';
@@ -1978,18 +1978,18 @@ async function agentNearCity(question) {
   try {
     const rows = await bqQuery(`SELECT candidate_id, full_name, role, origin_city, destination_country, visa_status FROM \`${BQ_DS}.candidates\` WHERE LOWER(origin_city) LIKE LOWER('%${city.replace(/'/g,'')}%') LIMIT 50`);
     if (!rows.length) return { text: `No candidates currently live in or near ${city}. (origin_city = where a candidate lives now, an Indian city.)`, rows: [] };
-    const lines = rows.slice(0, 10).map(r => `- ${r.full_name} (${r.candidate_id}) â€” ${r.role}, currently in ${r.origin_city} â†’ going to ${r.destination_country || 'â€”'}`);
+    const lines = rows.slice(0, 10).map(r => `- ${r.full_name} (${r.candidate_id}) — ${r.role}, currently in ${r.origin_city} → going to ${r.destination_country || '—'}`);
     const note = rows.length > 10 ? `\n\n(Showing 10 of ${rows.length}. Full list in the table below.)` : '';
     return { text: `Candidates whose current city is in/near ${city}:\n` + lines.join('\n') + note, rows };
   } catch (e) { return { text: 'City lookup failed.', rows: [] }; }
 }
 
 // ============================================================
-// USE-CASE SKILLS â€” deterministic answers to sir's exact questions.
+// USE-CASE SKILLS — deterministic answers to sir's exact questions.
 // These give accurate, grounded results where plain text-to-SQL is unreliable.
 // ============================================================
 
-// RECRUITER Q1 â€” jobs sitting idle >5 days + WHY (blocker classification)
+// RECRUITER Q1 — jobs sitting idle >5 days + WHY (blocker classification)
 async function skillIdleJobs() {
   const jobs = (await pool.query(`
     SELECT j.job_id, j.title, j.client, j.recruiter, j.description, j.primary_skills,
@@ -2012,21 +2012,21 @@ async function skillIdleJobs() {
     const hasJD = (j.description && j.description.trim()) || (j.primary_skills && j.primary_skills.trim());
     const hasRecruiter = j.recruiter && j.recruiter.trim();
     // Most specific blocker first, so each job reads distinctly.
-    if (!hasJD) blocker = 'Missing JD â€” add the job description/skills so sourcing can start';
-    else if (Number(j.subs) === 0 && !hasRecruiter) blocker = 'No recruiter assigned â€” assign a recruiter to start sourcing';
-    else if (Number(j.subs) === 0) blocker = `No candidates sourced in ${j.age_days} days â€” source & submit candidates`;
+    if (!hasJD) blocker = 'Missing JD — add the job description/skills so sourcing can start';
+    else if (Number(j.subs) === 0 && !hasRecruiter) blocker = 'No recruiter assigned — assign a recruiter to start sourcing';
+    else if (Number(j.subs) === 0) blocker = `No candidates sourced in ${j.age_days} days — source & submit candidates`;
     else if (Number(j.pending_hm) > 0) blocker = `${j.pending_hm} submission(s) waiting on hiring-manager approval`;
     else if (Number(j.awaiting_resume) > 0) blocker = `${j.awaiting_resume} candidate(s) approved but resume not received`;
-    else if (Number(j.interviewing) > 0) blocker = `${j.interviewing} candidate(s) mid-interview â€” move the rounds forward`;
+    else if (Number(j.interviewing) > 0) blocker = `${j.interviewing} candidate(s) mid-interview — move the rounds forward`;
     else if (Number(j.at_client) > 0) blocker = `Awaiting client feedback on ${j.at_client} candidate(s)`;
     else if (Number(j.at_placement) > 0) blocker = `${j.at_placement} candidate(s) waiting on placement approval`;
-    else blocker = 'No active movement â€” review and push the pipeline';
-    return `- ${j.title} (${j.client || 'â€”'}, ${j.job_id}) Â· idle ${j.age_days} days Â· Blocker: ${blocker}`;
+    else blocker = 'No active movement — review and push the pipeline';
+    return `- ${j.title} (${j.client || '—'}, ${j.job_id}) · idle ${j.age_days} days · Blocker: ${blocker}`;
   });
   return `Open jobs idle 5+ days (${jobs.length}), each with what is blocking it:\n` + lines.join('\n');
 }
 
-// BEST FIT â€” rank candidates for a named role (role match + readiness + experience)
+// BEST FIT — rank candidates for a named role (role match + readiness + experience)
 async function skillBestFit(question) {
   const roles = ['Software Engineer','Registered Nurse','Data Engineer','Cloud Architect','DevOps Engineer','Data Analyst','QA Engineer','Mechanical Engineer'];
   const found = roles.find(r => question.toLowerCase().includes(r.toLowerCase()))
@@ -2042,12 +2042,12 @@ async function skillBestFit(question) {
         experience_years DESC
       LIMIT 6`);
     if (!rows.length) return `No candidates found for ${found} in the pool.`;
-    const lines = rows.map((r, i) => `${i + 1}. ${r.full_name} (${r.candidate_id}) â€” ${r.experience_years || 0} yrs Â· ${r.destination_country || 'â€”'} Â· visa ${(r.visa_status || '').replace(/_/g, ' ')}`);
+    const lines = rows.map((r, i) => `${i + 1}. ${r.full_name} (${r.candidate_id}) — ${r.experience_years || 0} yrs · ${r.destination_country || '—'} · visa ${(r.visa_status || '').replace(/_/g, ' ')}`);
     return `Best-fit ${found} candidates (ranked by visa readiness, then experience):\n` + lines.join('\n');
   } catch (e) { return null; }
 }
 
-// RECRUITER Q2 â€” candidates with visa issues / rejections + reason + action
+// RECRUITER Q2 — candidates with visa issues / rejections + reason + action
 async function skillVisaIssues() {
   try {
     const rows = await bqQuery(`SELECT c.candidate_id, c.full_name, c.role, c.destination_country, w.rejection_codes
@@ -2059,28 +2059,28 @@ async function skillVisaIssues() {
       const codes = String(r.rejection_codes || '').split(';').map(c => c.trim()).filter(Boolean);
       const actions = codes.map(c => REJECTION_FIXES[c] || 'Refer to embassy guidance.').join(' ');
       out.push({ candidate_id: r.candidate_id, full_name: r.full_name, role: r.role, destination_country: r.destination_country, reason: codes.join(', ') || 'unspecified', action: actions });
-      return `- ${r.full_name} (${r.candidate_id}, ${r.role} â†’ ${r.destination_country}) Â· Reason: ${codes.join(', ') || 'unspecified'} Â· Action: ${actions}`;
+      return `- ${r.full_name} (${r.candidate_id}, ${r.role} → ${r.destination_country}) · Reason: ${codes.join(', ') || 'unspecified'} · Action: ${actions}`;
     });
-    return { text: `Candidates with visa rejections (${rows.length}) â€” reason and action required:\n` + lines.join('\n'), rows: out };
+    return { text: `Candidates with visa rejections (${rows.length}) — reason and action required:\n` + lines.join('\n'), rows: out };
   } catch (e) { return { text: 'Visa issues lookup failed.', rows: [] }; }
 }
 
-// RECRUITER Q3 â€” "what should I work on today?" (prioritised work queue)
+// RECRUITER Q3 — "what should I work on today?" (prioritised work queue)
 async function skillRecruiterQueue() {
   const needResume = (await pool.query(`SELECT candidate_name, job_title FROM submissions WHERE status='SUBMITTED' AND COALESCE(resume_received,FALSE)=FALSE ORDER BY created_at DESC LIMIT 10`)).rows;
   const toSchedule = (await pool.query(`SELECT candidate_name, job_title, status FROM submissions WHERE status IN ('RECRUITER_CALL','CLIENT_INTERVIEW') ORDER BY last_updated ASC NULLS FIRST LIMIT 10`)).rows;
   const forPlacement = (await pool.query(`SELECT candidate_name, job_title FROM submissions WHERE status='CLIENT_INTERVIEW' ORDER BY last_updated ASC NULLS FIRST LIMIT 10`)).rows;
   const idle = (await pool.query(`SELECT title, client, (CURRENT_DATE - created_date::date) AS age FROM jobs WHERE COALESCE(status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED') AND (CURRENT_DATE - created_date::date) >= 5 ORDER BY age DESC LIMIT 5`)).rows;
   const parts = [];
-  if (needResume.length) parts.push(`1) Chase resumes (${needResume.length}): ` + needResume.map(r => r.candidate_name + ' â€” ' + r.job_title).join('; '));
+  if (needResume.length) parts.push(`1) Chase resumes (${needResume.length}): ` + needResume.map(r => r.candidate_name + ' — ' + r.job_title).join('; '));
   if (toSchedule.length) parts.push(`2) Move interviews forward (${toSchedule.length}): ` + toSchedule.map(r => r.candidate_name + ' (' + (r.status || '').replace(/_/g,' ') + ')').join('; '));
   if (forPlacement.length) parts.push(`3) Close out client interviews / send for placement approval (${forPlacement.length}): ` + forPlacement.map(r => r.candidate_name).join('; '));
-  if (idle.length) parts.push(`4) Unblock aging jobs (${idle.length}): ` + idle.map(r => r.title + ' â€” ' + r.age + 'd').join('; '));
-  if (!parts.length) return 'Nothing urgent in your queue right now â€” pipeline is clear.';
+  if (idle.length) parts.push(`4) Unblock aging jobs (${idle.length}): ` + idle.map(r => r.title + ' — ' + r.age + 'd').join('; '));
+  if (!parts.length) return 'Nothing urgent in your queue right now — pipeline is clear.';
   return 'Your prioritised work for today:\n' + parts.join('\n');
 }
 
-// RECRUITER complex Q1 â€” candidates close to placement but blocked
+// RECRUITER complex Q1 — candidates close to placement but blocked
 async function skillPlacementRisk() {
   const rows = (await pool.query(`SELECT submission_id, candidate_id, candidate_name, job_title, client_name, status, COALESCE(resume_received,FALSE) AS resume_received
      FROM submissions WHERE status IN ('CLIENT_INTERVIEW','PENDING_PLACEMENT_APPROVAL','OFFER') ORDER BY last_updated ASC NULLS FIRST LIMIT 25`)).rows;
@@ -2097,26 +2097,35 @@ async function skillPlacementRisk() {
   const lines = rows.map(r => {
     const visa = visaMap[r.candidate_id];
     let blocker, who;
-    if (visa && /REJECT/.test(visa)) { blocker = 'Visa rejected â€” documents incomplete'; who = 'candidate action'; }
+    if (visa && /REJECT/.test(visa)) { blocker = 'Visa rejected — documents incomplete'; who = 'candidate action'; }
     else if (!r.resume_received && r.status === 'CLIENT_INTERVIEW') { blocker = 'Resume not on file'; who = 'candidate action'; }
     else if (r.status === 'PENDING_PLACEMENT_APPROVAL' || r.status === 'OFFER') { blocker = 'Placement approval pending'; who = 'hiring-manager action'; }
     else { blocker = 'Awaiting client decision'; who = 'client / recruiter action'; }
-    return `- ${r.candidate_name} â†’ ${(r.status||'').replace(/_/g,' ')} â†’ ${blocker} â†’ ${who}`;
+    return `- ${r.candidate_name} → ${(r.status||'').replace(/_/g,' ')} → ${blocker} → ${who}`;
   });
-  return `${rows.length} placement(s) at risk â€” blocker, then who needs to act:\n` + lines.join('\n');
+  return `${rows.length} placement(s) at risk — blocker, then who needs to act:\n` + lines.join('\n');
 }
 
-// HIRING MANAGER Q1 â€” what needs my attention today
+// HIRING MANAGER Q1 — what needs my attention today
 async function skillHMToday() {
   const subs = (await pool.query(`SELECT candidate_name, job_title, client_name FROM submissions WHERE status='PENDING_HM_APPROVAL' ORDER BY created_at DESC LIMIT 15`)).rows;
   const placements = (await pool.query(`SELECT candidate_name, job_title, client_name FROM submissions WHERE status='PENDING_PLACEMENT_APPROVAL' ORDER BY created_at DESC LIMIT 15`)).rows;
   const parts = [];
-  parts.push(`Submission approvals waiting (${subs.length})` + (subs.length ? ':\n' + subs.map(s => '  - ' + s.candidate_name + ' for ' + s.job_title + (s.client_name ? ' (' + s.client_name + ')' : '')).join('\n') : ' â€” none.'));
-  parts.push(`Placement approvals waiting (${placements.length})` + (placements.length ? ':\n' + placements.map(s => '  - ' + s.candidate_name + ' for ' + s.job_title + (s.client_name ? ' (' + s.client_name + ')' : '')).join('\n') : ' â€” none.'));
+  parts.push(`Submission approvals waiting (${subs.length})` + (subs.length ? ':\n' + subs.map(s => '  - ' + s.candidate_name + ' for ' + s.job_title + (s.client_name ? ' (' + s.client_name + ')' : '')).join('\n') : ' — none.'));
+  parts.push(`Placement approvals waiting (${placements.length})` + (placements.length ? ':\n' + placements.map(s => '  - ' + s.candidate_name + ' for ' + s.job_title + (s.client_name ? ' (' + s.client_name + ')' : '')).join('\n') : ' — none.'));
   return 'What needs your attention today:\n' + parts.join('\n');
 }
 
-// HIRING MANAGER Q2 â€” why haven't we found candidates for this role?
+// ADMIN — offer letters awaiting the authorized signatory (admin's pending work).
+async function skillPendingSignatures() {
+  try {
+    const { rows } = await pool.query(`SELECT candidate_name, job_title, client_name, offer_region, submitted_by FROM submissions WHERE offer_status = 'DRAFT' AND status = 'OFFER' ORDER BY last_updated DESC LIMIT 25`);
+    if (!rows.length) return 'Offer letters awaiting your signature (0) — none right now.';
+    return `Offer letters awaiting your signature (${rows.length}):\n` + rows.map(r => '  - ' + r.candidate_name + ' for ' + (r.job_title || 'a role') + (r.client_name ? ' (' + r.client_name + ')' : '') + (r.offer_region ? ' · ' + r.offer_region : '') + (r.submitted_by ? ' · prepared by ' + r.submitted_by : '') + ' — review & sign in the Offer Signatures tab.').join('\n');
+  } catch (e) { return 'Offer letters awaiting your signature (0) — none right now.'; }
+}
+
+// HIRING MANAGER Q2 — why haven't we found candidates for this role?
 async function skillWhyNoCandidates(question) {
   const roles = ['Software Engineer','Registered Nurse','Data Engineer','Cloud Architect','DevOps Engineer','Data Analyst','QA Engineer','Mechanical Engineer'];
   const found = roles.find(r => question.toLowerCase().includes(r.toLowerCase()));
@@ -2126,18 +2135,18 @@ async function skillWhyNoCandidates(question) {
     const rejected = (await bqQuery(`SELECT COUNT(*) AS n FROM \`${BQ_DS}.candidates\` WHERE LOWER(role)=LOWER('${found}') AND visa_status='VISA_REJECTED'`))[0]?.n || 0;
     const ready = (await bqQuery(`SELECT COUNT(*) AS n FROM \`${BQ_DS}.candidates\` WHERE LOWER(role)=LOWER('${found}') AND visa_status IN ('TRAINING_COMPLETE','VISA_APPROVED','PLACEMENT_ACTIVE')`))[0]?.n || 0;
     return `Feasibility for ${found}: ${total} candidates in the pool, ${ready} are placement-ready, ${rejected} have a visa rejection. ` +
-      (Number(total) === 0 ? 'The pool is empty for this role â€” it is a skill-scarcity problem; widen sourcing or relax location/rate.' :
+      (Number(total) === 0 ? 'The pool is empty for this role — it is a skill-scarcity problem; widen sourcing or relax location/rate.' :
        Number(ready) === 0 ? 'Candidates exist but none are placement-ready yet (training/visa in progress).' :
-       'There is a ready pool â€” the gap is likely matching or client feedback, not supply.');
+       'There is a ready pool — the gap is likely matching or client feedback, not supply.');
   } catch (e) { return null; }
 }
 
-const ASSISTANT_RULES = `You are the Recruit 360 AI Assistant. Ground every answer in the data provided by the tools; never invent a candidate name or ID. If a tool returns nothing, say so plainly â€” do not fabricate. Answer the exact question directly and answer every part of a multi-part question. origin_city = current Indian city; destination_country = where they go (never confuse). Placement probability is a model estimate (0-1), not a guarantee. You inform, you do not decide â€” never tell the user to hire/reject a specific candidate. You only help with Recruit 360 recruitment data; politely decline off-topic questions. Be concise and professional.`;
+const ASSISTANT_RULES = `You are the Recruit 360 AI Assistant. Ground every answer in the data provided by the tools; never invent a candidate name or ID. If a tool returns nothing, say so plainly — do not fabricate. Answer the exact question directly and answer every part of a multi-part question. origin_city = current Indian city; destination_country = where they go (never confuse). Placement probability is a model estimate (0-1), not a guarantee. You inform, you do not decide — never tell the user to hire/reject a specific candidate. You only help with Recruit 360 recruitment data; politely decline off-topic questions. Be concise and professional.`;
 
 function roleScope(role) {
   if (role === 'admin') return 'The user is an ADMIN with full visibility across all recruiters, clients, candidates and the pipeline.';
-  if (role === 'hiring_manager') return 'The user is a HIRING MANAGER â€” focus on their requisitions, pending approvals, submissions and candidate progress.';
-  if (role === 'recruiter') return 'The user is a RECRUITER â€” focus on their assigned jobs, their candidates, visa status and next actions.';
+  if (role === 'hiring_manager') return 'The user is a HIRING MANAGER — focus on their requisitions, pending approvals, submissions and candidate progress.';
+  if (role === 'recruiter') return 'The user is a RECRUITER — focus on their assigned jobs, their candidates, visa status and next actions.';
   return 'The user is a platform user.';
 }
 
@@ -2150,23 +2159,23 @@ app.post('/assistant/ask', async (req, res) => {
 
     // --- Greetings & vague follow-ups: show a helpful menu instead of guessing ---
     const menu = (role === 'hiring_manager')
-      ? 'I can help with:\nâ€¢ What needs my attention today?\nâ€¢ Why havenâ€™t we found candidates for a role (e.g. Registered Nurse)?\nâ€¢ Which candidates have visa issues?\nâ€¢ How many submissions are pending my approval?'
+      ? 'I can help with:\n• What needs my attention today?\n• Why haven’t we found candidates for a role (e.g. Registered Nurse)?\n• Which candidates have visa issues?\n• How many submissions are pending my approval?'
       : (role === 'admin')
-      ? 'I can help with:\nâ€¢ Which jobs are idle more than 5 days and what is blocking each?\nâ€¢ What needs attention today?\nâ€¢ Which candidates have visa issues?\nâ€¢ Which placements are at risk?'
-      : 'I can help with:\nâ€¢ What should I work on today?\nâ€¢ Which jobs are idle more than 5 days and what is blocking each?\nâ€¢ Which candidates have visa issues and what is the action?\nâ€¢ Which of my placements are at risk?';
+      ? 'I can help with:\n• Which jobs are idle more than 5 days and what is blocking each?\n• What needs attention today?\n• Which candidates have visa issues?\n• Which placements are at risk?'
+      : 'I can help with:\n• What should I work on today?\n• Which jobs are idle more than 5 days and what is blocking each?\n• Which candidates have visa issues and what is the action?\n• Which of my placements are at risk?';
     if (/^(hi+|hello|hey|yo|namaste|good (morning|afternoon|evening))\b/i.test(q)) {
-      return res.json({ answer: 'Hello! Iâ€™m the Recruit 360 assistant. ' + menu, agent: 'Assistant' });
+      return res.json({ answer: 'Hello! I’m the Recruit 360 assistant. ' + menu, agent: 'Assistant' });
     }
-    // Gratitude â€” always reply politely, never error.
+    // Gratitude — always reply politely, never error.
     if (/\b(thanks|thank you|thankyou|thx|thnx|ty)\b/i.test(q) && q.length < 40) {
-      return res.json({ answer: 'Youâ€™re welcome! Is there anything else I can help you with about your recruitment data?', agent: 'Assistant' });
+      return res.json({ answer: 'You’re welcome! Is there anything else I can help you with about your recruitment data?', agent: 'Assistant' });
     }
-    // Acknowledgements / sign-offs / tiny messages â€” reply gently instead of running a query.
+    // Acknowledgements / sign-offs / tiny messages — reply gently instead of running a query.
     if (/^(bye|goodbye|see you|that'?s all|that is all|nothing|no)\b/i.test(q)) {
-      return res.json({ answer: 'Alright â€” Iâ€™m here whenever you need anything about candidates, jobs, approvals, visas or placements.', agent: 'Assistant' });
+      return res.json({ answer: 'Alright — I’m here whenever you need anything about candidates, jobs, approvals, visas or placements.', agent: 'Assistant' });
     }
     if (q.length < 6 || /^(anything else|what else|more|ok(ay)?|k|cool|great|nice|good|awesome|perfect|got it|fine|done|yes|hmm+|and\??|next|continue)\b[\s\S]{0,15}$/i.test(q)) {
-      return res.json({ answer: 'Sure â€” hereâ€™s what I can help with. ' + menu, agent: 'Assistant' });
+      return res.json({ answer: 'Sure — here’s what I can help with. ' + menu, agent: 'Assistant' });
     }
 
     // --- Formatting / transform follow-ups: reshape the PREVIOUS answer, don't re-query ---
@@ -2179,7 +2188,7 @@ app.post('/assistant/ask', async (req, res) => {
         const wantsTable = /(grid|table|tabular|column)/i.test(q);
         const instruction = wantsTable
           ? 'Reformat the previous answer as a clean, aligned text table (a header row, then one record per line with columns separated by " | "). Keep every record. Plain text only.'
-          : 'Reformat the previous answer exactly as the user asks (e.g. shorter, a summary, or a tidy list). Keep the facts identical â€” do not add or invent anything.';
+          : 'Reformat the previous answer exactly as the user asks (e.g. shorter, a summary, or a tidy list). Keep the facts identical — do not add or invent anything.';
         const rp = `You are reformatting your own previous answer for the user. ${instruction}
 Do NOT use markdown asterisks, bold or backticks. Do not add new data. If the previous answer was an error or empty, ask the user to try the question again instead.
 
@@ -2204,10 +2213,10 @@ REFORMATTED ANSWER:`;
 
     let toolResult = '', agentName = '', rows = [];
     // Route: jobs/submissions/approvals/placements -> Cloud SQL (live website data). Candidates/visa -> BigQuery.
-    // Jobs/submissions live in Cloud SQL; candidates/visa live in BigQuery â€” never send a "visa" question here.
+    // Jobs/submissions live in Cloud SQL; candidates/visa live in BigQuery — never send a "visa" question here.
     const isJobsData = /(open job|jobs\b|job posting|requisition|submission|submitted|approv|pending|awaiting|assigned|my job|placement|placed|offer|interview|recruiter call|hr round|shortlist|reject)/i.test(q) && !/\bvisa\b/i.test(q);
 
-    // --- Use-case skills (sir's exact questions) â€” checked first for reliable answers ---
+    // --- Use-case skills (sir's exact questions) — checked first for reliable answers ---
     const isIdleJobs = /((idle|sitting idle|stuck|blocked|blocker|not moving|no movement|aging|ageing)[^.]*\b(job|jobs|requisition)|which jobs[^.]*(idle|blocked|stuck|blocking))/i.test(q);
     // "how many / count / total" questions go to the data agent for the clean number (e.g. 78),
     // not the visa-issues list skill (which only counts formal rejection workflows).
@@ -2231,9 +2240,11 @@ REFORMATTED ANSWER:`;
       toolResult = await skillIdleJobs(); agentName = 'Idle & Blocked Jobs';
     } else if (isPlacementRisk) {
       toolResult = await skillPlacementRisk(); agentName = 'Placement Risk';
+    } else if (/(pending|awaiting|need|needs|to)\s*(my\s*)?(signature|sign)|offers?\s*(to|for|awaiting|pending|need)?\s*sign|sign\s*(the\s*)?offer|signature queue|offers? (awaiting|pending|to be) sign/i.test(q)) {
+      toolResult = await skillPendingSignatures(); agentName = 'Offer Signatures';
     } else if (isWorkToday) {
       if (role === 'hiring_manager') toolResult = await skillHMToday();
-      else if (role === 'admin') { const a = await skillHMToday(); const b = await skillIdleJobs(); toolResult = a + '\n\n' + b; }
+      else if (role === 'admin') { const sig = await skillPendingSignatures(); const a = await skillHMToday(); const b = await skillIdleJobs(); toolResult = sig + '\n\n' + a + '\n\n' + b; }
       else toolResult = await skillRecruiterQueue();
       agentName = 'My Work Today';
     } else if (isVisaIssues) {
@@ -2264,8 +2275,8 @@ REFORMATTED ANSWER:`;
 
     // Compose a clean answer that faithfully reflects the tool result (no invention).
     const scope = role === 'admin' ? 'admin (full visibility)' : role === 'hiring_manager' ? 'hiring manager' : role === 'recruiter' ? 'recruiter' : 'user';
-    const finalPrompt = `You are the Recruit 360 AI assistant answering a ${scope}. Below is the exact result from the database for the user's question. Answer using ONLY this result â€” never add or invent names, numbers or candidates that are not in it. If the result says none were found, say clearly that there are none. Never output raw column names or aliases like "f0_" or JSON keys â€” describe the numbers in a plain sentence (e.g. "There are 78 â€¦"). If the result is an internal error or guard message, do NOT repeat it â€” instead briefly ask the user to rephrase.
-STRUCTURE: open with ONE short summary sentence that answers the question at a glance (e.g. "You have 12 candidates with visa issues â€” most need document fixes."), then a blank line, then the details. For a list, put each item on its own line starting with "â€¢ ". If a value is a probability/score, briefly note it is a model estimate.
+    const finalPrompt = `You are the Recruit 360 AI assistant answering a ${scope}. Below is the exact result from the database for the user's question. Answer using ONLY this result — never add or invent names, numbers or candidates that are not in it. If the result says none were found, say clearly that there are none. Never output raw column names or aliases like "f0_" or JSON keys — describe the numbers in a plain sentence (e.g. "There are 78 …"). If the result is an internal error or guard message, do NOT repeat it — instead briefly ask the user to rephrase.
+STRUCTURE: open with ONE short summary sentence that answers the question at a glance (e.g. "You have 12 candidates with visa issues — most need document fixes."), then a blank line, then the details. For a list, put each item on its own line starting with "• ". If a value is a probability/score, briefly note it is a model estimate.
 FORMAT as plain text for a chat bubble: do NOT use markdown, asterisks (*), bold (**), backticks or headings. Be concise and professional.
 
 DATABASE RESULT:
@@ -2283,8 +2294,8 @@ ANSWER:`;
     // Return rows + agent so the UI can show the "Result data" table and the agent trace.
     return res.json({ answer, agent: agentName, rows: Array.isArray(rows) ? rows.slice(0, 500) : [] });
   } catch (e) {
-    // Never surface a raw "Assistant error" â€” always answer gracefully.
-    return res.json({ answer: 'Sorry, I had trouble with that one. Please try rephrasing it â€” for example, ask about candidates, jobs, approvals, visas or placements.', agent: 'Assistant', rows: [] });
+    // Never surface a raw "Assistant error" — always answer gracefully.
+    return res.json({ answer: 'Sorry, I had trouble with that one. Please try rephrasing it — for example, ask about candidates, jobs, approvals, visas or placements.', agent: 'Assistant', rows: [] });
   }
 });
 
@@ -2299,17 +2310,17 @@ app.get('/submissions/:id/next-action', async (req, res) => {
     // New flow: resume + AI summary come BEFORE hiring-manager approval.
     // SUBMITTED: received -> send summary to HM; requested -> waiting; else -> request resume.
     const submittedStep = s.resume_received
-      ? { action: 'send_to_hm', label: 'Send summary to hiring manager', can: true, hint: 'Resume received â€” review it and send an AI summary to the hiring manager for approval.' }
+      ? { action: 'send_to_hm', label: 'Send summary to hiring manager', can: true, hint: 'Resume received — review it and send an AI summary to the hiring manager for approval.' }
       : s.resume_requested
-        ? { action: 'await_resume', label: 'Awaiting resume', can: false, hint: 'The resume-upload email was sent â€” waiting for the candidate to upload.' }
+        ? { action: 'await_resume', label: 'Awaiting resume', can: false, hint: 'The resume-upload email was sent — waiting for the candidate to upload.' }
         : { action: 'request_resume', label: 'Request resume', can: true, hint: 'Send the candidate the resume-upload email.' };
     const MAP = {
       SUBMITTED:                  submittedStep,
       PENDING_HM_APPROVAL:        { action: 'awaiting_approval', label: 'Awaiting approval', can: false, hint: 'The hiring manager is reviewing the resume summary.' },
-      RECRUITER_CALL:             { action: 'schedule_call', label: 'Schedule recruiter call', can: true, hint: 'Shortlisted â€” propose slots for the recruiter call and capture CTC there.' },
+      RECRUITER_CALL:             { action: 'schedule_call', label: 'Schedule recruiter call', can: true, hint: 'Shortlisted — propose slots for the recruiter call and capture CTC there.' },
       CLIENT_INTERVIEW:           { action: 'request_placement', label: 'Send for placement approval', can: true, hint: 'Request the client panel, schedule the client interview, then send to the hiring manager for placement approval.' },
       PENDING_PLACEMENT_APPROVAL: { action: 'await_placement', label: 'Awaiting placement approval', can: false, hint: 'Placement approval is pending with the hiring manager.' },
-      OFFER:                      { action: 'prepare_offer', label: 'Prepare & send the offer letter', can: false, hint: 'Approved to hire â€” prepare the offer letter below, get it signed by an admin, then send it to the candidate.' },
+      OFFER:                      { action: 'prepare_offer', label: 'Prepare & send the offer letter', can: false, hint: 'Approved to hire — prepare the offer letter below, get it signed by an admin, then send it to the candidate.' },
       PLACED:                     { action: 'done', label: 'Placed', can: false, hint: 'This candidate is placed.' },
       REJECTED:                   { action: 'done', label: 'Rejected', can: false, hint: 'This candidate was rejected.' },
       OFFER_DECLINED:             { action: 'done', label: 'Offer declined', can: false, hint: 'The candidate declined the offer.' },
@@ -2319,7 +2330,7 @@ app.get('/submissions/:id/next-action', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// Contextual agent EXECUTE â€” performs the suggested action (and returns any email content)
+// Contextual agent EXECUTE — performs the suggested action (and returns any email content)
 app.post('/submissions/:id/context-action', async (req, res) => {
   try {
     const { action } = req.body;
@@ -2334,7 +2345,7 @@ app.post('/submissions/:id/context-action', async (req, res) => {
       const token = 'INV-' + Math.random().toString(36).slice(2, 10).toUpperCase();
       try { await pool.query(`INSERT INTO candidate_onboarding (candidate_id, job_id, candidate_name, email, invite_token, onboarding_status) VALUES ($1,$2,$3,$4,$5,'INVITED')`, [s.candidate_id, s.job_id || '', s.candidate_name, candEmail, token]); } catch(e){}
       const link = (process.env.PORTAL_URL || 'https://direct-tribute-502305-q5.web.app') + '/#/candidate-upload?token=' + token;
-      const emailSubject = 'Please upload your resume â€” ' + (s.job_title || 'a role');
+      const emailSubject = 'Please upload your resume — ' + (s.job_title || 'a role');
       const emailBody = 'Dear ' + s.candidate_name + ',\n\nYou have been shortlisted for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '. Please upload your latest resume and confirm your contact details here:\n\n' + link + '\n\nBest regards,\nRecruit 360 Team';
       try { await pool.query('UPDATE submissions SET resume_requested = TRUE, last_updated = NOW() WHERE submission_id = $1', [req.params.id]); } catch (e) {}
       await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody, sent_by: 'recruiter' });
@@ -2355,31 +2366,31 @@ app.post('/submissions/:id/context-action', async (req, res) => {
         let prof = {};
         try { prof = (await pool.query('SELECT role, origin_city, destination_country, experience_years FROM candidates WHERE candidate_id = $1', [s.candidate_id])).rows[0] || {}; } catch (e) {}
         if (!prof || !prof.role) { try { const b = await bqQuery(`SELECT role, origin_city, destination_country, experience_years FROM \`${BQ_DS}.candidates\` WHERE candidate_id = '${(s.candidate_id || '').replace(/'/g, '')}'`); if (b && b[0]) prof = b[0]; } catch (e) {} }
-        basis = 'Candidate profile on file â€” role: ' + (prof.role || s.job_title || 'n/a') + ', experience: ' + (prof.experience_years != null ? prof.experience_years + ' years' : 'n/a') + ', current city: ' + (prof.origin_city || 'n/a') + ', destination: ' + (prof.destination_country || 'n/a') + '.';
-        basisNote = 'from the candidateâ€™s saved profile';
+        basis = 'Candidate profile on file — role: ' + (prof.role || s.job_title || 'n/a') + ', experience: ' + (prof.experience_years != null ? prof.experience_years + ' years' : 'n/a') + ', current city: ' + (prof.origin_city || 'n/a') + ', destination: ' + (prof.destination_country || 'n/a') + '.';
+        basisNote = 'from the candidate’s saved profile';
       }
       let summary = '';
       try {
         const gen = await genModel.generateContent('You are a recruiter preparing a concise candidate summary for a hiring manager to approve. Candidate: ' + s.candidate_name + ' for the role ' + (s.job_title || '') + (s.client_name ? ' at ' + s.client_name : '') + '. Base it ONLY on the data below (' + basisNote + ').\n' + basis + '\n\nWrite 4-5 short lines: fit for the role, experience, key points, and any strength or gap. Plain text, no markdown.');
         summary = gen.response.candidates[0].content.parts[0].text.trim();
-      } catch (e) { summary = `${s.candidate_name} â€” candidate for ${s.job_title || 'the role'}, summarized from the profile on file.`; }
+      } catch (e) { summary = `${s.candidate_name} — candidate for ${s.job_title || 'the role'}, summarized from the profile on file.`; }
       try { await pool.query('UPDATE submissions SET status = $1, resume_summary = $2, last_updated = NOW() WHERE submission_id = $3', ['PENDING_HM_APPROVAL', summary, req.params.id]); }
       catch (e) { await pool.query("UPDATE submissions SET status = 'PENDING_HM_APPROVAL', last_updated = NOW() WHERE submission_id = $1", [req.params.id]); }
       let hm = '';
       try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
-      const hmMsg = `Candidate for approval: ${s.candidate_name} for ${s.job_title || 'a role'}${s.client_name ? ' (' + s.client_name + ')' : ''}. Resume reviewed â€” summary attached.`;
+      const hmMsg = `Candidate for approval: ${s.candidate_name} for ${s.job_title || 'a role'}${s.client_name ? ' (' + s.client_name + ')' : ''}. Resume reviewed — summary attached.`;
       await notify({ candidate_id: s.candidate_id, recipient: hm || 'hiring_manager', type: 'CANDIDATE_REVIEW', message: hmMsg });
-      await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm || 'hiring_manager', subject: 'Candidate summary for approval â€” ' + s.candidate_name, body: summary, sent_by: 'recruiter' });
+      await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm || 'hiring_manager', subject: 'Candidate summary for approval — ' + s.candidate_name, body: summary, sent_by: 'recruiter' });
       return res.json({ ok: true, done: 'send_to_hm', status: 'PENDING_HM_APPROVAL', summary, message: 'Summary sent to the hiring manager for approval.' });
     }
     if (action === 'send_summary') {
       const gen = await genModel.generateContent('Write a short professional candidate summary email to a client for ' + s.candidate_name + ', role ' + (s.job_title || '') + '. 4-5 lines, highlight fit. Return only the email body.');
       const emailBody = gen.response.candidates[0].content.parts[0].text.trim();
-      return res.json({ ok: true, done: 'send_summary', emailSubject: 'Candidate summary â€” ' + s.candidate_name, emailBody, candidateEmail: (s.client_name||'client').toLowerCase().replace(/\s+/g,'') + '@client.com' });
+      return res.json({ ok: true, done: 'send_summary', emailSubject: 'Candidate summary — ' + s.candidate_name, emailBody, candidateEmail: (s.client_name||'client').toLowerCase().replace(/\s+/g,'') + '@client.com' });
     }
 
     // Recruiter sends the candidate to the hiring manager for PLACEMENT approval.
-    // Recruiters cannot place directly â€” this only queues it for the HM.
+    // Recruiters cannot place directly — this only queues it for the HM.
     if (action === 'request_placement') {
       if (s.status !== 'CLIENT_INTERVIEW') {
         return res.status(400).json({ error: 'Placement can only be requested after the client interview.' });
@@ -2390,7 +2401,7 @@ app.post('/submissions/:id/context-action', async (req, res) => {
       try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
       const hmMsg = `Placement approval needed: ${s.candidate_name} for ${s.job_title || 'a role'}${s.client_name ? ' (' + s.client_name + ')' : ''}.`;
       await notify({ candidate_id: s.candidate_id, recipient: hm || 'hiring_manager', type: 'PLACEMENT_APPROVAL', message: hmMsg });
-      await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm || 'hiring_manager', subject: 'Placement approval needed â€” ' + s.candidate_name, body: hmMsg, sent_by: s.submitted_by || 'recruiter' });
+      await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm || 'hiring_manager', subject: 'Placement approval needed — ' + s.candidate_name, body: hmMsg, sent_by: s.submitted_by || 'recruiter' });
       return res.json({ ok: true, done: 'request_placement', status: 'PENDING_PLACEMENT_APPROVAL', message: 'Sent to the hiring manager for placement approval.' });
     }
 
@@ -2400,19 +2411,19 @@ app.post('/submissions/:id/context-action', async (req, res) => {
       await pool.query("UPDATE submissions SET status = 'CLIENT_INTERVIEW', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
       let hm = '';
       try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
-      await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'STAGE', message: `${s.candidate_name} moved to the client interview â€” request the client panel.` });
-      await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Recruiter call complete â€” ' + s.candidate_name, body: 'Recruiter call completed. Proceeding to the client interview (request the panel from the client).', sent_by: 'recruiter' });
-      return res.json({ ok: true, done: 'complete_recruiter_call', status: 'CLIENT_INTERVIEW', message: 'Recruiter call complete â€” moved to the client interview.' });
+      await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'STAGE', message: `${s.candidate_name} moved to the client interview — request the client panel.` });
+      await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Recruiter call complete — ' + s.candidate_name, body: 'Recruiter call completed. Proceeding to the client interview (request the panel from the client).', sent_by: 'recruiter' });
+      return res.json({ ok: true, done: 'complete_recruiter_call', status: 'CLIENT_INTERVIEW', message: 'Recruiter call complete — moved to the client interview.' });
     }
 
-    // Schedule actions advance the pipeline forward (HR round removed â€” recruiter call then client interview).
+    // Schedule actions advance the pipeline forward (HR round removed — recruiter call then client interview).
     const ADVANCE = { schedule_call: 'CLIENT_INTERVIEW', schedule_client: 'CLIENT_INTERVIEW' };
     if (ADVANCE[action]) {
       await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [ADVANCE[action], req.params.id]);
       const labels = { schedule_call: 'recruiter call', schedule_client: 'client interview' };
       const meetCode = Math.random().toString(36).slice(2, 5) + '-' + Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 5);
       const interview_link = 'https://meet.google.com/' + meetCode;
-      const emailSubject = 'Your ' + labels[action] + ' is scheduled â€” ' + (s.job_title || 'a role');
+      const emailSubject = 'Your ' + labels[action] + ' is scheduled — ' + (s.job_title || 'a role');
       const emailBody = 'Dear ' + s.candidate_name + ',\n\nYour ' + labels[action] + ' for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + ' has been scheduled.\n\nJoin using this link:\n' + interview_link + '\n\nPlease confirm your availability by replying to this email.\n\nBest regards,\nRecruit 360 Team';
       await pool.query('UPDATE submissions SET interview_link = $1 WHERE submission_id = $2', [interview_link, req.params.id]).catch(() => {});
       // Record & keep recruiter + hiring manager in the loop
@@ -2420,9 +2431,9 @@ app.post('/submissions/:id/context-action', async (req, res) => {
       try { hm2 = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
       const cArgs = { submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, sent_by: 'recruiter' };
       await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody });
-      const upd = s.candidate_name + 'â€™s ' + labels[action] + ' for ' + (s.job_title || 'a role') + ' has been scheduled. Link: ' + interview_link;
+      const upd = s.candidate_name + '’s ' + labels[action] + ' for ' + (s.job_title || 'a role') + ' has been scheduled. Link: ' + interview_link;
       await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: 'Your ' + labels[action] + ' is scheduled. Link: ' + interview_link });
-      if (hm2) { await notify({ candidate_id: s.candidate_id, recipient: hm2, type: 'INTERVIEW', message: upd }); await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm2, subject: 'Interview scheduled â€” ' + s.candidate_name, body: upd }); }
+      if (hm2) { await notify({ candidate_id: s.candidate_id, recipient: hm2, type: 'INTERVIEW', message: upd }); await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm2, subject: 'Interview scheduled — ' + s.candidate_name, body: upd }); }
       return res.json({ ok: true, done: action, status: ADVANCE[action], interview_link, emailSubject, emailBody, candidateEmail: candEmail });
     }
 
@@ -2454,7 +2465,7 @@ app.patch('/submissions/:id/resume', async (req, res) => {
       [req.params.id, pasted_text ? String(pasted_text).slice(0, 8000) : null]);
     const tag = doc_type || 'Resume';
     const via = source ? ' (received via ' + source + ')' : '';
-    const body = `${tag} received for ${s.candidate_name}${filename ? ' â€” ' + filename : ''}${via} and added manually by the recruiter.`
+    const body = `${tag} received for ${s.candidate_name}${filename ? ' — ' + filename : ''}${via} and added manually by the recruiter.`
       + (pasted_text ? '\n\n--- Pasted content ---\n' + String(pasted_text).slice(0, 4000) : '')
       + '\n\nReady for the recruiter call.';
     await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'DOCUMENT', to_role: 'recruiter', to_name: added_by || 'recruiter', subject: tag + ' added (offline)', body, sent_by: added_by || 'recruiter' });
@@ -2481,20 +2492,20 @@ app.patch('/submissions/:id/placement-approval', async (req, res) => {
       let hm = '';
       try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
       await notify({ candidate_id: s.candidate_id, recipient: hm || 'hiring_manager', type: 'OFFER_PREP', message: `Prepare the offer letter for ${s.candidate_name} (${s.job_title || 'a role'}).` });
-      await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm || 'hiring_manager', subject: 'Approved to hire â€” prepare offer: ' + s.candidate_name, body: recMsg });
+      await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'hiring_manager', to_name: hm || 'hiring_manager', subject: 'Approved to hire — prepare offer: ' + s.candidate_name, body: recMsg });
       return res.json({ ok: true, status: 'OFFER', next: 'prepare_offer', message: 'Approved to hire. Prepare the offer letter next, then send it to admin for signature.' });
     }
     // Rejected -> send it back to the recruiter at the client-interview stage with a reason
     await pool.query("UPDATE submissions SET status = 'CLIENT_INTERVIEW', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
     const rejMsg = `Placement not approved for ${s.candidate_name}${reason ? ': ' + reason : ''}.`;
     await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACEMENT_REJECTED', message: rejMsg });
-    await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Placement not approved â€” ' + s.candidate_name, body: rejMsg });
+    await logComm({ ...cArgs, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Placement not approved — ' + s.candidate_name, body: rejMsg });
     return res.json({ ok: true, status: 'CLIENT_INTERVIEW' });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
 // ============================================================
-// OFFER LETTER (Stage 6 & 7) â€” HM prepares final terms, AI drafts the letter,
+// OFFER LETTER (Stage 6 & 7) — HM prepares final terms, AI drafts the letter,
 // ADMIN (authorized signatory) signs/seals, then it is sent to the candidate.
 // Region-aware (India / Germany / Poland). No infra deps: a branded, print-ready
 // HTML letter the UI renders and downloads as a PDF.
@@ -2507,17 +2518,17 @@ const DEFAULT_SIGNATORY = { name: process.env.SIGNATORY_NAME || 'Authorized Sign
 function offerRegionDefaults(region) {
   const r = String(region || 'India').trim().toLowerCase();
   if (r === 'germany' || r === 'de') {
-    return { region: 'Germany', country: 'Germany', currency: 'â‚¬', currency_code: 'EUR', locale: 'de-DE',
-      vacation_days: 28, min_stay_months: 12, repayment_cap: 'â‚¬8,000', pay_type: 'biweekly',
+    return { region: 'Germany', country: 'Germany', currency: '€', currency_code: 'EUR', locale: 'de-DE',
+      vacation_days: 28, min_stay_months: 12, repayment_cap: '€8,000', pay_type: 'biweekly',
       note: 'European salary standards apply; figures are gross before tax, social security and statutory contributions.' };
   }
   if (r === 'poland' || r === 'pl') {
-    return { region: 'Poland', country: 'Poland', currency: 'zÅ‚', currency_code: 'PLN', locale: 'pl-PL',
-      vacation_days: 26, min_stay_months: 12, repayment_cap: 'zÅ‚30,000', pay_type: 'monthly',
+    return { region: 'Poland', country: 'Poland', currency: 'zł', currency_code: 'PLN', locale: 'pl-PL',
+      vacation_days: 26, min_stay_months: 12, repayment_cap: 'zł30,000', pay_type: 'monthly',
       note: 'Figures are gross and aligned to the applicable Polish national minimum-wage baseline and statutory contributions.' };
   }
-  return { region: 'India', country: 'India', currency: 'â‚¹', currency_code: 'INR', locale: 'en-IN',
-    vacation_days: 24, min_stay_months: 6, repayment_cap: 'â‚¹400,000', pay_type: 'annual',
+  return { region: 'India', country: 'India', currency: '₹', currency_code: 'INR', locale: 'en-IN',
+    vacation_days: 24, min_stay_months: 6, repayment_cap: '₹400,000', pay_type: 'annual',
     note: 'Figures are gross before tax, statutory deductions and employer contributions as applicable in India.' };
 }
 
@@ -2541,7 +2552,7 @@ function buildOfferHtml(d) {
   const startDate = d.start_date ? new Date(d.start_date).toLocaleDateString(d.locale || 'en-IN', { day: 'numeric', month: 'long', year: 'numeric' }) : 'to be confirmed';
   const resp = (d.responsibilities || '').trim();
   const respHtml = resp
-    ? resp.split(/\n+/).filter(Boolean).map(x => `<li>${esc(x.replace(/^[-â€¢]\s*/, ''))}</li>`).join('')
+    ? resp.split(/\n+/).filter(Boolean).map(x => `<li>${esc(x.replace(/^[-•]\s*/, ''))}</li>`).join('')
     : '<li>Deliver the responsibilities of the role as directed by your reporting manager.</li>';
   const signedBlock = d.signed ? `
       <div class="sign">
@@ -2597,7 +2608,7 @@ function buildOfferHtml(d) {
   <p>Proposed start date: ${esc(startDate)}</p>
 
   <p class="greeting">Dear ${esc((d.candidate_name || 'Candidate').split(' ')[0])},</p>
-  <p>${esc(d.opening || `We are pleased to offer you employment with ${COMPANY_NAME} (the â€œCompanyâ€) as ${d.role_title || 'a member of our team'}${d.client_name ? ', on assignment with ' + d.client_name : ''}. This letter summarizes the principal terms of the proposed employment. Your employment will be governed by the definitive local employment agreement, Company policies, and all mandatory laws applicable in ${d.country || d.region || 'your work location'}.`)}</p>
+  <p>${esc(d.opening || `We are pleased to offer you employment with ${COMPANY_NAME} (the “Company”) as ${d.role_title || 'a member of our team'}${d.client_name ? ', on assignment with ' + d.client_name : ''}. This letter summarizes the principal terms of the proposed employment. Your employment will be governed by the definitive local employment agreement, Company policies, and all mandatory laws applicable in ${d.country || d.region || 'your work location'}.`)}</p>
 
   <table class="meta">
     <tr><td class="k">Position</td><td>${esc(d.role_title || '')}</td></tr>
@@ -2662,7 +2673,7 @@ async function assembleOfferData(s, body) {
     hr_name: body.hr_name || '', hr_phone: body.hr_phone || '', hr_email: body.hr_email || '',
     gen_at: new Date().toISOString(),
   };
-  // AI assist (opening + responsibilities) â€” grounded, never invents numbers. Safe fallback on any error.
+  // AI assist (opening + responsibilities) — grounded, never invents numbers. Safe fallback on any error.
   try {
     const want = [];
     if (!data.responsibilities) want.push('responsibilities');
@@ -2692,7 +2703,7 @@ app.get('/submissions/:id/offer', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// GENERATE (hiring manager or admin) â€” AI drafts, template guarantees the numbers/clauses.
+// GENERATE (hiring manager or admin) — AI drafts, template guarantees the numbers/clauses.
 app.post('/submissions/:id/offer/generate', async (req, res) => {
   try {
     await ensureSlots();
@@ -2705,12 +2716,12 @@ app.post('/submissions/:id/offer/generate', async (req, res) => {
     const html = buildOfferHtml({ ...data, signed: false });
     await pool.query("UPDATE submissions SET status = 'OFFER', offer_status = 'DRAFT', offer_json = $2, offer_html = $3, offer_region = $4, offer_signed_by = NULL, offer_signed_at = NULL, last_updated = NOW() WHERE submission_id = $1",
       [req.params.id, JSON.stringify(data), html, data.region]);
-    await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'DOCUMENT', to_role: 'admin', to_name: 'Authorized signatory', subject: 'Offer letter drafted â€” ' + s.candidate_name, body: 'Offer letter prepared for ' + s.candidate_name + ' (' + data.region + '). Awaiting admin signature.', sent_by: by });
+    await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'DOCUMENT', to_role: 'admin', to_name: 'Authorized signatory', subject: 'Offer letter drafted — ' + s.candidate_name, body: 'Offer letter prepared for ' + s.candidate_name + ' (' + data.region + '). Awaiting admin signature.', sent_by: by });
     return res.json({ ok: true, offer_status: 'DRAFT', offer: data, html });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// SIGN (ADMIN ONLY â€” authorized signatory). Seals the letter.
+// SIGN (ADMIN ONLY — authorized signatory). Seals the letter.
 app.post('/submissions/:id/offer/sign', async (req, res) => {
   try {
     await ensureSlots();
@@ -2727,7 +2738,7 @@ app.post('/submissions/:id/offer/sign', async (req, res) => {
     const html = buildOfferHtml({ ...data, signed: true });
     await pool.query("UPDATE submissions SET offer_status = 'SIGNED', offer_json = $2, offer_html = $3, offer_signed_by = $4, offer_signed_at = $5, last_updated = NOW() WHERE submission_id = $1",
       [req.params.id, JSON.stringify(data), html, signatory_name, signed_at]);
-    await logComm({ submission_id: req.params.id, candidate_id: r.candidate_id, job_id: r.job_id, channel: 'DOCUMENT', to_role: 'hiring_manager', to_name: 'Hiring manager', subject: 'Offer letter signed â€” ' + r.candidate_name, body: 'Offer letter signed by ' + signatory_name + ' (' + signatory_title + '). Ready to send to the candidate.', sent_by: 'admin' });
+    await logComm({ submission_id: req.params.id, candidate_id: r.candidate_id, job_id: r.job_id, channel: 'DOCUMENT', to_role: 'hiring_manager', to_name: 'Hiring manager', subject: 'Offer letter signed — ' + r.candidate_name, body: 'Offer letter signed by ' + signatory_name + ' (' + signatory_title + '). Ready to send to the candidate.', sent_by: 'admin' });
     return res.json({ ok: true, offer_status: 'SIGNED', signatory_name, signatory_title, signed_at, html });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -2741,8 +2752,8 @@ app.post('/submissions/:id/offer/send', async (req, res) => {
     if (r.offer_status !== 'SIGNED') return res.status(400).json({ error: 'The offer must be signed by an admin before it can be sent.' });
     let data = {}; try { data = JSON.parse(r.offer_json); } catch (e) {}
     const candEmail = candidateEmail(r.candidate_id);
-    const emailSubject = 'Your Employment Offer â€” ' + (r.job_title || 'a role') + ' at ' + COMPANY_NAME;
-    const emailBody = 'Dear ' + (r.candidate_name || 'Candidate') + ',\n\nCongratulations! On behalf of ' + COMPANY_NAME + ', we are delighted to extend a formal offer of employment for the role of ' + (data.role_title || r.job_title || 'the position') + (r.client_name ? ' (assignment with ' + r.client_name + ')' : '') + '.\n\nYour signed offer letter is attached. It sets out your compensation, benefits, leave, the initial service commitment and the conditions of the offer. Please review it carefully.\n\nTo accept, kindly confirm by replying to this email. On acceptance, we will begin onboarding and will need the following documents to proceed:\n1. Identity & address proof (passport / national ID).\n2. Education and experience certificates.\n3. Recent photographs and completed joining forms (we will share these).\n4. Any documents required for visa processing â€” our visa partner (' + VISA_PARTNER_NAME + ') will guide you.\n\nIf you have any questions, our team is happy to help. We look forward to welcoming you aboard.\n\nBest regards,\n' + COMPANY_NAME + ' Talent Team';
+    const emailSubject = 'Your Employment Offer — ' + (r.job_title || 'a role') + ' at ' + COMPANY_NAME;
+    const emailBody = 'Dear ' + (r.candidate_name || 'Candidate') + ',\n\nCongratulations! On behalf of ' + COMPANY_NAME + ', we are delighted to extend a formal offer of employment for the role of ' + (data.role_title || r.job_title || 'the position') + (r.client_name ? ' (assignment with ' + r.client_name + ')' : '') + '.\n\nYour signed offer letter is attached. It sets out your compensation, benefits, leave, the initial service commitment and the conditions of the offer. Please review it carefully.\n\nTo accept, kindly confirm by replying to this email. On acceptance, we will begin onboarding and will need the following documents to proceed:\n1. Identity & address proof (passport / national ID).\n2. Education and experience certificates.\n3. Recent photographs and completed joining forms (we will share these).\n4. Any documents required for visa processing — our visa partner (' + VISA_PARTNER_NAME + ') will guide you.\n\nIf you have any questions, our team is happy to help. We look forward to welcoming you aboard.\n\nBest regards,\n' + COMPANY_NAME + ' Talent Team';
     const cc = [r.submitted_by ? 'recruiter (' + r.submitted_by + ')' : null].filter(Boolean).join(', ');
     await pool.query("UPDATE submissions SET offer_status = 'SENT', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
     await notify({ candidate_id: r.candidate_id, recipient: 'candidate', type: 'OFFER', message: 'You have received an employment offer for ' + (r.job_title || 'a role') + '. Please review and confirm.' });
@@ -2768,9 +2779,9 @@ app.post('/submissions/:id/offer/accept', async (req, res) => {
       const openings = Number((await pool.query('SELECT number_of_positions FROM jobs WHERE job_id = $1', [s.job_id])).rows[0]?.number_of_positions || 1);
       if (placedCount >= openings) { await pool.query("UPDATE jobs SET status = 'Filled' WHERE job_id = $1", [s.job_id]); jobFilled = true; }
     } catch (e) {}
-    const congratsSubject = 'Welcome Aboard â€” Onboarding Next Steps for ' + (s.job_title || 'a role');
-    const congratsBody = 'Dear ' + s.candidate_name + ',\n\nThank you for accepting your offer with ' + COMPANY_NAME + ' for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '. We are thrilled to have you join us.\n\nTo begin onboarding, our team will guide you through:\n1. Document Verification â€” please keep your identity and education documents ready.\n2. Application Forms â€” we will share the joining application for you to complete.\n3. Visa Documentation â€” our visa partner (' + VISA_PARTNER_NAME + ') will collect and process the required documents and keep you updated.\n\nWe will contact you shortly with the details. Congratulations and welcome aboard!\n\nBest regards,\n' + COMPANY_NAME + ' Talent Team\n\nCc: Recruiter (' + (s.submitted_by || 'assigned recruiter') + '), Visa Application Team (' + VISA_TEAM_EMAIL + ')';
-    await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'PLACED', message: 'Offer accepted â€” you have been placed for ' + (s.job_title || 'a role') + '. Visa processing will begin.' });
+    const congratsSubject = 'Welcome Aboard — Onboarding Next Steps for ' + (s.job_title || 'a role');
+    const congratsBody = 'Dear ' + s.candidate_name + ',\n\nThank you for accepting your offer with ' + COMPANY_NAME + ' for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + '. We are thrilled to have you join us.\n\nTo begin onboarding, our team will guide you through:\n1. Document Verification — please keep your identity and education documents ready.\n2. Application Forms — we will share the joining application for you to complete.\n3. Visa Documentation — our visa partner (' + VISA_PARTNER_NAME + ') will collect and process the required documents and keep you updated.\n\nWe will contact you shortly with the details. Congratulations and welcome aboard!\n\nBest regards,\n' + COMPANY_NAME + ' Talent Team\n\nCc: Recruiter (' + (s.submitted_by || 'assigned recruiter') + '), Visa Application Team (' + VISA_TEAM_EMAIL + ')';
+    await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'PLACED', message: 'Offer accepted — you have been placed for ' + (s.job_title || 'a role') + '. Visa processing will begin.' });
     await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'PLACED', message: s.candidate_name + ' accepted the offer and is now placed for ' + (s.job_title || 'a role') + '.' });
     await logComm({ ...cArgs, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: congratsSubject, body: congratsBody });
     return res.json({ ok: true, status: 'PLACED', offer_status: 'ACCEPTED', candidateEmail: candEmail, emailSubject: congratsSubject, emailBody: congratsBody, cc: VISA_TEAM_EMAIL, jobFilled });
@@ -2786,12 +2797,12 @@ app.post('/submissions/:id/offer/decline', async (req, res) => {
     await pool.query("UPDATE submissions SET status = 'OFFER_DECLINED', offer_status = 'DECLINED', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
     const reason = req.body?.reason || '';
     await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by || 'recruiter', type: 'OFFER_DECLINED', message: s.candidate_name + ' declined the offer for ' + (s.job_title || 'a role') + (reason ? ': ' + reason : '') + '.' });
-    await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Offer declined â€” ' + s.candidate_name, body: 'Offer declined' + (reason ? ': ' + reason : '') + '.', sent_by: req.body?.by || 'recruiter' });
+    await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'UPDATE', to_role: 'recruiter', to_name: s.submitted_by || 'recruiter', subject: 'Offer declined — ' + s.candidate_name, body: 'Offer declined' + (reason ? ': ' + reason : '') + '.', sent_by: req.body?.by || 'recruiter' });
     return res.json({ ok: true, status: 'OFFER_DECLINED', offer_status: 'DECLINED' });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ADMIN signature queue â€” offers drafted by the hiring manager, awaiting the authorized signatory.
+// ADMIN signature queue — offers drafted by the hiring manager, awaiting the authorized signatory.
 app.get('/offers/pending-signature', async (req, res) => {
   try {
     await ensureSlots();
@@ -2802,8 +2813,19 @@ app.get('/offers/pending-signature', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
+// HIRING MANAGER offer queue — every candidate currently at the OFFER stage (prepare / signed / send).
+app.get('/offers/active', async (req, res) => {
+  try {
+    await ensureSlots();
+    const { rows } = await pool.query(
+      `SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, offer_region, offer_status, submitted_by, last_updated
+         FROM submissions WHERE status = 'OFFER' ORDER BY last_updated DESC`);
+    return res.json({ offers: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
 // ============================================================
-// INTERVIEW SLOT ORCHESTRATOR â€” propose non-overlapping slots, candidate confirms one.
+// INTERVIEW SLOT ORCHESTRATOR — propose non-overlapping slots, candidate confirms one.
 // (Care 360-style: the agent suggests slots and never double-books a candidate or recruiter.)
 // ============================================================
 function meetLink() {
@@ -2874,7 +2896,7 @@ app.post('/submissions/:id/slots/propose', async (req, res) => {
     const candEmail = candidateEmail(s.candidate_id);
     const opts = accepted.map((a, i) => `  ${i + 1}. ${new Date(a.slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}`).join('\n');
     const label = kind === 'client' ? 'client interview' : 'recruiter call';
-    const emailSubject = `Choose a time for your ${label} â€” ${s.job_title || 'a role'}`;
+    const emailSubject = `Choose a time for your ${label} — ${s.job_title || 'a role'}`;
     const emailBody = 'Dear ' + s.candidate_name + ',\n\nPlease pick one of the available time slots for your ' + label + (s.client_name && kind === 'client' ? ' with ' + s.client_name : '') + ':\n\n' + opts + '\n\nReply with your preferred slot and we will confirm it with the meeting link.\n\nBest regards,\nRecruit 360 Team';
     await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody, sent_by: proposed_by || 'recruiter' });
     await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'SLOTS', message: `Please choose a time for your ${label}.` });
@@ -2882,7 +2904,7 @@ app.post('/submissions/:id/slots/propose', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// Directly FIX a manual slot (recruiter sets the exact time) â€” no candidate choosing.
+// Directly FIX a manual slot (recruiter sets the exact time) — no candidate choosing.
 // Books it as CONFIRMED, creates the meeting link, and emails the candidate the fixed time + link.
 app.post('/submissions/:id/slots/fix', async (req, res) => {
   try {
@@ -2906,9 +2928,9 @@ app.post('/submissions/:id/slots/fix', async (req, res) => {
     const label = kind === 'client' ? 'client interview' : 'recruiter call';
     const when = new Date(slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
     const clientCc = kind === 'client' ? clientEmailFor(s.client_name) : '';
-    const calLink = calendarLink(slot_time, dur, label.replace(/^./, c => c.toUpperCase()) + ' â€” ' + (s.job_title || 'role'), 'Candidate: ' + s.candidate_name + (s.client_name ? ' | Client: ' + s.client_name : '') + ' | Join: ' + link);
-    const emailSubject = `Your ${label} is scheduled â€” ${s.job_title || 'a role'}`;
-    const emailBody = 'Dear ' + s.candidate_name + ',\n\nYour ' + label + (s.client_name && kind === 'client' ? ' with ' + s.client_name : '') + ' has been scheduled for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nAdd it to your calendar (with Google Meet):\n' + calLink + '\n\nNo reply is needed â€” please join at the scheduled time.\n\nBest regards,\nRecruit 360 Team' + (clientCc ? '\n\n(The client interview panel is copied on this invite.)' : '');
+    const calLink = calendarLink(slot_time, dur, label.replace(/^./, c => c.toUpperCase()) + ' — ' + (s.job_title || 'role'), 'Candidate: ' + s.candidate_name + (s.client_name ? ' | Client: ' + s.client_name : '') + ' | Join: ' + link);
+    const emailSubject = `Your ${label} is scheduled — ${s.job_title || 'a role'}`;
+    const emailBody = 'Dear ' + s.candidate_name + ',\n\nYour ' + label + (s.client_name && kind === 'client' ? ' with ' + s.client_name : '') + ' has been scheduled for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nAdd it to your calendar (with Google Meet):\n' + calLink + '\n\nNo reply is needed — please join at the scheduled time.\n\nBest regards,\nRecruit 360 Team' + (clientCc ? '\n\n(The client interview panel is copied on this invite.)' : '');
     await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody + (clientCc ? '\nCc: ' + clientCc : ''), sent_by: fixed_by || 'recruiter' });
     await notify({ candidate_id: s.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: `Your ${label} is fixed for ${when}. Link: ${link}` });
     if (s.submitted_by) await notify({ candidate_id: s.candidate_id, recipient: s.submitted_by, type: 'INTERVIEW', message: `${s.candidate_name}'s ${label} fixed for ${when}.` });
@@ -2916,7 +2938,7 @@ app.post('/submissions/:id/slots/fix', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// Taken (already-booked) slot times for a date â€” so a booked slot is hidden from every candidate.
+// Taken (already-booked) slot times for a date — so a booked slot is hidden from every candidate.
 app.get('/slots/taken', async (req, res) => {
   try {
     await ensureSlots();
@@ -2957,8 +2979,8 @@ app.post('/slots/:slotId/confirm', async (req, res) => {
     const label = slot.kind === 'client' ? 'client interview' : 'recruiter call';
     const when = new Date(slot.slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
     const clientCc = slot.kind === 'client' ? clientEmailFor(s.client_name) : '';
-    const calLink = calendarLink(slot.slot_time, slot.duration_min, label.replace(/^./, c => c.toUpperCase()) + ' â€” ' + (s.job_title || 'role'), 'Candidate: ' + (s.candidate_name || '') + (s.client_name ? ' | Client: ' + s.client_name : '') + ' | Join: ' + link);
-    const emailSubject = `Your ${label} is confirmed â€” ${s.job_title || 'a role'}`;
+    const calLink = calendarLink(slot.slot_time, slot.duration_min, label.replace(/^./, c => c.toUpperCase()) + ' — ' + (s.job_title || 'role'), 'Candidate: ' + (s.candidate_name || '') + (s.client_name ? ' | Client: ' + s.client_name : '') + ' | Join: ' + link);
+    const emailSubject = `Your ${label} is confirmed — ${s.job_title || 'a role'}`;
     const emailBody = 'Dear ' + (s.candidate_name || 'Candidate') + ',\n\nYour ' + label + (s.client_name && slot.kind === 'client' ? ' with ' + s.client_name : '') + ' is confirmed for ' + when + ' (IST).\n\nJoin using this link:\n' + link + '\n\nAdd it to your calendar (with Google Meet):\n' + calLink + '\n\nBest regards,\nRecruit 360 Team' + (clientCc ? '\n\n(The client interview panel is copied on this invite.)' : '');
     await logComm({ submission_id: slot.submission_id, candidate_id: slot.candidate_id, job_id: slot.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: s.candidate_name, to_email: candEmail, subject: emailSubject, body: emailBody + (clientCc ? '\nCc: ' + clientCc : ''), sent_by: 'recruiter' });
     await notify({ candidate_id: slot.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: `Your ${label} is confirmed for ${when}. Link: ${link}` });
@@ -2984,7 +3006,7 @@ app.post('/slots/:slotId/cancel', async (req, res) => {
 });
 
 // ============================================================
-// CLIENT COMMUNICATION â€” separate from candidate comms (panel request + client scheduling).
+// CLIENT COMMUNICATION — separate from candidate comms (panel request + client scheduling).
 // ============================================================
 // Auto-draft the client email requesting a panel, sharing the candidate + resume summary.
 app.post('/submissions/:id/client/request-panel', async (req, res) => {
@@ -2994,9 +3016,9 @@ app.post('/submissions/:id/client/request-panel', async (req, res) => {
     const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, resume_summary, current_ctc, expected_ctc FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
     if (!s) return res.status(404).json({ error: 'not found' });
     const clientEmail = (String(s.client_name || 'client').toLowerCase().replace(/[^a-z0-9]+/g, '') || 'client') + '@client.com';
-    const summary = s.resume_summary || (s.candidate_name + ' â€” strong candidate for ' + (s.job_title || 'the role') + '.');
+    const summary = s.resume_summary || (s.candidate_name + ' — strong candidate for ' + (s.job_title || 'the role') + '.');
     const ctcLine = (s.current_ctc || s.expected_ctc) ? `\nCompensation: current ${s.current_ctc || 'n/a'}, expected ${s.expected_ctc || 'n/a'}.\n` : '\n';
-    const emailSubject = `Candidate for ${s.job_title || 'your role'} â€” please set up the interview panel`;
+    const emailSubject = `Candidate for ${s.job_title || 'your role'} — please set up the interview panel`;
     const emailBody = 'Dear ' + (s.client_name || 'Client') + ' team,\n\nFor the ' + (s.job_title || 'role') + ', we have identified a suitable candidate, ' + s.candidate_name + ', who has cleared our internal recruiter screening. We would like to request you to set up the interview panel and share your available interview slots.\n\nCandidate summary:\n' + summary + ctcLine + '\nPlease reply with:\n1. The interview panel members.\n2. A few available interview time slots.\n\nWe will then coordinate the interview with the candidate and share the confirmed schedule. After the interview, please let us know your decision (selected / not selected).\n\nBest regards,\nRecruit 360 Team';
     await logComm({ submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, channel: 'CLIENT', to_role: 'client', to_name: s.client_name || 'client', to_email: clientEmail, subject: emailSubject, body: emailBody, sent_by: requested_by || 'recruiter' });
     return res.json({ ok: true, emailSubject, emailBody, clientEmail });
@@ -3031,11 +3053,11 @@ app.post('/submissions/bulk-approval', async (req, res) => {
       if (decision === 'APPROVED') {
         await pool.query("UPDATE submissions SET status = 'RECRUITER_CALL', last_updated = NOW() WHERE submission_id = $1", [id]);
         const recruiterName = sub.submitted_by || 'your recruiter';
-        const subject = 'You have been shortlisted â€” ' + (sub.job_title || 'a role');
+        const subject = 'You have been shortlisted — ' + (sub.job_title || 'a role');
         const body = 'Dear ' + sub.candidate_name + ',\n\nCongratulations! You have been shortlisted for the next rounds for ' + (sub.job_title || 'a role') + (sub.client_name ? ' at ' + sub.client_name : '') + '. ' + recruiterName + ' will guide you through the upcoming interviews and next steps, and will be in touch shortly to arrange your recruiter call.\n\nBest regards,\nRecruit 360 Team';
         await logComm({ submission_id: id, candidate_id: sub.candidate_id, job_id: sub.job_id, channel: 'EMAIL', to_role: 'candidate', to_name: sub.candidate_name, to_email: candEmail, subject, body, sent_by: approver || 'hiring_manager' });
         await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'SHORTLISTED', message: 'You have been shortlisted for ' + (sub.job_title || 'a role') + '.' });
-        await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by || 'recruiter', type: 'APPROVED', message: sub.candidate_name + ' approved for ' + (sub.job_title || 'a role') + ' â€” schedule the recruiter call.' });
+        await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by || 'recruiter', type: 'APPROVED', message: sub.candidate_name + ' approved for ' + (sub.job_title || 'a role') + ' — schedule the recruiter call.' });
         emails.push({ name: sub.candidate_name, email: candEmail, subject, body });
       } else {
         await pool.query("UPDATE submissions SET status = 'REJECTED', last_updated = NOW() WHERE submission_id = $1", [id]);
@@ -3088,7 +3110,7 @@ ${text.slice(0, 4000)}`;
 });
 
 // ---------- Self-healing schema: make sure supporting tables/columns exist ----------
-// Lazy self-heal for the newer flow tables/columns â€” guarantees they exist on first use,
+// Lazy self-heal for the newer flow tables/columns — guarantees they exist on first use,
 // even if the startup ensureSchema() was interrupted by a cold-start DB blip.
 let _slotsReady = false;
 async function ensureSlots() {
@@ -3175,7 +3197,7 @@ async function ensureSchema() {
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_text TEXT');
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_summary TEXT');
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS client_panel TEXT');
-    // Interview slot orchestrator â€” proposed/confirmed slots, used to prevent overlaps.
+    // Interview slot orchestrator — proposed/confirmed slots, used to prevent overlaps.
     await pool.query(`CREATE TABLE IF NOT EXISTS interview_slots (
       slot_id       TEXT PRIMARY KEY,
       submission_id TEXT,
