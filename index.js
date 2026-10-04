@@ -2211,17 +2211,20 @@ async function skillVisaIssues() {
 }
 
 // RECRUITER Q3 — "what should I work on today?" (prioritised work queue)
-async function skillRecruiterQueue() {
-  const needResume = (await pool.query(`SELECT candidate_name, job_title FROM submissions WHERE status='SUBMITTED' AND COALESCE(resume_received,FALSE)=FALSE ORDER BY created_at DESC LIMIT 10`)).rows;
-  const toSchedule = (await pool.query(`SELECT candidate_name, job_title, status FROM submissions WHERE status IN ('RECRUITER_CALL','CLIENT_INTERVIEW') ORDER BY last_updated ASC NULLS FIRST LIMIT 10`)).rows;
-  const forPlacement = (await pool.query(`SELECT candidate_name, job_title FROM submissions WHERE status='CLIENT_INTERVIEW' ORDER BY last_updated ASC NULLS FIRST LIMIT 10`)).rows;
-  const idle = (await pool.query(`SELECT title, client, (CURRENT_DATE - created_date::date) AS age FROM jobs WHERE COALESCE(status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED') AND (CURRENT_DATE - created_date::date) >= 5 ORDER BY age DESC LIMIT 5`)).rows;
+async function skillRecruiterQueue(name, userId) {
+  const who = name || '';
+  const uid = userId || '';
+  // Scoped to THIS recruiter: only their own candidates (submitted_by) and jobs assigned to them.
+  const needResume = (await pool.query(`SELECT candidate_name, job_title FROM submissions WHERE status='SUBMITTED' AND COALESCE(resume_received,FALSE)=FALSE AND submitted_by = $1 ORDER BY created_at DESC LIMIT 10`, [who])).rows;
+  const toSchedule = (await pool.query(`SELECT candidate_name, job_title, status FROM submissions WHERE status IN ('RECRUITER_CALL','CLIENT_INTERVIEW') AND submitted_by = $1 ORDER BY last_updated ASC NULLS FIRST LIMIT 10`, [who])).rows;
+  const forPlacement = (await pool.query(`SELECT candidate_name, job_title FROM submissions WHERE status='CLIENT_INTERVIEW' AND submitted_by = $1 ORDER BY last_updated ASC NULLS FIRST LIMIT 10`, [who])).rows;
+  const idle = (await pool.query(`SELECT title, client, (CURRENT_DATE - created_date::date) AS age FROM jobs WHERE COALESCE(status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED') AND (recruiter = $1 OR assigned_recruiter_id = $2) AND (CURRENT_DATE - created_date::date) >= 5 ORDER BY age DESC LIMIT 5`, [who, uid])).rows;
   const parts = [];
   if (needResume.length) parts.push(`1) Chase resumes (${needResume.length}): ` + needResume.map(r => r.candidate_name + ' — ' + r.job_title).join('; '));
   if (toSchedule.length) parts.push(`2) Move interviews forward (${toSchedule.length}): ` + toSchedule.map(r => r.candidate_name + ' (' + (r.status || '').replace(/_/g,' ') + ')').join('; '));
   if (forPlacement.length) parts.push(`3) Close out client interviews / send for placement approval (${forPlacement.length}): ` + forPlacement.map(r => r.candidate_name).join('; '));
   if (idle.length) parts.push(`4) Unblock aging jobs (${idle.length}): ` + idle.map(r => r.title + ' — ' + r.age + 'd').join('; '));
-  if (!parts.length) return 'Nothing urgent in your queue right now — pipeline is clear.';
+  if (!parts.length) return 'You have no assigned jobs or candidates yet. Once a hiring manager assigns you a job and you start adding candidates, your prioritised work for the day will appear here.';
   return 'Your prioritised work for today:\n' + parts.join('\n');
 }
 
@@ -2252,9 +2255,11 @@ async function skillPlacementRisk() {
 }
 
 // HIRING MANAGER Q1 — what needs my attention today
-async function skillHMToday() {
-  const subs = (await pool.query(`SELECT candidate_name, job_title, client_name FROM submissions WHERE status='PENDING_HM_APPROVAL' ORDER BY created_at DESC LIMIT 15`)).rows;
-  const placements = (await pool.query(`SELECT candidate_name, job_title, client_name FROM submissions WHERE status='PENDING_PLACEMENT_APPROVAL' ORDER BY created_at DESC LIMIT 15`)).rows;
+async function skillHMToday(name) {
+  const who = name || '';
+  // When a hiring-manager name is given, scope to their jobs; admin (no name) sees everything.
+  const subs = (await pool.query(`SELECT s.candidate_name, s.job_title, s.client_name FROM submissions s LEFT JOIN jobs j ON j.job_id = s.job_id WHERE s.status='PENDING_HM_APPROVAL' AND ($1 = '' OR j.hiring_manager = $1) ORDER BY s.created_at DESC LIMIT 15`, [who])).rows;
+  const placements = (await pool.query(`SELECT s.candidate_name, s.job_title, s.client_name FROM submissions s LEFT JOIN jobs j ON j.job_id = s.job_id WHERE s.status='PENDING_PLACEMENT_APPROVAL' AND ($1 = '' OR j.hiring_manager = $1) ORDER BY s.created_at DESC LIMIT 15`, [who])).rows;
   const parts = [];
   parts.push(`Submission approvals waiting (${subs.length})` + (subs.length ? ':\n' + subs.map(s => '  - ' + s.candidate_name + ' for ' + s.job_title + (s.client_name ? ' (' + s.client_name + ')' : '')).join('\n') : ' — none.'));
   parts.push(`Placement approvals waiting (${placements.length})` + (placements.length ? ':\n' + placements.map(s => '  - ' + s.candidate_name + ' for ' + s.job_title + (s.client_name ? ' (' + s.client_name + ')' : '')).join('\n') : ' — none.'));
@@ -2298,7 +2303,7 @@ function roleScope(role) {
 // ---------- THE ASSISTANT ENDPOINT (accurate, role-scoped, grounded) ----------
 app.post('/assistant/ask', async (req, res) => {
   try {
-    const { question, role, history } = req.body;
+    const { question, role, history, userName, userId } = req.body;
     if (!question) return res.status(400).json({ error: 'question required' });
     const q = question.toLowerCase().trim();
 
@@ -2388,9 +2393,9 @@ REFORMATTED ANSWER:`;
     } else if (/(pending|awaiting|need|needs|to)\s*(my\s*)?(signature|sign)|offers?\s*(to|for|awaiting|pending|need)?\s*sign|sign\s*(the\s*)?offer|signature queue|offers? (awaiting|pending|to be) sign/i.test(q)) {
       toolResult = await skillPendingSignatures(); agentName = 'Offer Signatures';
     } else if (isWorkToday) {
-      if (role === 'hiring_manager') toolResult = await skillHMToday();
+      if (role === 'hiring_manager') toolResult = await skillHMToday(userName);
       else if (role === 'admin') { const sig = await skillPendingSignatures(); const a = await skillHMToday(); const b = await skillIdleJobs(); toolResult = sig + '\n\n' + a + '\n\n' + b; }
-      else toolResult = await skillRecruiterQueue();
+      else toolResult = await skillRecruiterQueue(userName, userId);
       agentName = 'My Work Today';
     } else if (isVisaIssues) {
       const r = await skillVisaIssues(); toolResult = r.text; rows = r.rows; agentName = 'Visa Issues';
