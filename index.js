@@ -1999,33 +1999,43 @@ SQL:`;
 }
 
 
-// Cloud SQL data agent — for jobs, submissions, approvals, placements (the live website data)
+// Cloud SQL data agent — for jobs, submissions, approvals, placements (the live website data).
+// Hardened: role hint, richer schema, read-only safety guard, and a one-shot auto-repair retry.
 async function agentSqlData(question, role) {
+  const roleHint = role === 'admin' ? 'The user is an ADMIN (full visibility across all recruiters/HMs).' : role === 'hiring_manager' ? 'The user is a HIRING MANAGER.' : role === 'recruiter' ? 'The user is a RECRUITER.' : '';
   const schema = `Cloud SQL (PostgreSQL) tables:
-jobs(job_id, title, client, hiring_manager, recruiter, assigned_recruiter_id, country, job_location, number_of_positions, priority, status, created_date)
-  -- open jobs = status IN ('Open','Active','POSTED','In Process'); closed = status IN ('Closed','CLOSED','Filled')
-submissions(submission_id, candidate_id, candidate_name, job_id, job_title, client_name, status, submitted_by, current_ctc, expected_ctc, resume_received, created_at)
-  -- statuses: SUBMITTED, PENDING_HM_APPROVAL, RECRUITER_CALL, CLIENT_INTERVIEW, PENDING_PLACEMENT_APPROVAL, OFFER, PLACED, REJECTED
-  -- "who needs approval" / "pending approval" / "awaiting approval" / "to approve" = status = 'PENDING_HM_APPROVAL' (select candidate_name, job_title)
-  -- "submitted candidates" = all submissions. "placed" = status='PLACED'. "in interview" = status IN ('RECRUITER_CALL','CLIENT_INTERVIEW')
-  -- "rejected" = status='REJECTED". Count questions use COUNT(*).
-app_users(user_id, full_name, email, role, user_group)  -- roles: admin, hiring_manager, recruiter
+jobs(job_id, title, client, hiring_manager, recruiter, assigned_recruiter_id, assigned_recruiter_names, country, job_location, number_of_positions, bill_rate, bill_rate_type, priority, status, created_date)
+  -- open jobs = status IN ('Open','Active','POSTED','In Process'); closed/done = status IN ('Closed','CLOSED','Filled','On Hold')
+  -- hiring_manager and recruiter store FULL NAMES; always match a person with ILIKE '%name%' (names may be partial/misspelled).
+submissions(submission_id, candidate_id, candidate_name, job_id, job_title, client_name, status, submitted_by, current_ctc, expected_ctc, resume_received, offer_status, created_at, last_updated)
+  -- statuses: SUBMITTED, PENDING_HM_APPROVAL, RECRUITER_CALL, CLIENT_INTERVIEW, PENDING_PLACEMENT_APPROVAL, OFFER, PLACED, REJECTED, OFFER_DECLINED
+  -- "pending approval"/"awaiting approval"/"to approve" = status='PENDING_HM_APPROVAL'. "placement approval" = status='PENDING_PLACEMENT_APPROVAL'.
+  -- "placed" = status='PLACED'. "in interview" = status IN ('RECRUITER_CALL','CLIENT_INTERVIEW'). "rejected" = status='REJECTED'. submitted_by = the recruiter's name.
+app_users(user_id, full_name, email, role)  -- roles: admin, hiring_manager, recruiter. Active users only matter.
 clients(client_id, client_name, country, industry)`;
-  const prompt = `Write ONE plain PostgreSQL SELECT statement only — no explanation, no code fences, no trailing semicolon, no ':' named parameters, no '::' type casts. Use COUNT(*) for counts and ALWAYS alias aggregates with a readable name (e.g. COUNT(*) AS count, never a bare COUNT(*)). Use ILIKE for text matching, and LIMIT 50 for lists (never SELECT *). Write real literal values directly in the WHERE clause.
-${schema}
-Question: ${question}
-SQL:`;
-  const gen = await genModel.generateContent(prompt);
-  let sql = gen.response.candidates[0].content.parts[0].text.replace(/```sql/gi,'').replace(/```/g,'').trim().replace(/;+\s*$/,'').trim();
-  // take only the first statement / SELECT onward
-  const selIdx = sql.toLowerCase().indexOf('select');
-  if (selIdx > 0) sql = sql.slice(selIdx);
-  if (!/^select/i.test(sql) || /\b(insert|update|delete|drop|alter|create)\b/i.test(sql)) return { text: 'Could not build a safe query for that.', rows: [] };
+  const rules = `Write ONE plain PostgreSQL SELECT only — no explanation, no code fences, no trailing semicolon, NO stacked statements, no ':' named parameters, no '::' casts. Always alias aggregates (COUNT(*) AS count). Use ILIKE '%value%' for text/name matching. LIMIT 50 for lists; never SELECT *. Put real literal values directly in the WHERE clause.`;
+  const build = async (prevErr) => {
+    const p = `${rules}\n${roleHint}\n${schema}\n` + (prevErr ? `Your previous SQL failed with this error: ${prevErr}\nReturn corrected SQL only.\n` : '') + `Question: ${question}\nSQL:`;
+    const gen = await genModel.generateContent(p);
+    let sql = gen.response.candidates[0].content.parts[0].text.replace(/```sql/gi, '').replace(/```/g, '').trim().replace(/;+\s*$/, '').trim();
+    const selIdx = sql.toLowerCase().indexOf('select');
+    if (selIdx > 0) sql = sql.slice(selIdx);
+    return sql;
+  };
+  const fmt = (rows) => rows.length ? { text: `Result (${rows.length} found):\n${JSON.stringify(rows.slice(0, 15), null, 1)}`, rows } : { text: 'No matching records were found in the live database. The correct answer is that none were found.', rows: [] };
   try {
-    const { rows } = await pool.query(sql);
-    if (!rows.length) return { text: 'No records found for this in the live database.', rows: [] };
-    return { text: `Result (${rows.length} found):\n${JSON.stringify(rows.slice(0,15), null, 1)}`, rows };
-  } catch (e) { return { text: 'Query failed: ' + e.message, rows: [] }; }
+    const sql = await build();
+    if (!_readonlySQL(sql)) return { text: 'I could not build a safe lookup for that. Try naming the role, client, recruiter or status you want.', rows: [] };
+    try {
+      return fmt((await pool.query(sql)).rows);
+    } catch (e1) {
+      const sql2 = await build(e1.message);           // one auto-repair pass
+      if (!_readonlySQL(sql2)) return { text: 'I could not build a safe lookup for that. Try rephrasing — name the role, client, recruiter or status.', rows: [] };
+      return fmt((await pool.query(sql2)).rows);
+    }
+  } catch (e) {
+    return { text: 'I could not complete that lookup. Please try rephrasing — for example, name the role, client, recruiter or status you want.', rows: [] };
+  }
 }
 
 async function agentVisaFix(candidateId) {
@@ -2332,6 +2342,51 @@ function roleScope(role) {
   return 'The user is a platform user.';
 }
 
+// Small edit-distance for fuzzy name matching (handles typos like "Subham" -> "Shubham").
+function editDist(a, b) {
+  a = String(a).toLowerCase(); b = String(b).toLowerCase();
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++)
+    dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return dp[m][n];
+}
+
+// "Which jobs is <person> assigned / what is the status" — deterministic, fuzzy-matches the person
+// against real users (recruiter OR hiring manager) and returns their jobs + status.
+async function skillWhoseJobs(question) {
+  try {
+    await ensureAuth();
+    const users = (await pool.query("SELECT user_id, full_name, role FROM app_users WHERE active = TRUE")).rows;
+    const words = (String(question).toLowerCase().match(/[a-z]{3,}/g) || []);
+    let best = null, bestScore = 99;
+    for (const u of users) {
+      const tokens = String(u.full_name || '').toLowerCase().split(/\s+/).filter(Boolean);
+      for (const t of tokens) {
+        for (const w of words) {
+          if (w === t || (w.length >= 4 && t.length >= 4 && (t.includes(w) || w.includes(t)))) { if (bestScore > 0) { best = u; bestScore = 0; } }
+          else if (Math.min(w.length, t.length) >= 4) { const d = editDist(w, t); if (d <= 2 && d < bestScore) { best = u; bestScore = d; } }
+        }
+      }
+    }
+    if (!best) return null; // no person recognized -> let the SQL agent try
+    const roleLabel = best.role === 'hiring_manager' ? 'hiring manager' : best.role;
+    let rows;
+    if (best.role === 'recruiter') {
+      rows = (await pool.query(`SELECT title, client, status FROM jobs WHERE assigned_recruiter_id = $1 OR recruiter ILIKE $2 ORDER BY created_date DESC`, [best.user_id, '%' + best.full_name + '%'])).rows;
+    } else if (best.role === 'hiring_manager') {
+      rows = (await pool.query(`SELECT title, client, status FROM jobs WHERE hiring_manager ILIKE $1 ORDER BY created_date DESC`, ['%' + best.full_name + '%'])).rows;
+    } else {
+      rows = (await pool.query(`SELECT title, client, status FROM jobs WHERE hiring_manager ILIKE $1 OR recruiter ILIKE $1 ORDER BY created_date DESC`, ['%' + best.full_name + '%'])).rows;
+    }
+    if (!rows.length) return { text: `No jobs are currently assigned to ${best.full_name} (${roleLabel}).`, rows: [] };
+    const lines = rows.map(r => `• ${r.title}${r.client ? ' (' + r.client + ')' : ''} — status: ${r.status || 'Open'}`);
+    return { text: `Jobs for ${best.full_name} (${roleLabel}) — ${rows.length}:\n` + lines.join('\n'), rows };
+  } catch (e) { return null; }
+}
+
 // ---------- THE ASSISTANT ENDPOINT (accurate, role-scoped, grounded) ----------
 app.post('/assistant/ask', async (req, res) => {
   try {
@@ -2355,6 +2410,14 @@ app.post('/assistant/ask', async (req, res) => {
     // Acknowledgements / sign-offs / tiny messages — reply gently instead of running a query.
     if (/^(bye|goodbye|see you|that'?s all|that is all|nothing|no)\b/i.test(q)) {
       return res.json({ answer: 'Alright — I’m here whenever you need anything about candidates, jobs, approvals, visas or placements.', agent: 'Assistant' });
+    }
+    // Out-of-domain guard: if the question mentions nothing recruitment-related, politely decline
+    // (no guessing, no "rephrase") — this is a recruitment-data assistant, not a general chatbot.
+    const onTopic = /\b(candidate|applicant|job|requisition|recruit|recruiter|hir(e|ed|ing)|manager|visa|placement|placed|place|interview|submission|submit|shortlist|offer|resume|cv|client|approv|role|pipeline|idle|pool|ctc|salary|rate|bill|city|origin|destination|skill|experience|fresher|senior|nurse|engineer|architect|analyst|devops|consultant|onboard|status|stage|reject|sourc|fill|open|today|attention|work|priorit|urgent|risk|assign|team|hiring)\b/i.test(q)
+      || /\bC\d{4}\b/i.test(question)
+      || /\b(parikshith|pushpam|neha|shubham|parv|avanciers)\b/i.test(q);
+    if (!onTopic) {
+      return res.json({ answer: 'I can only help with Recruit 360 recruitment data — candidates, jobs, submissions, visas, interviews, offers and placements. I can’t answer questions outside that.\n\n' + menu, agent: 'Assistant', rows: [] });
     }
     if (q.length < 6 || /^(anything else|what else|more|ok(ay)?|k|cool|great|nice|good|awesome|perfect|got it|fine|done|yes|hmm+|and\??|next|continue)\b[\s\S]{0,15}$/i.test(q)) {
       return res.json({ answer: 'Sure — here’s what I can help with. ' + menu, agent: 'Assistant' });
@@ -2444,10 +2507,19 @@ REFORMATTED ANSWER:`;
     } else if (isUrgency) {
       const r = await agentUrgency(10); toolResult = r.text; rows = r.rows; agentName = 'Urgency Watch';
     } else if (/(who needs approv|needs approval|pending approv|awaiting approv|to approve|approval queue|whom.*approve)/i.test(q)) {
-      // Direct, reliable query for pending approvals
-      const pr = await pool.query(`SELECT candidate_name, job_title, client_name FROM submissions WHERE status = 'PENDING_HM_APPROVAL' ORDER BY created_at DESC`);
+      // Direct, reliable query for pending approvals — a hiring manager sees only their own jobs; admin sees all.
+      const scoped = role === 'hiring_manager' && userName;
+      const pr = await pool.query(
+        `SELECT s.candidate_name, s.job_title, s.client_name FROM submissions s LEFT JOIN jobs j ON j.job_id = s.job_id
+          WHERE s.status = 'PENDING_HM_APPROVAL' ${scoped ? 'AND j.hiring_manager = $1' : ''} ORDER BY s.created_at DESC`,
+        scoped ? [userName] : []);
       toolResult = pr.rows.length ? ('Candidates awaiting approval (' + pr.rows.length + '):\n' + pr.rows.map(x => '- ' + x.candidate_name + ' for ' + x.job_title + (x.client_name ? ' (' + x.client_name + ')' : '')).join('\n')) : 'There are no candidates awaiting approval right now.';
       rows = pr.rows; agentName = 'Approvals';
+    } else if (/\b(assigned to|which jobs?|what jobs?|whose jobs?|jobs? (assigned|of|for)|handling|working on)\b/i.test(q)) {
+      // "which jobs is <person> assigned / status" -> deterministic, fuzzy person match.
+      const r = await skillWhoseJobs(question);
+      if (r) { toolResult = r.text; rows = r.rows; agentName = 'Jobs & Submissions'; }
+      else { const rr = await agentSqlData(question, role); toolResult = rr.text; rows = rr.rows; agentName = 'Jobs & Submissions'; }
     } else if (isCountQ && (/\bvisa\b/.test(q) || /candidate|applicant|pool|placed|placement|submission|submitted|shortlist/.test(q))) {
       // Deterministic counts — reliable numbers for the common "how many / total" questions,
       // so they never depend on the AI query-writer. Falls back to the data agent only if these fail.
