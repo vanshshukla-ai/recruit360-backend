@@ -55,7 +55,7 @@ async function ensureAuth() {
     }
     // Clean up so only the intended testers (plus anyone the admin adds) are active.
     // 1) Deactivate known legacy demo accounts.
-    const legacy = ['admin@avanciers.com', 'rajesh.kumar@avanciers.com', 'riya.sharma@avanciers.com', 'amit.verma@avanciers.com', 'sofia.rossi@avanciers.com'];
+    const legacy = ['admin@avanciers.com', 'rajesh.kumar@avanciers.com', 'riya.sharma@avanciers.com', 'amit.verma@avanciers.com', 'sofia.rossi@avanciers.com', 'test.rec@avanciers.com'];
     await pool.query('UPDATE app_users SET active = FALSE WHERE LOWER(email) = ANY($1)', [legacy]);
     // 2) Deactivate duplicate rows that share a seeded email but are NOT the seeded account
     //    (e.g. an old "Neha Das" row created as a hiring manager).
@@ -1754,7 +1754,7 @@ app.get('/recruiters/:id/jobs', async (req, res) => {
     const { rows } = await pool.query(
       `SELECT job_id, title, job_code, client, country, job_location, number_of_positions, priority, status, created_date, recruiter,
               (CURRENT_DATE - created_date::date) AS ageing_days
-         FROM jobs WHERE assigned_recruiter_id = $1 OR recruiter = $2 ORDER BY created_date DESC`,
+         FROM jobs WHERE assigned_recruiter_id = $1 OR recruiter = $2 OR replace(COALESCE(assigned_recruiter_ids,''),' ','') ILIKE '%' || $1 || '%' ORDER BY created_date DESC`,
       [req.params.id, name]
     );
     return res.json({ jobs: rows, recruiter_name: name });
@@ -2162,7 +2162,7 @@ async function agentNearCity(question) {
 async function skillIdleJobs(role, name, userId) {
   // Scope: a recruiter sees only THEIR assigned idle jobs; a hiring manager their own jobs; admin sees all.
   let scope = ''; const params = [];
-  if (role === 'recruiter') { params.push(name || '', userId || ''); scope = 'AND (j.recruiter = $1 OR j.assigned_recruiter_id = $2)'; }
+  if (role === 'recruiter') { params.push(name || '', userId || ''); scope = "AND (j.recruiter = $1 OR j.assigned_recruiter_id = $2 OR replace(COALESCE(j.assigned_recruiter_ids,''),' ','') ILIKE '%' || $2 || '%')"; }
   else if (role === 'hiring_manager') { params.push(name || ''); scope = 'AND j.hiring_manager = $1'; }
   const jobs = (await pool.query(`
     SELECT j.job_id, j.title, j.client, j.recruiter, j.description, j.primary_skills,
@@ -2250,7 +2250,7 @@ async function skillRecruiterQueue(name, userId) {
   const assigned = (await pool.query(
     `SELECT j.title, j.client, (CURRENT_DATE - j.created_date::date) AS age, COUNT(s.submission_id) AS subs
        FROM jobs j LEFT JOIN submissions s ON s.job_id = j.job_id
-      WHERE (j.recruiter = $1 OR j.assigned_recruiter_id = $2)
+      WHERE (j.recruiter = $1 OR j.assigned_recruiter_id = $2 OR replace(COALESCE(j.assigned_recruiter_ids,''),' ','') ILIKE '%' || $2 || '%')
         AND COALESCE(j.status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED')
       GROUP BY j.job_id, j.title, j.client, j.created_date
       ORDER BY j.created_date DESC LIMIT 20`, [who, uid])).rows;
@@ -2360,10 +2360,12 @@ async function skillWhoseJobs(question) {
   try {
     await ensureAuth();
     const users = (await pool.query("SELECT user_id, full_name, role FROM app_users WHERE active = TRUE")).rows;
-    const words = (String(question).toLowerCase().match(/[a-z]{3,}/g) || []);
+    // Ignore generic words so a question like "assigned to X the recruiter" doesn't match a person literally named "Test Recruiter".
+    const STOP = new Set(['the','and','for','with','job','jobs','status','assigned','assign','which','what','whose','recruiter','recruiters','manager','managers','hiring','admin','candidate','candidates','client','clients','test','user','users','role','roles','are','does','his','her','their','this','that','show','list','all','open','working']);
+    const words = (String(question).toLowerCase().match(/[a-z]{3,}/g) || []).filter(w => !STOP.has(w));
     let best = null, bestScore = 99;
     for (const u of users) {
-      const tokens = String(u.full_name || '').toLowerCase().split(/\s+/).filter(Boolean);
+      const tokens = String(u.full_name || '').toLowerCase().split(/\s+/).filter(t => t && !STOP.has(t));
       for (const t of tokens) {
         for (const w of words) {
           if (w === t || (w.length >= 4 && t.length >= 4 && (t.includes(w) || w.includes(t)))) { if (bestScore > 0) { best = u; bestScore = 0; } }
@@ -2375,7 +2377,7 @@ async function skillWhoseJobs(question) {
     const roleLabel = best.role === 'hiring_manager' ? 'hiring manager' : best.role;
     let rows;
     if (best.role === 'recruiter') {
-      rows = (await pool.query(`SELECT title, client, status FROM jobs WHERE assigned_recruiter_id = $1 OR recruiter ILIKE $2 ORDER BY created_date DESC`, [best.user_id, '%' + best.full_name + '%'])).rows;
+      rows = (await pool.query(`SELECT title, client, status FROM jobs WHERE assigned_recruiter_id = $1 OR recruiter ILIKE $2 OR replace(COALESCE(assigned_recruiter_ids,''),' ','') ILIKE '%' || $1 || '%' ORDER BY created_date DESC`, [best.user_id, '%' + best.full_name + '%'])).rows;
     } else if (best.role === 'hiring_manager') {
       rows = (await pool.query(`SELECT title, client, status FROM jobs WHERE hiring_manager ILIKE $1 ORDER BY created_date DESC`, ['%' + best.full_name + '%'])).rows;
     } else {
@@ -2384,6 +2386,30 @@ async function skillWhoseJobs(question) {
     if (!rows.length) return { text: `No jobs are currently assigned to ${best.full_name} (${roleLabel}).`, rows: [] };
     const lines = rows.map(r => `• ${r.title}${r.client ? ' (' + r.client + ')' : ''} — status: ${r.status || 'Open'}`);
     return { text: `Jobs for ${best.full_name} (${roleLabel}) — ${rows.length}:\n` + lines.join('\n'), rows };
+  } catch (e) { return null; }
+}
+
+// Deterministic job listing — "list/show open jobs", "jobs for client <X>", "all jobs", by status/client.
+async function skillJobList(question) {
+  try {
+    const ql = String(question).toLowerCase();
+    let client = null;
+    try {
+      const clients = (await pool.query("SELECT DISTINCT client FROM jobs WHERE client IS NOT NULL AND client <> ''")).rows.map(r => r.client);
+      client = clients.find(c => c && ql.includes(String(c).toLowerCase())) || null;
+    } catch (e) {}
+    const wantOpen = /\bopen\b/.test(ql);
+    const wantClosed = /\b(closed|filled|on hold|on-hold)\b/.test(ql);
+    const where = []; const params = [];
+    if (client) { params.push('%' + client + '%'); where.push(`client ILIKE $${params.length}`); }
+    if (wantOpen) where.push(`COALESCE(status,'Open') IN ('Open','Active','POSTED','In Process')`);
+    else if (wantClosed) where.push(`status IN ('Closed','CLOSED','Filled','On Hold')`);
+    const sql = `SELECT title, client, status, (CURRENT_DATE - created_date::date) AS age_days FROM jobs ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY created_date DESC LIMIT 50`;
+    const rows = (await pool.query(sql, params)).rows;
+    const scope = (wantOpen ? 'Open jobs' : wantClosed ? 'Closed/filled jobs' : 'Jobs') + (client ? ' for ' + client : '');
+    if (!rows.length) return { text: `No ${scope.toLowerCase()} were found.`, rows: [] };
+    const lines = rows.map(r => `• ${r.title}${r.client ? ' (' + r.client + ')' : ''} — status: ${r.status || 'Open'}`);
+    return { text: `${scope} — ${rows.length}:\n` + lines.join('\n'), rows };
   } catch (e) { return null; }
 }
 
@@ -2517,6 +2543,11 @@ REFORMATTED ANSWER:`;
         scoped ? [userName] : []);
       toolResult = pr.rows.length ? ('Candidates awaiting approval (' + pr.rows.length + '):\n' + pr.rows.map(x => '- ' + x.candidate_name + ' for ' + x.job_title + (x.client_name ? ' (' + x.client_name + ')' : '')).join('\n')) : 'There are no candidates awaiting approval right now.';
       rows = pr.rows; agentName = 'Approvals';
+    } else if (!/\b(assigned to|working on|handling|whose)\b/i.test(q) && /\bjob/i.test(q) && (/\b(open|closed|filled)\b/i.test(q) || /\b(list|show)\b/i.test(q) || /\bclient\b/i.test(q))) {
+      // "list/show open jobs", "jobs for client X", "open/closed jobs" -> deterministic job listing.
+      const r = await skillJobList(question);
+      if (r) { toolResult = r.text; rows = r.rows; agentName = 'Jobs & Submissions'; }
+      else { const rr = await agentSqlData(question, role); toolResult = rr.text; rows = rr.rows; agentName = 'Jobs & Submissions'; }
     } else if (/\b(assigned to|which jobs?|what jobs?|whose jobs?|jobs? (assigned|of|for)|handling|working on)\b/i.test(q)) {
       // "which jobs is <person> assigned / status" -> deterministic, fuzzy person match.
       const r = await skillWhoseJobs(question);
