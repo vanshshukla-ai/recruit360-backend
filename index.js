@@ -2413,9 +2413,11 @@ app.post('/assistant/ask', async (req, res) => {
     }
     // Out-of-domain guard: if the question mentions nothing recruitment-related, politely decline
     // (no guessing, no "rephrase") — this is a recruitment-data assistant, not a general chatbot.
-    const onTopic = /\b(candidate|applicant|job|requisition|recruit|recruiter|hir(e|ed|ing)|manager|visa|placement|placed|place|interview|submission|submit|shortlist|offer|resume|cv|client|approv|role|pipeline|idle|pool|ctc|salary|rate|bill|city|origin|destination|skill|experience|fresher|senior|nurse|engineer|architect|analyst|devops|consultant|onboard|status|stage|reject|sourc|fill|open|today|attention|work|priorit|urgent|risk|assign|team|hiring)\b/i.test(q)
+    // Leading word-boundary + stems (no trailing \b) so "approval", "jobs", "candidates",
+    // "sourcing", "priority" all match — but "generate"/"replace" (mid-word) do not.
+    const onTopic = /\b(candidat|applicant|job|requisition|recruit|hir|manager|visa|placement|plac|interview|submission|submit|shortlist|offer|resume|cv|client|approv|role|pipeline|idle|pool|ctc|salary|rate|bill|city|origin|destination|skill|experience|fresher|senior|nurse|engineer|architect|analyst|devops|consultant|onboard|status|stage|reject|sourc|fill|open|today|attention|work|priorit|urgent|risk|assign|team)/i.test(q)
       || /\bC\d{4}\b/i.test(question)
-      || /\b(parikshith|pushpam|neha|shubham|parv|avanciers)\b/i.test(q);
+      || /(parikshith|pushpam|neha|shubham|parv|avanciers)/i.test(q);
     if (!onTopic) {
       return res.json({ answer: 'I can only help with Recruit 360 recruitment data — candidates, jobs, submissions, visas, interviews, offers and placements. I can’t answer questions outside that.\n\n' + menu, agent: 'Assistant', rows: [] });
     }
