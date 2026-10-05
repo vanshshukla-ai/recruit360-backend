@@ -2448,6 +2448,31 @@ REFORMATTED ANSWER:`;
       const pr = await pool.query(`SELECT candidate_name, job_title, client_name FROM submissions WHERE status = 'PENDING_HM_APPROVAL' ORDER BY created_at DESC`);
       toolResult = pr.rows.length ? ('Candidates awaiting approval (' + pr.rows.length + '):\n' + pr.rows.map(x => '- ' + x.candidate_name + ' for ' + x.job_title + (x.client_name ? ' (' + x.client_name + ')' : '')).join('\n')) : 'There are no candidates awaiting approval right now.';
       rows = pr.rows; agentName = 'Approvals';
+    } else if (isCountQ && (/\bvisa\b/.test(q) || /candidate|applicant|pool|placed|placement|submission|submitted|shortlist/.test(q))) {
+      // Deterministic counts — reliable numbers for the common "how many / total" questions,
+      // so they never depend on the AI query-writer. Falls back to the data agent only if these fail.
+      try {
+        let n, label;
+        if (/\bvisa\b/.test(q) && /reject/.test(q)) {
+          n = Number((await bqQuery(`SELECT COUNT(*) AS n FROM \`${BQ_DS}.candidates\` WHERE UPPER(visa_status) = 'VISA_REJECTED'`))[0]?.n || 0);
+          label = `There are ${n} candidates whose visa has been rejected.`;
+        } else if (/\bvisa\b/.test(q) && /(approved|cleared)/.test(q)) {
+          n = Number((await bqQuery(`SELECT COUNT(*) AS n FROM \`${BQ_DS}.candidates\` WHERE UPPER(visa_status) = 'VISA_APPROVED'`))[0]?.n || 0);
+          label = `There are ${n} candidates with an approved visa.`;
+        } else if (/placed|placement/.test(q)) {
+          n = Number((await pool.query("SELECT COUNT(*) AS n FROM submissions WHERE status = 'PLACED'")).rows[0]?.n || 0);
+          label = `There are ${n} placed candidates.`;
+        } else if (/submission|submitted|shortlist/.test(q)) {
+          n = Number((await pool.query('SELECT COUNT(*) AS n FROM submissions')).rows[0]?.n || 0);
+          label = `There are ${n} submissions in total.`;
+        } else {
+          n = Number((await bqQuery(`SELECT COUNT(*) AS n FROM \`${BQ_DS}.candidates\``))[0]?.n || 0);
+          label = `There are ${n} candidates in total in the pool.`;
+        }
+        toolResult = label; agentName = 'Candidate Data';
+      } catch (e) {
+        const rr = await agentQueryData(question, role, history); toolResult = rr.text; rows = rr.rows; agentName = 'Candidate Data';
+      }
     } else if (isJobsData) {
       const r = await agentSqlData(question, role); toolResult = r.text; rows = r.rows; agentName = 'Jobs & Submissions';
     } else {
