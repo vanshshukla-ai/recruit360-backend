@@ -1312,9 +1312,14 @@ app.patch('/submissions/:id/approval', async (req, res) => {
 app.get('/submissions/pending-approval', async (req, res) => {
   try {
     await ensureSlots();
+    // A hiring manager sees only approvals for their own jobs; admin sees all.
+    const hm = String(req.query.hm || '').trim();
+    const scoped = String(req.query.role || '') !== 'admin' && hm;
     const { rows } = await pool.query(
-      `SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, current_ctc, expected_ctc, resume_summary, submitted_by, created_at
-         FROM submissions WHERE status = 'PENDING_HM_APPROVAL' ORDER BY created_at DESC`);
+      `SELECT s.submission_id, s.candidate_id, s.candidate_name, s.job_id, s.job_title, s.client_name, s.current_ctc, s.expected_ctc, s.resume_summary, s.submitted_by, s.created_at
+         FROM submissions s LEFT JOIN jobs j ON j.job_id = s.job_id
+        WHERE s.status = 'PENDING_HM_APPROVAL' ${scoped ? 'AND j.hiring_manager = $1' : ''}
+        ORDER BY s.created_at DESC`, scoped ? [hm] : []);
     return res.json({ pending: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -2622,9 +2627,13 @@ app.post('/submissions/:id/context-action', async (req, res) => {
 // Recruiters queue placements; the hiring manager approves here.
 app.get('/placements/pending-approval', async (req, res) => {
   try {
+    const hm = String(req.query.hm || '').trim();
+    const scoped = String(req.query.role || '') !== 'admin' && hm;
     const { rows } = await pool.query(
-      `SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, current_ctc, expected_ctc, submitted_by, created_at
-         FROM submissions WHERE status = 'PENDING_PLACEMENT_APPROVAL' ORDER BY created_at DESC`);
+      `SELECT s.submission_id, s.candidate_id, s.candidate_name, s.job_id, s.job_title, s.client_name, s.current_ctc, s.expected_ctc, s.submitted_by, s.created_at
+         FROM submissions s LEFT JOIN jobs j ON j.job_id = s.job_id
+        WHERE s.status = 'PENDING_PLACEMENT_APPROVAL' ${scoped ? 'AND j.hiring_manager = $1' : ''}
+        ORDER BY s.created_at DESC`, scoped ? [hm] : []);
     return res.json({ pending: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -2994,9 +3003,13 @@ app.get('/offers/pending-signature', async (req, res) => {
 app.get('/offers/active', async (req, res) => {
   try {
     await ensureSlots();
+    const hm = String(req.query.hm || '').trim();
+    const scoped = String(req.query.role || '') !== 'admin' && hm;
     const { rows } = await pool.query(
-      `SELECT submission_id, candidate_id, candidate_name, job_id, job_title, client_name, offer_region, offer_status, submitted_by, last_updated
-         FROM submissions WHERE status = 'OFFER' ORDER BY last_updated DESC`);
+      `SELECT s.submission_id, s.candidate_id, s.candidate_name, s.job_id, s.job_title, s.client_name, s.offer_region, s.offer_status, s.submitted_by, s.last_updated
+         FROM submissions s LEFT JOIN jobs j ON j.job_id = s.job_id
+        WHERE s.status = 'OFFER' ${scoped ? 'AND j.hiring_manager = $1' : ''}
+        ORDER BY s.last_updated DESC`, scoped ? [hm] : []);
     return res.json({ offers: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
