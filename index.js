@@ -2144,7 +2144,11 @@ async function agentNearCity(question) {
 // ============================================================
 
 // RECRUITER Q1 — jobs sitting idle >5 days + WHY (blocker classification)
-async function skillIdleJobs() {
+async function skillIdleJobs(role, name, userId) {
+  // Scope: a recruiter sees only THEIR assigned idle jobs; a hiring manager their own jobs; admin sees all.
+  let scope = ''; const params = [];
+  if (role === 'recruiter') { params.push(name || '', userId || ''); scope = 'AND (j.recruiter = $1 OR j.assigned_recruiter_id = $2)'; }
+  else if (role === 'hiring_manager') { params.push(name || ''); scope = 'AND j.hiring_manager = $1'; }
   const jobs = (await pool.query(`
     SELECT j.job_id, j.title, j.client, j.recruiter, j.description, j.primary_skills,
            (CURRENT_DATE - j.created_date::date) AS age_days,
@@ -2156,11 +2160,11 @@ async function skillIdleJobs() {
            COUNT(*) FILTER (WHERE s.status IN ('RECRUITER_CALL')) AS interviewing
       FROM jobs j
       LEFT JOIN submissions s ON s.job_id = j.job_id
-     WHERE COALESCE(j.status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED')
+     WHERE COALESCE(j.status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED') ${scope}
      GROUP BY j.job_id, j.title, j.client, j.recruiter, j.description, j.primary_skills, j.created_date
      HAVING (CURRENT_DATE - j.created_date::date) >= 5
-     ORDER BY age_days DESC LIMIT 25`)).rows;
-  if (!jobs.length) return 'No open jobs have been idle for more than 5 days.';
+     ORDER BY age_days DESC LIMIT 25`, params)).rows;
+  if (!jobs.length) return role === 'recruiter' ? 'None of your assigned jobs have been idle for more than 5 days.' : 'No open jobs have been idle for more than 5 days.';
   const lines = jobs.map(j => {
     let blocker;
     const hasJD = (j.description && j.description.trim()) || (j.primary_skills && j.primary_skills.trim());
@@ -2227,12 +2231,26 @@ async function skillRecruiterQueue(name, userId) {
   const needResume = (await pool.query(`SELECT candidate_name, job_title FROM submissions WHERE status='SUBMITTED' AND COALESCE(resume_received,FALSE)=FALSE AND submitted_by = $1 ORDER BY created_at DESC LIMIT 10`, [who])).rows;
   const toSchedule = (await pool.query(`SELECT candidate_name, job_title, status FROM submissions WHERE status IN ('RECRUITER_CALL','CLIENT_INTERVIEW') AND submitted_by = $1 ORDER BY last_updated ASC NULLS FIRST LIMIT 10`, [who])).rows;
   const forPlacement = (await pool.query(`SELECT candidate_name, job_title FROM submissions WHERE status='CLIENT_INTERVIEW' AND submitted_by = $1 ORDER BY last_updated ASC NULLS FIRST LIMIT 10`, [who])).rows;
-  const idle = (await pool.query(`SELECT title, client, (CURRENT_DATE - created_date::date) AS age FROM jobs WHERE COALESCE(status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED') AND (recruiter = $1 OR assigned_recruiter_id = $2) AND (CURRENT_DATE - created_date::date) >= 5 ORDER BY age DESC LIMIT 5`, [who, uid])).rows;
+  // All OPEN jobs assigned to this recruiter, with how many candidates each has so far.
+  const assigned = (await pool.query(
+    `SELECT j.title, j.client, (CURRENT_DATE - j.created_date::date) AS age, COUNT(s.submission_id) AS subs
+       FROM jobs j LEFT JOIN submissions s ON s.job_id = j.job_id
+      WHERE (j.recruiter = $1 OR j.assigned_recruiter_id = $2)
+        AND COALESCE(j.status,'Open') NOT IN ('Closed','CLOSED','Filled','CANCELLED')
+      GROUP BY j.job_id, j.title, j.client, j.created_date
+      ORDER BY j.created_date DESC LIMIT 20`, [who, uid])).rows;
+  const needSourcing = assigned.filter(j => Number(j.subs) === 0);
+  const aging = assigned.filter(j => Number(j.age) >= 5);
   const parts = [];
-  if (needResume.length) parts.push(`1) Chase resumes (${needResume.length}): ` + needResume.map(r => r.candidate_name + ' — ' + r.job_title).join('; '));
-  if (toSchedule.length) parts.push(`2) Move interviews forward (${toSchedule.length}): ` + toSchedule.map(r => r.candidate_name + ' (' + (r.status || '').replace(/_/g,' ') + ')').join('; '));
-  if (forPlacement.length) parts.push(`3) Close out client interviews / send for placement approval (${forPlacement.length}): ` + forPlacement.map(r => r.candidate_name).join('; '));
-  if (idle.length) parts.push(`4) Unblock aging jobs (${idle.length}): ` + idle.map(r => r.title + ' — ' + r.age + 'd').join('; '));
+  // Surface assigned jobs first — a freshly assigned job with no candidates still needs action.
+  if (assigned.length) {
+    parts.push(`You have ${assigned.length} assigned job(s): ` + assigned.map(j => j.title + (j.client ? ' (' + j.client + ')' : '') + ' — ' + Number(j.subs) + ' candidate(s)').join('; '));
+    if (needSourcing.length) parts.push(`Start sourcing candidates for (${needSourcing.length}): ` + needSourcing.map(j => j.title + (j.client ? ' (' + j.client + ')' : '')).join('; '));
+  }
+  if (needResume.length) parts.push(`Chase resumes (${needResume.length}): ` + needResume.map(r => r.candidate_name + ' — ' + r.job_title).join('; '));
+  if (toSchedule.length) parts.push(`Move interviews forward (${toSchedule.length}): ` + toSchedule.map(r => r.candidate_name + ' (' + (r.status || '').replace(/_/g,' ') + ')').join('; '));
+  if (forPlacement.length) parts.push(`Close out client interviews / send for placement approval (${forPlacement.length}): ` + forPlacement.map(r => r.candidate_name).join('; '));
+  if (aging.length) parts.push(`Unblock aging jobs (${aging.length}): ` + aging.map(j => j.title + ' — ' + j.age + 'd').join('; '));
   if (!parts.length) return 'You have no assigned jobs or candidates yet. Once a hiring manager assigns you a job and you start adding candidates, your prioritised work for the day will appear here.';
   return 'Your prioritised work for today:\n' + parts.join('\n');
 }
@@ -2396,14 +2414,14 @@ REFORMATTED ANSWER:`;
       if (r) { toolResult = r; agentName = 'Best-Fit Match'; }
       else { const rr = await agentQueryData(question, role, history); toolResult = rr.text; rows = rr.rows; agentName = 'Candidate Data'; }
     } else if (isIdleJobs) {
-      toolResult = await skillIdleJobs(); agentName = 'Idle & Blocked Jobs';
+      toolResult = await skillIdleJobs(role, userName, userId); agentName = 'Idle & Blocked Jobs';
     } else if (isPlacementRisk) {
       toolResult = await skillPlacementRisk(); agentName = 'Placement Risk';
     } else if (/(pending|awaiting|need|needs|to)\s*(my\s*)?(signature|sign)|offers?\s*(to|for|awaiting|pending|need)?\s*sign|sign\s*(the\s*)?offer|signature queue|offers? (awaiting|pending|to be) sign/i.test(q)) {
       toolResult = await skillPendingSignatures(); agentName = 'Offer Signatures';
     } else if (isWorkToday) {
       if (role === 'hiring_manager') toolResult = await skillHMToday(userName);
-      else if (role === 'admin') { const sig = await skillPendingSignatures(); const a = await skillHMToday(); const b = await skillIdleJobs(); toolResult = sig + '\n\n' + a + '\n\n' + b; }
+      else if (role === 'admin') { const sig = await skillPendingSignatures(); const a = await skillHMToday(); const b = await skillIdleJobs('admin'); toolResult = sig + '\n\n' + a + '\n\n' + b; }
       else toolResult = await skillRecruiterQueue(userName, userId);
       agentName = 'My Work Today';
     } else if (isVisaIssues) {
