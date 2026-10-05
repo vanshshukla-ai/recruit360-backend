@@ -86,7 +86,11 @@ const docaiClient = new DocumentProcessorServiceClient({ apiEndpoint: 'us-docume
 const PROCESSOR = 'projects/direct-tribute-502305-q5/locations/us/processors/22d406f8def70c29';
 const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
+// Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
+// which proves the running service is the latest file (not a stale revision).
+const BUILD_TAG = '2026-10-05-v4-jobinfo';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
+app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
 // OCR: PDF/image -> text (Document AI) -> fields (Gemini). Returns timing.
 app.post('/jobs/ocr-extract', async (req, res) => {
@@ -1272,6 +1276,32 @@ app.post('/jobs/:jobId/submit-candidate', async (req, res) => {
       'INSERT INTO submissions (submission_id, candidate_id, candidate_name, job_id, job_title, client_name, status, screening_notes, submitted_by, current_ctc, expected_ctc, created_at, last_updated) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())',
       [submission_id, candidate_id, cRes.rows[0].full_name, req.params.jobId, job.title, job.client || '', 'PENDING_HM_APPROVAL', screening_notes || '', submitted_by || '', current_ctc || '', expected_ctc || '']
     );
+    // Link the submitting recruiter to the job itself, so the job appears in their "my jobs" list and in the
+    // assistant. Submitting a candidate to a job means you are working that req — otherwise the submission
+    // shows the recruiter's name but the job looks unassigned (the exact gap that was causing confusion).
+    try {
+      if (submitted_by && String(submitted_by).trim()) {
+        const u = (await pool.query('SELECT user_id, full_name FROM app_users WHERE user_id = $1 OR full_name ILIKE $2 LIMIT 1', [submitted_by, submitted_by])).rows[0];
+        if (u) {
+          await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_ids TEXT');
+          await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_names TEXT');
+          await pool.query(
+            `UPDATE jobs SET
+               assigned_recruiter_id = COALESCE(NULLIF(assigned_recruiter_id, ''), $1),
+               recruiter = COALESCE(NULLIF(recruiter, ''), $2),
+               assigned_recruiter_ids = CASE
+                 WHEN COALESCE(assigned_recruiter_ids, '') = '' THEN $1
+                 WHEN replace(assigned_recruiter_ids, ' ', '') ILIKE '%' || $1 || '%' THEN assigned_recruiter_ids
+                 ELSE assigned_recruiter_ids || ',' || $1 END,
+               assigned_recruiter_names = CASE
+                 WHEN COALESCE(assigned_recruiter_names, '') = '' THEN $2
+                 WHEN assigned_recruiter_names ILIKE '%' || $2 || '%' THEN assigned_recruiter_names
+                 ELSE assigned_recruiter_names || ',' || $2 END
+             WHERE job_id = $3`,
+            [u.user_id, u.full_name, req.params.jobId]);
+        }
+      }
+    } catch (e) { /* non-fatal — submission already recorded */ }
     // Notify the hiring manager
     try { await pool.query('INSERT INTO notifications (message, type, read, created_at) VALUES ($1,$2,FALSE,NOW())', ['Approval needed: ' + cRes.rows[0].full_name + ' submitted for ' + job.title, 'APPROVAL']); } catch(e){}
     return res.json({ ok: true, submission_id, candidate_name: cRes.rows[0].full_name, hiring_manager: job.hiring_manager, status: 'PENDING_HM_APPROVAL' });
@@ -2433,6 +2463,42 @@ async function skillJobList(question) {
   } catch (e) { return null; }
 }
 
+// "info/details/status on <a specific job>" — fuzzy-matches one job by the keywords in the question
+// (title or client) and returns a full snapshot: status, HM, recruiter(s), positions, and the pipeline.
+// Handles loose phrasings like "pull latest info on SAP HANA job" -> SAP S/4HANA Functional Consultant.
+async function skillJobInfo(question) {
+  try {
+    const STOP = new Set(['pull','latest','info','information','tell','about','detail','details','status','give','show','me','my','the','on','of','for','and','job','jobs','role','roles','position','positions','req','reqs','requisition','please','need','want','current','currently','now','any','all','this','that','what','whats','which','is','are','a','an','to','with','update','updates','summary','overview','get','fetch','see','regarding','related','assigned']);
+    const words = (String(question).toLowerCase().match(/[a-z0-9/]{2,}/g) || []).filter(w => !STOP.has(w));
+    if (!words.length) return null;
+    const jobs = (await pool.query("SELECT job_id, title, client, hiring_manager, recruiter, assigned_recruiter_names, status, number_of_positions, job_location, country, created_date FROM jobs")).rows;
+    let best = null, bestScore = 0;
+    for (const j of jobs) {
+      const hay = (String(j.title || '') + ' ' + String(j.client || '')).toLowerCase();
+      let score = 0;
+      for (const w of words) if (hay.includes(w)) score++;
+      if (score > bestScore) { best = j; bestScore = score; }
+    }
+    if (!best || bestScore === 0) return null; // nothing recognizable -> let the SQL agent try
+    const subs = (await pool.query("SELECT status, COUNT(*) AS n FROM submissions WHERE job_id = $1 GROUP BY status", [best.job_id])).rows;
+    const total = subs.reduce((a, r) => a + Number(r.n), 0);
+    const byStatus = subs.map(r => `${r.status}: ${r.n}`).join(', ');
+    const rec = best.assigned_recruiter_names || best.recruiter || 'unassigned';
+    const age = best.created_date ? Math.max(0, Math.floor((Date.now() - new Date(best.created_date).getTime()) / 86400000)) : null;
+    const lines = [
+      `${best.title}${best.client ? ' — ' + best.client : ''}`,
+      `Status: ${best.status || 'Open'}`,
+      `Hiring manager: ${best.hiring_manager || '—'}`,
+      `Recruiter(s): ${rec}`,
+      `Positions: ${best.number_of_positions || 1}`,
+      (best.job_location || best.country) ? `Location: ${[best.job_location, best.country].filter(Boolean).join(', ')}` : null,
+      age !== null ? `Age: ${age} day(s) since posting` : null,
+      `Candidates submitted: ${total}${total ? ' (' + byStatus + ')' : ''}`
+    ].filter(Boolean);
+    return { text: lines.join('\n'), rows: [{ title: best.title, client: best.client, status: best.status || 'Open', recruiter: rec, positions: best.number_of_positions || 1, submissions: total }] };
+  } catch (e) { return null; }
+}
+
 // ---------- THE ASSISTANT ENDPOINT (accurate, role-scoped, grounded) ----------
 app.post('/assistant/ask', async (req, res) => {
   try {
@@ -2585,6 +2651,11 @@ REFORMATTED ANSWER:`;
     } else if (/\b(assigned to|which jobs?|what jobs?|whose jobs?|jobs? (assigned|of|for)|handling|working on)\b/i.test(q)) {
       // "which jobs is <person> assigned / status" -> deterministic, fuzzy person match.
       const r = await skillWhoseJobs(question);
+      if (r) { toolResult = r.text; rows = r.rows; agentName = 'Jobs & Submissions'; }
+      else { const rr = await agentSqlData(question, role); toolResult = rr.text; rows = rr.rows; agentName = 'Jobs & Submissions'; }
+    } else if (/(info|information|detail|latest|about|overview|summary|status|tell me|how is|how'?s|update on|pull)\b/i.test(q) && /\b(job|role|position|requisition|req|opening|consultant|engineer|developer|architect|manager|analyst|nurse|sap|hana|s\/4|functional)\b/i.test(q)) {
+      // "pull latest info on <a job>", "status of the SAP job", "details on the QA role" -> single-job snapshot.
+      const r = await skillJobInfo(question);
       if (r) { toolResult = r.text; rows = r.rows; agentName = 'Jobs & Submissions'; }
       else { const rr = await agentSqlData(question, role); toolResult = rr.text; rows = rr.rows; agentName = 'Jobs & Submissions'; }
     } else if (isCountQ && (/\bvisa\b/.test(q) || /candidate|applicant|pool|placed|placement|submission|submitted|shortlist/.test(q))) {
