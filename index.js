@@ -2381,14 +2381,23 @@ async function skillWhoseJobs(question) {
       // Match every way a recruiter can be stored on a job: by user_id (single or in the multi-assign list),
       // by full name, or by first name only (jobs assigned before full names were used).
       const firstName = String(best.full_name || '').split(/\s+/)[0] || best.full_name;
-      rows = (await pool.query(
-        `SELECT title, client, status FROM jobs
-          WHERE assigned_recruiter_id = $1
-             OR replace(COALESCE(assigned_recruiter_ids,''),' ','') ILIKE '%' || $1 || '%'
-             OR recruiter ILIKE $2 OR recruiter ILIKE $3
-             OR COALESCE(assigned_recruiter_names,'') ILIKE $2 OR COALESCE(assigned_recruiter_names,'') ILIKE $3
-          ORDER BY created_date DESC`,
-        [best.user_id, '%' + best.full_name + '%', '%' + firstName + '%'])).rows;
+      // Make sure the multi-assign columns exist so the broad query can't throw on a DB that never used them.
+      try { await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_ids TEXT'); await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_names TEXT'); } catch (e) {}
+      try {
+        rows = (await pool.query(
+          `SELECT title, client, status FROM jobs
+            WHERE assigned_recruiter_id = $1
+               OR replace(COALESCE(assigned_recruiter_ids,''),' ','') ILIKE '%' || $1 || '%'
+               OR recruiter ILIKE $2 OR recruiter ILIKE $3
+               OR COALESCE(assigned_recruiter_names,'') ILIKE $2 OR COALESCE(assigned_recruiter_names,'') ILIKE $3
+            ORDER BY created_date DESC`,
+          [best.user_id, '%' + best.full_name + '%', '%' + firstName + '%'])).rows;
+      } catch (e) {
+        // Last-resort fallback using only columns guaranteed to exist, so a schema gap never hides the job.
+        rows = (await pool.query(
+          `SELECT title, client, status FROM jobs WHERE assigned_recruiter_id = $1 OR recruiter ILIKE $2 OR recruiter ILIKE $3 ORDER BY created_date DESC`,
+          [best.user_id, '%' + best.full_name + '%', '%' + firstName + '%'])).rows;
+      }
     } else if (best.role === 'hiring_manager') {
       rows = (await pool.query(`SELECT title, client, status FROM jobs WHERE hiring_manager ILIKE $1 ORDER BY created_date DESC`, ['%' + best.full_name + '%'])).rows;
     } else {
@@ -3508,6 +3517,10 @@ async function ensureSchema() {
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS resume_requested BOOLEAN DEFAULT FALSE');
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS current_ctc TEXT');
     await pool.query('ALTER TABLE submissions ADD COLUMN IF NOT EXISTS expected_ctc TEXT');
+    // Multi-recruiter assignment columns — created here so EVERY recruiter-scoped query can reference
+    // them safely, even on a DB where no job was ever assigned through the multi-assign endpoint.
+    await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_ids TEXT');
+    await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_names TEXT');
     await pool.query(`CREATE TABLE IF NOT EXISTS user_settings (
       user_key   TEXT PRIMARY KEY,
       prefs      JSONB DEFAULT '{}',
