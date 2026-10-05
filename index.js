@@ -88,7 +88,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-05-v4-jobinfo';
+const BUILD_TAG = '2026-10-05-v5-multirecruiter';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1570,6 +1570,26 @@ app.post('/jobs/requisition', async (req, res) => {
       b.priority || 'Medium', b.status || 'Open', b.owner || b.recruiter || '', b.created_by || b.hiring_manager || '',
     ];
     const { rows } = await pool.query(q, vals);
+    // Multi-recruiter assignment: the form may send recruiter_ids / recruiter_names (comma-separated) when a
+    // single job (e.g. 6 positions) is split across several recruiters. Store the full list; set the primary
+    // (assigned_recruiter_id / recruiter) to the first one for back-compatibility. Works for 1 or many.
+    try {
+      await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_ids TEXT');
+      await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_names TEXT');
+      const ids = String(b.recruiter_ids || b.assigned_recruiter_id || '').trim();
+      const names = String(b.recruiter_names || b.recruiter || '').trim();
+      if (ids || names) {
+        const firstId = ids.split(',')[0] || '';
+        const firstName = names.split(',')[0] || '';
+        await pool.query(
+          `UPDATE jobs SET assigned_recruiter_id = $1,
+             recruiter = COALESCE(NULLIF($2, ''), recruiter),
+             assigned_recruiter_ids = $3, assigned_recruiter_names = $4
+           WHERE job_id = $5`,
+          [firstId, firstName, ids, names, job_id]);
+        rows[0].assigned_recruiter_ids = ids; rows[0].assigned_recruiter_names = names;
+      }
+    } catch (e) { /* non-fatal — job already created */ }
     return res.json({ ok: true, job: rows[0] });
   } catch (e) {
     return res.status(500).json({ error: 'Could not create requisition', detail: e.message });
