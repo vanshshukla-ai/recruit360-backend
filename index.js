@@ -2545,7 +2545,10 @@ REFORMATTED ANSWER:`;
       const r = await agentSemanticMatch(question); toolResult = r.text; rows = r.rows; agentName = 'Semantic Match';
     } else if (isUrgency) {
       const r = await agentUrgency(10); toolResult = r.text; rows = r.rows; agentName = 'Urgency Watch';
-    } else if (/(who needs approv|needs approval|pending approv|awaiting approv|to approve|approval queue|whom.*approve)/i.test(q)) {
+    } else if (/\bapprov/i.test(q) || /\bsign[\s-]?off\b/i.test(q)) {
+      // Any question mentioning approval/approve/approvals (e.g. "who needs my approval", "pending my
+      // approval", "what's awaiting approval") routes here. There is a dedicated handler, so matching the
+      // stem is safe and reliable — no more silent fall-through to the generic SQL agent.
       // Direct, reliable query for pending approvals — a hiring manager sees only their own jobs; admin sees all.
       // A hiring manager approves at TWO points: the submission (PENDING_HM_APPROVAL) and the placement
       // (PENDING_PLACEMENT_APPROVAL). Both must show up under "who needs my approval".
