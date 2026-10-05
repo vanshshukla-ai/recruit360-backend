@@ -102,7 +102,7 @@ app.post('/jobs/ocr-extract', async (req, res) => {
     const docText = result.document?.text || '';
     if (!docText.trim()) return res.status(422).json({ error: 'No text found in document' });
     const t1 = Date.now();
-    const prompt = 'Extract job details from the text and return ONLY valid JSON with keys: title, client, location, destination_country, openings, skills. If missing use empty string. No markdown, only JSON.\n\nTEXT:\n' + docText;
+    const prompt = 'Extract job details from the text and return ONLY valid JSON with keys: title, client, location, destination_country, openings, skills, bill_rate (number only, no currency symbol or text; empty if absent), bill_rate_type (one of Hourly/Daily/Weekly/Monthly/Annual if stated, else empty), zip_code, job_start_date (YYYY-MM-DD if a date is given, else empty), job_end_date (YYYY-MM-DD if given, else empty). If a field is missing use empty string. No markdown, only JSON.\n\nTEXT:\n' + docText;
     const gen = await genModel.generateContent(prompt);
     const genMs = Date.now() - t1;
     let out = gen.response.candidates[0].content.parts[0].text.trim();
@@ -1510,7 +1510,8 @@ app.post('/jobs/requisition', async (req, res) => {
       return res.status(400).json({ error: 'Title, Client and Hiring Manager are required.' });
     }
     const job_id = b.job_id || ('JOB' + Date.now().toString().slice(-7));
-    const job_code = b.job_code || ('JC-' + Date.now().toString().slice(-6));
+    // Self-generated 6-digit job code (sir's request). Keep any code the form already supplied.
+    const job_code = b.job_code || String(Math.floor(100000 + Math.random() * 900000));
     const q = `INSERT INTO jobs (
         job_id, title, job_code, client, hiring_manager, recruiter, recruitment_manager,
         description, primary_skills, job_location, location, country, zip_code,
@@ -2377,7 +2378,17 @@ async function skillWhoseJobs(question) {
     const roleLabel = best.role === 'hiring_manager' ? 'hiring manager' : best.role;
     let rows;
     if (best.role === 'recruiter') {
-      rows = (await pool.query(`SELECT title, client, status FROM jobs WHERE assigned_recruiter_id = $1 OR recruiter ILIKE $2 OR replace(COALESCE(assigned_recruiter_ids,''),' ','') ILIKE '%' || $1 || '%' ORDER BY created_date DESC`, [best.user_id, '%' + best.full_name + '%'])).rows;
+      // Match every way a recruiter can be stored on a job: by user_id (single or in the multi-assign list),
+      // by full name, or by first name only (jobs assigned before full names were used).
+      const firstName = String(best.full_name || '').split(/\s+/)[0] || best.full_name;
+      rows = (await pool.query(
+        `SELECT title, client, status FROM jobs
+          WHERE assigned_recruiter_id = $1
+             OR replace(COALESCE(assigned_recruiter_ids,''),' ','') ILIKE '%' || $1 || '%'
+             OR recruiter ILIKE $2 OR recruiter ILIKE $3
+             OR COALESCE(assigned_recruiter_names,'') ILIKE $2 OR COALESCE(assigned_recruiter_names,'') ILIKE $3
+          ORDER BY created_date DESC`,
+        [best.user_id, '%' + best.full_name + '%', '%' + firstName + '%'])).rows;
     } else if (best.role === 'hiring_manager') {
       rows = (await pool.query(`SELECT title, client, status FROM jobs WHERE hiring_manager ILIKE $1 ORDER BY created_date DESC`, ['%' + best.full_name + '%'])).rows;
     } else {
@@ -2536,12 +2547,23 @@ REFORMATTED ANSWER:`;
       const r = await agentUrgency(10); toolResult = r.text; rows = r.rows; agentName = 'Urgency Watch';
     } else if (/(who needs approv|needs approval|pending approv|awaiting approv|to approve|approval queue|whom.*approve)/i.test(q)) {
       // Direct, reliable query for pending approvals — a hiring manager sees only their own jobs; admin sees all.
+      // A hiring manager approves at TWO points: the submission (PENDING_HM_APPROVAL) and the placement
+      // (PENDING_PLACEMENT_APPROVAL). Both must show up under "who needs my approval".
       const scoped = role === 'hiring_manager' && userName;
       const pr = await pool.query(
-        `SELECT s.candidate_name, s.job_title, s.client_name FROM submissions s LEFT JOIN jobs j ON j.job_id = s.job_id
-          WHERE s.status = 'PENDING_HM_APPROVAL' ${scoped ? 'AND j.hiring_manager = $1' : ''} ORDER BY s.created_at DESC`,
+        `SELECT s.candidate_name, s.job_title, s.client_name, s.status FROM submissions s LEFT JOIN jobs j ON j.job_id = s.job_id
+          WHERE s.status IN ('PENDING_HM_APPROVAL','PENDING_PLACEMENT_APPROVAL') ${scoped ? 'AND j.hiring_manager = $1' : ''} ORDER BY s.created_at DESC`,
         scoped ? [userName] : []);
-      toolResult = pr.rows.length ? ('Candidates awaiting approval (' + pr.rows.length + '):\n' + pr.rows.map(x => '- ' + x.candidate_name + ' for ' + x.job_title + (x.client_name ? ' (' + x.client_name + ')' : '')).join('\n')) : 'There are no candidates awaiting approval right now.';
+      const subApprovals = pr.rows.filter(x => x.status === 'PENDING_HM_APPROVAL');
+      const plcApprovals = pr.rows.filter(x => x.status === 'PENDING_PLACEMENT_APPROVAL');
+      if (!pr.rows.length) {
+        toolResult = 'There is nothing awaiting your approval right now.';
+      } else {
+        const blocks = [];
+        if (subApprovals.length) blocks.push('Submission approvals (' + subApprovals.length + '):\n' + subApprovals.map(x => '- ' + x.candidate_name + ' for ' + x.job_title + (x.client_name ? ' (' + x.client_name + ')' : '')).join('\n'));
+        if (plcApprovals.length) blocks.push('Placement approvals (' + plcApprovals.length + '):\n' + plcApprovals.map(x => '- ' + x.candidate_name + ' for ' + x.job_title + (x.client_name ? ' (' + x.client_name + ')' : '')).join('\n'));
+        toolResult = blocks.join('\n\n');
+      }
       rows = pr.rows; agentName = 'Approvals';
     } else if (!/\b(assigned to|working on|handling|whose)\b/i.test(q) && /\bjob/i.test(q) && (/\b(open|closed|filled)\b/i.test(q) || /\b(list|show)\b/i.test(q) || /\bclient\b/i.test(q))) {
       // "list/show open jobs", "jobs for client X", "open/closed jobs" -> deterministic job listing.
