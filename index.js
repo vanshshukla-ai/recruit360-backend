@@ -2404,7 +2404,7 @@ REFORMATTED ANSWER:`;
     // not the visa-issues list skill (which only counts formal rejection workflows).
     const isCountQ = /\b(how many|count|number of|total|how much)\b/i.test(q);
     const isVisaIssues = /(visa (issue|problem|reject)|rejections?|who[^.]*visa|candidates[^.]*visa[^.]*(issue|reject))/i.test(q) && !idMatch && !isCountQ;
-    const isWorkToday = /(work on today|what should i (do|work)|my (work|queue|priorities|priority|tasks|pending)|today.?s (work|priorities|tasks)|prioriti[sz]e[^.]*today|need[^.]*my attention|what needs my attention|pending work|what.?s pending|whats pending|summary of (my )?(work|pending|tasks)|work summary|summari[sz]e (my )?(work|pending|tasks|day))/i.test(q);
+    const isWorkToday = /(work on today|what should i (do|work)|my (work|queue|priorities|priority|tasks|pending)|today.?s (work|priorities|tasks)|prioriti[sz]e[^.]*today|need[^.]*my attention|what needs[^.]*attention|attention today|pending work|what.?s pending|whats pending|summary of (my )?(work|pending|tasks)|work summary|summari[sz]e (my )?(work|pending|tasks|day))/i.test(q);
     const isPlacementRisk = /(close to placement|near placement|placement[^.]*(risk|blocker|block)|at risk[^.]*placement|placements? at risk)/i.test(q);
     const isWhyNoCand = /(why[^.]*(no|haven.?t|not)[^.]*candidat|why[^.]*can.?t[^.]*find|feasibility)/i.test(q);
     const isBestFit = /(best fit|best candidate|best.*match|top candidate|good fit|suitable candidate|who.?s? (the )?best|which candidate.*best|candidates? (for|suitable for) (a |the )?[a-z])/i.test(q) && !isVisaIssues && !isWhyNoCand;
