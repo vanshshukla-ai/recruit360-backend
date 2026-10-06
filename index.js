@@ -88,7 +88,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-06-v10-demotidy';
+const BUILD_TAG = '2026-10-06-v11-reports-export';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1927,28 +1927,77 @@ app.get('/recruiters/:id/jobs', async (req, res) => {
 // ---------- ROLE-BASED REPORTS (3 different) ----------
 app.get('/reports/:role', async (req, res) => {
   try {
+    await ensureSchema();
     const role = req.params.role;
-    const jobsTotal = await pool.query('SELECT COUNT(*) c FROM jobs');
-    const jobsOpen = await pool.query("SELECT COUNT(*) c FROM jobs WHERE status IN ('Open','Active','In Process')");
-    const subs = await pool.query('SELECT COUNT(*) c FROM submissions');
-    const placed = await pool.query("SELECT COUNT(*) c FROM submissions WHERE status='PLACED'");
+    const name = req.query.name || '';
+    const userId = req.query.userId || '';
+    const n = async (sql, params = []) => +((await pool.query(sql, params)).rows[0].c);
 
     if (role === 'admin') {
-      const byRecruiter = await pool.query(`SELECT recruiter, COUNT(*) jobs FROM jobs WHERE recruiter IS NOT NULL GROUP BY recruiter ORDER BY jobs DESC LIMIT 10`);
-      const byClient = await pool.query(`SELECT client, COUNT(*) jobs FROM jobs GROUP BY client ORDER BY jobs DESC LIMIT 10`);
+      const jobs = await n('SELECT COUNT(*) c FROM jobs');
+      const open = await n("SELECT COUNT(*) c FROM jobs WHERE status IN ('Open','Active','In Process','POSTED')");
+      const subs = await n('SELECT COUNT(*) c FROM submissions');
+      const placed = await n("SELECT COUNT(*) c FROM submissions WHERE status='PLACED'");
+      const byRecruiter = await pool.query(`SELECT COALESCE(NULLIF(recruiter,''),'Unassigned') recruiter, COUNT(*) jobs FROM jobs GROUP BY 1 ORDER BY jobs DESC LIMIT 10`);
+      const byClient = await pool.query(`SELECT COALESCE(NULLIF(client,''),'—') client, COUNT(*) jobs FROM jobs GROUP BY 1 ORDER BY jobs DESC LIMIT 10`);
       return res.json({ role, scope: 'All hiring managers, recruiters & clients',
-        totals: { jobs: +jobsTotal.rows[0].c, open: +jobsOpen.rows[0].c, submissions: +subs.rows[0].c, placements: +placed.rows[0].c },
-        byRecruiter: byRecruiter.rows, byClient: byClient.rows });
+        totals: { jobs, open, submissions: subs, placements: placed }, byRecruiter: byRecruiter.rows, byClient: byClient.rows });
     }
+
     if (role === 'hiring_manager') {
-      const byStatus = await pool.query(`SELECT status, COUNT(*) jobs FROM jobs GROUP BY status`);
-      return res.json({ role, scope: 'Your job requisitions & their progress',
-        totals: { jobs: +jobsTotal.rows[0].c, open: +jobsOpen.rows[0].c, submissions: +subs.rows[0].c, placements: +placed.rows[0].c },
-        byStatus: byStatus.rows });
+      // Scoped to THIS hiring manager's requisitions.
+      const jobs = await n('SELECT COUNT(*) c FROM jobs WHERE hiring_manager = $1', [name]);
+      const open = await n("SELECT COUNT(*) c FROM jobs WHERE hiring_manager = $1 AND status IN ('Open','Active','In Process','POSTED')", [name]);
+      const subs = await n('SELECT COUNT(*) c FROM submissions s JOIN jobs j ON j.job_id = s.job_id WHERE j.hiring_manager = $1', [name]);
+      const placed = await n("SELECT COUNT(*) c FROM submissions s JOIN jobs j ON j.job_id = s.job_id WHERE j.hiring_manager = $1 AND s.status='PLACED'", [name]);
+      const byStatus = await pool.query(`SELECT COALESCE(NULLIF(status,''),'Open') status, COUNT(*) jobs FROM jobs WHERE hiring_manager = $1 GROUP BY 1`, [name]);
+      return res.json({ role, scope: `Your requisitions${name ? ' — ' + name : ''}`,
+        totals: { jobs, open, submissions: subs, placements: placed }, byStatus: byStatus.rows });
     }
-    // recruiter
-    return res.json({ role, scope: 'Your assigned jobs & submissions',
-      totals: { assigned_jobs: +jobsOpen.rows[0].c, submissions: +subs.rows[0].c, placements: +placed.rows[0].c } });
+
+    // recruiter — scoped to THIS recruiter's assigned jobs + their own submissions
+    const recPred = `(recruiter = $1 OR assigned_recruiter_id = $2 OR replace(COALESCE(assigned_recruiter_ids,''),' ','') ILIKE '%' || $2 || '%')`;
+    const assigned = await n(`SELECT COUNT(*) c FROM jobs WHERE ${recPred}`, [name, userId]);
+    const subs = await n('SELECT COUNT(*) c FROM submissions WHERE submitted_by = $1', [name]);
+    const placed = await n("SELECT COUNT(*) c FROM submissions WHERE submitted_by = $1 AND status='PLACED'", [name]);
+    return res.json({ role, scope: `Your assigned jobs & submissions${name ? ' — ' + name : ''}`,
+      totals: { assigned_jobs: assigned, submissions: subs, placements: placed } });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- REPORTS EXPORT (CSV — opens in Excel) — scoped to the user ----------
+app.get('/reports/:role/export', async (req, res) => {
+  try {
+    await ensureSchema();
+    const role = req.params.role;
+    const name = req.query.name || '';
+    const userId = req.query.userId || '';
+    const type = (req.query.type === 'submissions') ? 'submissions' : 'jobs';
+    let rows = [];
+    if (type === 'submissions') {
+      let sql = `SELECT s.submission_id, s.candidate_name, s.job_title, s.client_name, s.status, s.submitted_by, s.created_at
+                   FROM submissions s LEFT JOIN jobs j ON j.job_id = s.job_id`;
+      const params = []; const where = [];
+      if (role === 'hiring_manager' && name) { params.push(name); where.push(`j.hiring_manager = $${params.length}`); }
+      else if (role === 'recruiter' && name) { params.push(name); where.push(`s.submitted_by = $${params.length}`); }
+      if (where.length) sql += ' WHERE ' + where.join(' AND ');
+      sql += ' ORDER BY s.created_at DESC';
+      rows = (await pool.query(sql, params)).rows;
+    } else {
+      let sql = `SELECT job_id, title, job_code, client, hiring_manager, recruiter, status, number_of_positions, bill_rate, created_date FROM jobs`;
+      const params = []; const where = [];
+      if (role === 'hiring_manager' && name) { params.push(name); where.push(`hiring_manager = $${params.length}`); }
+      else if (role === 'recruiter') { params.push(name || ''); params.push(userId || ''); where.push(`(recruiter = $1 OR assigned_recruiter_id = $2 OR replace(COALESCE(assigned_recruiter_ids,''),' ','') ILIKE '%' || $2 || '%')`); }
+      if (where.length) sql += ' WHERE ' + where.join(' AND ');
+      sql += ' ORDER BY created_date DESC';
+      rows = (await pool.query(sql, params)).rows;
+    }
+    const cols = rows.length ? Object.keys(rows[0]) : ['no_data'];
+    const esc = v => { if (v == null) return ''; const s = String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    const csv = [cols.join(','), ...rows.map(r => cols.map(c => esc(r[c])).join(','))].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="recruit360_${role}_${type}.csv"`);
+    return res.send(csv);
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
