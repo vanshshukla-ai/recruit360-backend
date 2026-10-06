@@ -88,7 +88,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-06-v6-uniquejobid';
+const BUILD_TAG = '2026-10-06-v7-clientcontacts';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1678,13 +1678,59 @@ app.post('/admin/clients', async (req, res) => {
   try {
     const b = req.body;
     if (!b.client_name || !b.client_name.trim()) return res.status(400).json({ error: 'client_name required' });
+    await ensureSchema();
+    // Client Code must be unique when supplied (sir's request). Auto-generate one if blank.
+    let client_code = (b.client_code || '').trim();
+    if (client_code) {
+      const dup = await pool.query('SELECT 1 FROM clients WHERE client_code = $1', [client_code]);
+      if (dup.rows.length) return res.status(409).json({ error: 'duplicate_client_code', message: `Client Code ${client_code} already exists. Please use a different one.` });
+    } else {
+      client_code = 'CLT-' + Date.now().toString().slice(-6);
+    }
     const client_id = b.client_id || ('CL-' + Date.now().toString().slice(-6));
     await pool.query(
-      `INSERT INTO clients (client_id, client_name, industry, contact_person, contact_email, contact_phone, country, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (client_id) DO NOTHING`,
-      [client_id, b.client_name, b.industry || '', b.contact_person || '', b.contact_email || '', b.contact_phone || '', b.country || '', b.created_by || 'Admin']
+      `INSERT INTO clients (client_id, client_name, client_code, status, industry, country, state, city, website, contact_person, contact_email, contact_phone, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (client_id) DO NOTHING`,
+      [client_id, b.client_name, client_code, b.status || 'Active', b.industry || '', b.country || '', b.state || '', b.city || '', b.website || '',
+       b.contact_person || '', b.contact_email || '', b.contact_phone || '', b.created_by || 'Admin']
     );
-    return res.json({ ok: true, client_id });
+    // Store the primary contact as the first row in client_contacts (if any details were given).
+    if ((b.contact_person || b.contact_email || b.contact_phone || b.contact_title) && String(b.contact_person || b.contact_email || '').trim()) {
+      const cid = 'CTC-' + Date.now().toString().slice(-8);
+      await pool.query(
+        'INSERT INTO client_contacts (contact_id, client_id, contact_name, job_title, email, phone, is_primary) VALUES ($1,$2,$3,$4,$5,$6,TRUE)',
+        [cid, client_id, b.contact_person || '', b.contact_title || '', b.contact_email || '', b.contact_phone || '']);
+    }
+    return res.json({ ok: true, client_id, client_code });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- CLIENT CONTACTS (one primary + many additional people on the client side) ----------
+app.get('/admin/clients/:id/contacts', async (req, res) => {
+  try {
+    await ensureSchema();
+    const { rows } = await pool.query('SELECT * FROM client_contacts WHERE client_id = $1 ORDER BY is_primary DESC, created_at ASC', [req.params.id]);
+    return res.json({ contacts: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/admin/clients/:id/contacts', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body;
+    if (!b.contact_name && !b.email) return res.status(400).json({ error: 'A contact name or email is required.' });
+    const contact_id = 'CTC-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    // If this is flagged primary, demote any existing primary first.
+    if (b.is_primary) await pool.query('UPDATE client_contacts SET is_primary = FALSE WHERE client_id = $1', [req.params.id]);
+    await pool.query(
+      'INSERT INTO client_contacts (contact_id, client_id, contact_name, job_title, email, phone, is_primary) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [contact_id, req.params.id, b.contact_name || '', b.job_title || '', b.email || '', b.phone || '', !!b.is_primary]);
+    return res.json({ ok: true, contact_id });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.delete('/admin/clients/:id/contacts/:contactId', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM client_contacts WHERE contact_id = $1 AND client_id = $2', [req.params.contactId, req.params.id]);
+    return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -3633,6 +3679,23 @@ async function ensureSchema() {
     // them safely, even on a DB where no job was ever assigned through the multi-assign endpoint.
     await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_ids TEXT');
     await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_names TEXT');
+    // Client core fields (code/status/location/web) + a separate contacts table (one primary, many extra).
+    await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS client_code TEXT');
+    await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS status TEXT DEFAULT \'Active\'');
+    await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS state TEXT');
+    await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS city TEXT');
+    await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS website TEXT');
+    await pool.query(`CREATE TABLE IF NOT EXISTS client_contacts (
+      contact_id   TEXT PRIMARY KEY,
+      client_id    TEXT,
+      contact_name TEXT,
+      job_title    TEXT,
+      email        TEXT,
+      phone        TEXT,
+      is_primary   BOOLEAN DEFAULT FALSE,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_client_contacts_client ON client_contacts (client_id)');
     await pool.query(`CREATE TABLE IF NOT EXISTS user_settings (
       user_key   TEXT PRIMARY KEY,
       prefs      JSONB DEFAULT '{}',
