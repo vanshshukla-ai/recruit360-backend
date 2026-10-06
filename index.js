@@ -88,7 +88,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-06-v9-hmaddcandidate';
+const BUILD_TAG = '2026-10-06-v10-demotidy';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1867,6 +1867,44 @@ app.patch('/jobs/:jobId/edit', async (req, res) => {
     vals.push(req.params.jobId);
     await pool.query('UPDATE jobs SET ' + sets.join(', ') + ' WHERE job_id = $' + i, vals);
     return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- DEMO TIDY: keep only jobs tied to ACTIVE recruiters (+ any hand-picked), close the rest ----------
+// Reversible: it only sets status = 'Closed' (data is kept). Preview with ?dry=1 to see what WOULD close.
+app.post('/admin/demo-tidy', async (req, res) => {
+  try {
+    await ensureSchema();
+    const dry = String(req.query.dry || '') === '1';
+    const keepIds = new Set(Array.isArray(req.body.keep_job_ids) ? req.body.keep_job_ids : []);
+    const recs = (await pool.query("SELECT user_id, full_name FROM app_users WHERE role = 'recruiter' AND active = TRUE")).rows;
+    if (!recs.length) return res.status(400).json({ error: 'No active recruiters found — nothing to key the cleanup on.' });
+    const ids = recs.map(r => r.user_id);
+    const names = recs.map(r => String(r.full_name || '').toLowerCase()).filter(Boolean);
+    const jobs = (await pool.query('SELECT job_id, title, assigned_recruiter_id, recruiter, assigned_recruiter_ids, assigned_recruiter_names, status FROM jobs')).rows;
+    const kept = [], toClose = [];
+    for (const j of jobs) {
+      const rec = String(j.recruiter || '').toLowerCase();
+      const recNames = String(j.assigned_recruiter_names || '').toLowerCase();
+      const recIds = String(j.assigned_recruiter_ids || '');
+      const linked =
+        keepIds.has(j.job_id) ||
+        ids.includes(j.assigned_recruiter_id) ||
+        ids.some(id => id && recIds.includes(id)) ||
+        names.some(n => rec.includes(n) || recNames.includes(n));
+      if (linked) kept.push(j.job_id);
+      else if (String(j.status || '').toLowerCase() !== 'closed') toClose.push({ job_id: j.job_id, title: j.title });
+    }
+    if (!dry && toClose.length) {
+      await pool.query("UPDATE jobs SET status = 'Closed' WHERE job_id = ANY($1)", [toClose.map(x => x.job_id)]);
+    }
+    return res.json({
+      ok: true, dry_run: dry,
+      active_recruiters: recs.map(r => r.full_name),
+      kept_count: kept.length,
+      closed_count: toClose.length,
+      closed: toClose,
+    });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
