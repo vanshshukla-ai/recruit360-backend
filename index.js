@@ -88,7 +88,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-06-v7-clientcontacts';
+const BUILD_TAG = '2026-10-06-v8-editdates';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1853,9 +1853,16 @@ app.patch('/jobs/:jobId/assign', async (req, res) => {
 app.patch('/jobs/:jobId/edit', async (req, res) => {
   try {
     const b = req.body;
-    const fields = ['title','job_code','client','hiring_manager','description','primary_skills','job_location','country','zip_code','number_of_positions','bill_rate','bill_rate_type','tax_terms','priority','status'];
+    const fields = ['title','job_code','client','hiring_manager','description','primary_skills','job_location','country','zip_code','number_of_positions','bill_rate','bill_rate_type','tax_terms','priority','status','job_start_date','job_end_date'];
     const sets = []; const vals = []; let i = 1;
-    fields.forEach(f => { if (b[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(b[f]); i++; } });
+    const dateFields = new Set(['job_start_date', 'job_end_date']);
+    fields.forEach(f => {
+      if (b[f] !== undefined) {
+        // Empty date strings must become NULL (Postgres rejects '' for a date column).
+        const val = (dateFields.has(f) && (b[f] === '' || b[f] === null)) ? null : b[f];
+        sets.push(f + ' = $' + i); vals.push(val); i++;
+      }
+    });
     if (!sets.length) return res.json({ ok: true });
     vals.push(req.params.jobId);
     await pool.query('UPDATE jobs SET ' + sets.join(', ') + ' WHERE job_id = $' + i, vals);
