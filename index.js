@@ -88,7 +88,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-06-v8-editdates';
+const BUILD_TAG = '2026-10-06-v9-hmaddcandidate';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1281,8 +1281,8 @@ app.post('/jobs/:jobId/submit-candidate', async (req, res) => {
     // shows the recruiter's name but the job looks unassigned (the exact gap that was causing confusion).
     try {
       if (submitted_by && String(submitted_by).trim()) {
-        const u = (await pool.query('SELECT user_id, full_name FROM app_users WHERE user_id = $1 OR full_name ILIKE $2 LIMIT 1', [submitted_by, submitted_by])).rows[0];
-        if (u) {
+        const u = (await pool.query('SELECT user_id, full_name, role FROM app_users WHERE user_id = $1 OR full_name ILIKE $2 LIMIT 1', [submitted_by, submitted_by])).rows[0];
+        if (u && u.role === 'recruiter') {
           await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_ids TEXT');
           await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_recruiter_names TEXT');
           await pool.query(
