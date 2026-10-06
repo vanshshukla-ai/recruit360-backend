@@ -88,7 +88,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-05-v5-multirecruiter';
+const BUILD_TAG = '2026-10-06-v6-uniquejobid';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1539,9 +1539,30 @@ app.post('/jobs/requisition', async (req, res) => {
     if (!b.title || !b.client || !b.hiring_manager) {
       return res.status(400).json({ error: 'Title, Client and Hiring Manager are required.' });
     }
-    const job_id = b.job_id || ('JOB' + Date.now().toString().slice(-7));
-    // Self-generated 6-digit job code (sir's request). Keep any code the form already supplied.
-    const job_code = b.job_code || String(Math.floor(100000 + Math.random() * 900000));
+    // Generate a GUARANTEED-UNIQUE Job ID — never reuse/overwrite an existing one. If the client sent a
+    // job_id that already exists, reject it as a duplicate (create must not silently overwrite a job).
+    let job_id = b.job_id;
+    if (job_id) {
+      const exists = await pool.query('SELECT 1 FROM jobs WHERE job_id = $1', [job_id]);
+      if (exists.rows.length) return res.status(409).json({ error: 'duplicate_job_id', message: `Job ID ${job_id} already exists. Please use a different one.` });
+    } else {
+      for (let i = 0; i < 20; i++) {
+        const cand = 'JOB' + Date.now().toString().slice(-7) + Math.floor(Math.random() * 100).toString().padStart(2, '0');
+        const hit = await pool.query('SELECT 1 FROM jobs WHERE job_id = $1', [cand]);
+        if (!hit.rows.length) { job_id = cand; break; }
+      }
+      if (!job_id) job_id = 'JOB' + Date.now().toString();
+    }
+    // Self-generated 6-digit job code (sir's request), also guaranteed unique.
+    let job_code = b.job_code;
+    if (!job_code) {
+      for (let i = 0; i < 25; i++) {
+        const cand = String(Math.floor(100000 + Math.random() * 900000));
+        const hit = await pool.query('SELECT 1 FROM jobs WHERE job_code = $1', [cand]);
+        if (!hit.rows.length) { job_code = cand; break; }
+      }
+      if (!job_code) job_code = String(Date.now()).slice(-6);
+    }
     const q = `INSERT INTO jobs (
         job_id, title, job_code, client, hiring_manager, recruiter, recruitment_manager,
         description, primary_skills, job_location, location, country, zip_code,
