@@ -88,7 +88,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-06-v11-reports-export';
+const BUILD_TAG = '2026-10-07-v13-sales-edit-export';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1731,6 +1731,111 @@ app.delete('/admin/clients/:id/contacts/:contactId', async (req, res) => {
   try {
     await pool.query('DELETE FROM client_contacts WHERE contact_id = $1 AND client_id = $2', [req.params.contactId, req.params.id]);
     return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// =================== SALES MODULE (Leads / Opportunities / Contacts / Accounts) ===================
+// ---- Leads ----
+app.get('/sales/leads', async (req, res) => {
+  try { await ensureSchema(); const { rows } = await pool.query('SELECT * FROM sales_leads ORDER BY created_at DESC'); return res.json({ leads: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/sales/leads', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body;
+    if (!b.company && !b.email && !b.requirement) return res.status(400).json({ error: 'Please add at least a company, email, or requirement.' });
+    const id = 'LEAD-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    await pool.query(
+      `INSERT INTO sales_leads (lead_id, user_email, company, country, address, phone, email, requirement, source, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [id, b.user_email || '', b.company || '', b.country || '', b.address || '', b.phone || '', b.email || '', b.requirement || '', b.source || '', b.status || 'New']);
+    const { rows } = await pool.query('SELECT * FROM sales_leads WHERE lead_id = $1', [id]);
+    return res.json({ ok: true, lead: rows[0] });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/sales/leads/:id', async (req, res) => {
+  try {
+    const fields = ['company', 'country', 'address', 'phone', 'email', 'requirement', 'source', 'status'];
+    const sets = [], vals = []; let i = 1;
+    fields.forEach(f => { if (req.body[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(req.body[f]); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE sales_leads SET ' + sets.join(', ') + ' WHERE lead_id = $' + i, vals);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---- Opportunities ----
+app.get('/sales/opportunities', async (req, res) => {
+  try { await ensureSchema(); const { rows } = await pool.query('SELECT * FROM sales_opportunities ORDER BY created_at DESC'); return res.json({ opportunities: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/sales/opportunities', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body;
+    if (!b.name && !b.account) return res.status(400).json({ error: 'Please add an opportunity name or account.' });
+    const id = 'OPP-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    await pool.query(
+      `INSERT INTO sales_opportunities (opp_id, user_email, name, account, amount, stage, close_date, owner)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [id, b.user_email || '', b.name || '', b.account || '', b.amount ? Number(b.amount) : null, b.stage || 'Prospecting', b.close_date || null, b.owner || '']);
+    return res.json({ ok: true, opp_id: id });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---- Contacts ----
+app.get('/sales/contacts', async (req, res) => {
+  try { await ensureSchema(); const { rows } = await pool.query('SELECT * FROM sales_contacts ORDER BY created_at DESC'); return res.json({ contacts: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/sales/contacts', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body;
+    if (!b.full_name && !b.email) return res.status(400).json({ error: 'Please add a name or email.' });
+    const id = 'SCT-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    await pool.query(
+      `INSERT INTO sales_contacts (contact_id, user_email, full_name, title, company, email, phone, country)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [id, b.user_email || '', b.full_name || '', b.title || '', b.company || '', b.email || '', b.phone || '', b.country || '']);
+    return res.json({ ok: true, contact_id: id });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---- Accounts ----
+app.get('/sales/accounts', async (req, res) => {
+  try { await ensureSchema(); const { rows } = await pool.query('SELECT * FROM sales_accounts ORDER BY created_at DESC'); return res.json({ accounts: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/sales/accounts', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body;
+    if (!b.company_name) return res.status(400).json({ error: 'Please add a company name.' });
+    const id = 'ACC-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    await pool.query(
+      `INSERT INTO sales_accounts (account_id, user_email, company_name, industry, country, website, phone, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [id, b.user_email || '', b.company_name || '', b.industry || '', b.country || '', b.website || '', b.phone || '', b.status || 'Active']);
+    return res.json({ ok: true, account_id: id });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---- Sales CSV export (opens in Excel) — works for leads/opportunities/contacts/accounts ----
+app.get('/sales/export', async (req, res) => {
+  try {
+    await ensureSchema();
+    const map = { leads: 'sales_leads', opportunities: 'sales_opportunities', contacts: 'sales_contacts', accounts: 'sales_accounts' };
+    const type = map[req.query.type] ? req.query.type : 'leads';
+    const rows = (await pool.query(`SELECT * FROM ${map[type]} ORDER BY created_at DESC`)).rows;
+    const cols = rows.length ? Object.keys(rows[0]) : ['no_data'];
+    const esc = v => { if (v == null) return ''; const s = String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    const csv = [cols.join(','), ...rows.map(r => cols.map(c => esc(r[c])).join(','))].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="recruit360_sales_${type}.csv"`);
+    return res.send(csv);
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -3790,6 +3895,53 @@ async function ensureSchema() {
       created_at   TIMESTAMPTZ DEFAULT NOW()
     )`);
     await pool.query('CREATE INDEX IF NOT EXISTS idx_client_contacts_client ON client_contacts (client_id)');
+    // ---- SALES module: Leads, Opportunities, Contacts, Accounts ----
+    await pool.query(`CREATE TABLE IF NOT EXISTS sales_leads (
+      lead_id     TEXT PRIMARY KEY,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      user_email  TEXT,
+      company     TEXT,
+      country     TEXT,
+      address     TEXT,
+      phone       TEXT,
+      email       TEXT,
+      requirement TEXT,
+      source      TEXT,
+      status      TEXT DEFAULT 'New'
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS sales_opportunities (
+      opp_id      TEXT PRIMARY KEY,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      user_email  TEXT,
+      name        TEXT,
+      account     TEXT,
+      amount      NUMERIC,
+      stage       TEXT DEFAULT 'Prospecting',
+      close_date  DATE,
+      owner       TEXT
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS sales_contacts (
+      contact_id  TEXT PRIMARY KEY,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      user_email  TEXT,
+      full_name   TEXT,
+      title       TEXT,
+      company     TEXT,
+      email       TEXT,
+      phone       TEXT,
+      country     TEXT
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS sales_accounts (
+      account_id   TEXT PRIMARY KEY,
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      user_email   TEXT,
+      company_name TEXT,
+      industry     TEXT,
+      country      TEXT,
+      website      TEXT,
+      phone        TEXT,
+      status       TEXT DEFAULT 'Active'
+    )`);
     await pool.query(`CREATE TABLE IF NOT EXISTS user_settings (
       user_key   TEXT PRIMARY KEY,
       prefs      JSONB DEFAULT '{}',
