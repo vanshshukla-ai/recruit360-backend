@@ -88,7 +88,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-07-v13-sales-edit-export';
+const BUILD_TAG = '2026-10-07-v15-sales-convert-detail';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1778,9 +1778,10 @@ app.post('/sales/opportunities', async (req, res) => {
     if (!b.name && !b.account) return res.status(400).json({ error: 'Please add an opportunity name or account.' });
     const id = 'OPP-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
     await pool.query(
-      `INSERT INTO sales_opportunities (opp_id, user_email, name, account, amount, stage, close_date, owner)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [id, b.user_email || '', b.name || '', b.account || '', b.amount ? Number(b.amount) : null, b.stage || 'Prospecting', b.close_date || null, b.owner || '']);
+      `INSERT INTO sales_opportunities (opp_id, user_email, name, account, contact, stage, open_date, close_date, amount, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [id, b.user_email || '', b.name || '', b.account || '', b.contact || '', b.stage || 'Prospecting',
+       b.open_date || null, b.close_date || null, b.amount ? Number(b.amount) : null, b.status || 'Open']);
     return res.json({ ok: true, opp_id: id });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -1797,9 +1798,9 @@ app.post('/sales/contacts', async (req, res) => {
     if (!b.full_name && !b.email) return res.status(400).json({ error: 'Please add a name or email.' });
     const id = 'SCT-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
     await pool.query(
-      `INSERT INTO sales_contacts (contact_id, user_email, full_name, title, company, email, phone, country)
+      `INSERT INTO sales_contacts (contact_id, user_email, full_name, account, phone, email, department, role)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [id, b.user_email || '', b.full_name || '', b.title || '', b.company || '', b.email || '', b.phone || '', b.country || '']);
+      [id, b.user_email || '', b.full_name || '', b.account || '', b.phone || '', b.email || '', b.department || '', b.role || '']);
     return res.json({ ok: true, contact_id: id });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -1816,9 +1817,11 @@ app.post('/sales/accounts', async (req, res) => {
     if (!b.company_name) return res.status(400).json({ error: 'Please add a company name.' });
     const id = 'ACC-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
     await pool.query(
-      `INSERT INTO sales_accounts (account_id, user_email, company_name, industry, country, website, phone, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [id, b.user_email || '', b.company_name || '', b.industry || '', b.country || '', b.website || '', b.phone || '', b.status || 'Active']);
+      `INSERT INTO sales_accounts (account_id, user_email, company_name, country, phone, website, billing_address, shipping_address, ownership, industry, annual_revenue, active, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [id, b.user_email || '', b.company_name || '', b.country || '', b.phone || '', b.website || '',
+       b.billing_address || '', b.shipping_address || '', b.ownership || '', b.industry || '', b.annual_revenue || '',
+       (b.active === false ? false : true), (b.active === false ? 'Inactive' : 'Active')]);
     return res.json({ ok: true, account_id: id });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -1838,6 +1841,74 @@ app.get('/sales/export', async (req, res) => {
     return res.send(csv);
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
+
+// ---- CONVERT a lead: auto-create 1 Account + 1 Contact + 1 Opportunity (Salesforce-style) ----
+app.post('/sales/leads/:id/convert', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body || {};
+    const lead = (await pool.query('SELECT * FROM sales_leads WHERE lead_id = $1', [req.params.id])).rows[0];
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    const who = b.user_email || lead.user_email || '';
+    const accName = (b.account_name || lead.company || 'New Account').trim();
+    const ctcName = (b.contact_name || lead.email || accName).trim();
+    const oppName = (b.opportunity_name || (accName + ' — Opportunity')).trim();
+
+    const accId = 'ACC-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    await pool.query(
+      `INSERT INTO sales_accounts (account_id, user_email, company_name, country, phone, website, industry, active, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,'Active')`,
+      [accId, who, accName, lead.country || '', lead.phone || '', '', '']);
+
+    const ctcId = 'SCT-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    await pool.query(
+      `INSERT INTO sales_contacts (contact_id, user_email, full_name, account, phone, email, department, role)
+       VALUES ($1,$2,$3,$4,$5,$6,'','Decision Maker')`,
+      [ctcId, who, ctcName, accName, (b.contact_phone || lead.phone || ''), (b.contact_email || lead.email || '')]);
+
+    const oppId = 'OPP-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    await pool.query(
+      `INSERT INTO sales_opportunities (opp_id, user_email, name, account, contact, stage, open_date, close_date, amount, status)
+       VALUES ($1,$2,$3,$4,$5,$6,CURRENT_DATE,$7,$8,$9)`,
+      [oppId, who, oppName, accName, ctcName, (b.stage || 'Qualification'), (b.close_date || null),
+       (b.amount ? Number(b.amount) : null), (b.status || 'Open')]);
+
+    await pool.query("UPDATE sales_leads SET status = 'Converted', converted = TRUE WHERE lead_id = $1", [req.params.id]);
+    return res.json({ ok: true, account_id: accId, contact_id: ctcId, opp_id: oppId, account_name: accName, contact_name: ctcName, opportunity_name: oppName });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---- Activities (tasks / calls / events / emails) on any sales record ----
+app.get('/sales/activities', async (req, res) => {
+  try {
+    await ensureSchema();
+    const { parent_type, parent_id } = req.query;
+    const { rows } = await pool.query(
+      'SELECT * FROM sales_activities WHERE parent_type = $1 AND parent_id = $2 ORDER BY created_at DESC',
+      [parent_type || '', parent_id || '']);
+    return res.json({ activities: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/sales/activities', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body;
+    if (!b.parent_id || !b.subject) return res.status(400).json({ error: 'A subject is required.' });
+    const id = 'ACT-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    await pool.query(
+      `INSERT INTO sales_activities (activity_id, user_email, parent_type, parent_id, type, subject, notes, due_date, done)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [id, b.user_email || '', b.parent_type || '', b.parent_id || '', b.type || 'Task', b.subject || '', b.notes || '', b.due_date || null, !!b.done]);
+    return res.json({ ok: true, activity_id: id });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/sales/activities/:id', async (req, res) => {
+  try {
+    await pool.query('UPDATE sales_activities SET done = $1 WHERE activity_id = $2', [!!req.body.done, req.params.id]);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
 
 // ---------- USERS (admin sees all HMs & recruiters) ----------
 app.get('/admin/users', async (req, res) => {
@@ -3942,6 +4013,34 @@ async function ensureSchema() {
       phone        TEXT,
       status       TEXT DEFAULT 'Active'
     )`);
+    // Extended Sales fields (per Pushpam's spec) — added as columns so existing tables upgrade in place.
+    await pool.query("ALTER TABLE sales_opportunities ADD COLUMN IF NOT EXISTS contact TEXT");
+    await pool.query("ALTER TABLE sales_opportunities ADD COLUMN IF NOT EXISTS open_date DATE");
+    await pool.query("ALTER TABLE sales_opportunities ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'Open'");
+    await pool.query("ALTER TABLE sales_accounts ADD COLUMN IF NOT EXISTS billing_address TEXT");
+    await pool.query("ALTER TABLE sales_accounts ADD COLUMN IF NOT EXISTS shipping_address TEXT");
+    await pool.query("ALTER TABLE sales_accounts ADD COLUMN IF NOT EXISTS ownership TEXT");
+    await pool.query("ALTER TABLE sales_accounts ADD COLUMN IF NOT EXISTS annual_revenue TEXT");
+    await pool.query("ALTER TABLE sales_accounts ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE");
+    await pool.query("ALTER TABLE sales_contacts ADD COLUMN IF NOT EXISTS account TEXT");
+    await pool.query("ALTER TABLE sales_contacts ADD COLUMN IF NOT EXISTS department TEXT");
+    await pool.query("ALTER TABLE sales_contacts ADD COLUMN IF NOT EXISTS role TEXT");
+    // Activity log (tasks / calls / events / emails) that can hang off any sales record.
+    await pool.query(`CREATE TABLE IF NOT EXISTS sales_activities (
+      activity_id TEXT PRIMARY KEY,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      user_email  TEXT,
+      parent_type TEXT,
+      parent_id   TEXT,
+      type        TEXT,
+      subject     TEXT,
+      notes       TEXT,
+      due_date    DATE,
+      done        BOOLEAN DEFAULT FALSE
+    )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_sales_activities_parent ON sales_activities (parent_type, parent_id)');
+    // Mark on a lead once it has been converted.
+    await pool.query("ALTER TABLE sales_leads ADD COLUMN IF NOT EXISTS converted BOOLEAN DEFAULT FALSE");
     await pool.query(`CREATE TABLE IF NOT EXISTS user_settings (
       user_key   TEXT PRIMARY KEY,
       prefs      JSONB DEFAULT '{}',
