@@ -33,6 +33,8 @@ async function ensureAuth() {
     await pool.query('ALTER TABLE app_users ADD COLUMN IF NOT EXISTS password_hash TEXT');
     await pool.query('ALTER TABLE app_users ADD COLUMN IF NOT EXISTS password_salt TEXT');
     await pool.query('ALTER TABLE app_users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()');
+    await pool.query('ALTER TABLE app_users ADD COLUMN IF NOT EXISTS department TEXT');
+    await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'India'");
     // Seed the testing accounts (idempotent). Password only set if the account has none yet.
     const def = process.env.SEED_PASSWORD || 'Avanciers@360';
     const seed = [
@@ -88,7 +90,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-07-v15-sales-convert-detail';
+const BUILD_TAG = '2026-10-09-v17-sales-polish';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1401,7 +1403,7 @@ async function notify({ candidate_id, recipient, type, message }) {
 // Gated on SENDGRID_API_KEY. No key => demo mode (nothing sends; UI/logs unchanged).
 // MAIL_FROM = your verified SendGrid sender. MAIL_REDIRECT (optional) = send every email to this
 // one inbox during testing (so sir receives them all) while the app still shows the real recipient.
-async function sendEmail({ to, cc, subject, body }) {
+async function sendEmail({ to, cc, subject, body, html }) {
   try {
     const key = process.env.SENDGRID_API_KEY;
     const from = process.env.MAIL_FROM;
@@ -1419,7 +1421,7 @@ async function sendEmail({ to, cc, subject, body }) {
       personalizations: [personalization],
       from: { email: from, name: process.env.MAIL_FROM_NAME || 'Recruit 360' },
       subject: subj || '(no subject)',
-      content: [{ type: 'text/plain', value: body || '' }],
+      content: [{ type: html ? 'text/html' : 'text/plain', value: body || '' }],
     };
     const r = await fetch('https://api.sendgrid.com/v3/mail/send', {
       method: 'POST',
@@ -1737,8 +1739,16 @@ app.delete('/admin/clients/:id/contacts/:contactId', async (req, res) => {
 // =================== SALES MODULE (Leads / Opportunities / Contacts / Accounts) ===================
 // ---- Leads ----
 app.get('/sales/leads', async (req, res) => {
-  try { await ensureSchema(); const { rows } = await pool.query('SELECT * FROM sales_leads ORDER BY created_at DESC'); return res.json({ leads: rows }); }
-  catch (e) { return res.status(500).json({ error: e.message }); }
+  try {
+    await ensureSchema();
+    // Email security: a non-admin only sees the leads they own; admin sees all.
+    const role = req.query.role || '';
+    const email = req.query.email || '';
+    let rows;
+    if (role && role !== 'admin' && email) rows = (await pool.query('SELECT * FROM sales_leads WHERE user_email = $1 ORDER BY created_at DESC', [email])).rows;
+    else rows = (await pool.query('SELECT * FROM sales_leads ORDER BY created_at DESC')).rows;
+    return res.json({ leads: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 app.post('/sales/leads', async (req, res) => {
   try {
@@ -1756,6 +1766,11 @@ app.post('/sales/leads', async (req, res) => {
 });
 app.patch('/sales/leads/:id', async (req, res) => {
   try {
+    // A lead that is Won or Lost is final — no more edits or status changes.
+    const cur = (await pool.query('SELECT status FROM sales_leads WHERE lead_id = $1', [req.params.id])).rows[0];
+    if (cur && ['won', 'lost'].includes((cur.status || '').toLowerCase())) {
+      return res.status(409).json({ error: 'locked', message: 'This lead is ' + cur.status + ' and can no longer be edited.' });
+    }
     const fields = ['company', 'country', 'address', 'phone', 'email', 'requirement', 'source', 'status'];
     const sets = [], vals = []; let i = 1;
     fields.forEach(f => { if (req.body[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(req.body[f]); i++; } });
@@ -1796,11 +1811,27 @@ app.post('/sales/contacts', async (req, res) => {
     await ensureSchema();
     const b = req.body;
     if (!b.full_name && !b.email) return res.status(400).json({ error: 'Please add a name or email.' });
+    // Duplicate check (same name) — offer merge unless caller forced create or chose a merge target.
+    if (b.full_name && !b.force && !b.merge_id) {
+      const dup = (await pool.query('SELECT * FROM sales_contacts WHERE LOWER(full_name) = LOWER($1) LIMIT 1', [b.full_name])).rows[0];
+      if (dup) return res.status(409).json({ duplicate: true, type: 'contact', existing: dup });
+    }
+    if (b.merge_id) {
+      // Merge: fill only the empty fields on the existing record.
+      await pool.query(
+        `UPDATE sales_contacts SET
+           account = COALESCE(NULLIF(account,''), $1), phone = COALESCE(NULLIF(phone,''), $2),
+           email = COALESCE(NULLIF(email,''), $3), department = COALESCE(NULLIF(department,''), $4),
+           role = COALESCE(NULLIF(role,''), $5), gender = COALESCE(NULLIF(gender,''), $6)
+         WHERE contact_id = $7`,
+        [b.account || '', b.phone || '', b.email || '', b.department || '', b.role || '', b.gender || '', b.merge_id]);
+      return res.json({ ok: true, merged: true, contact_id: b.merge_id });
+    }
     const id = 'SCT-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
     await pool.query(
-      `INSERT INTO sales_contacts (contact_id, user_email, full_name, account, phone, email, department, role)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [id, b.user_email || '', b.full_name || '', b.account || '', b.phone || '', b.email || '', b.department || '', b.role || '']);
+      `INSERT INTO sales_contacts (contact_id, user_email, full_name, account, phone, email, department, role, gender)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [id, b.user_email || '', b.full_name || '', b.account || '', b.phone || '', b.email || '', b.department || '', b.role || '', b.gender || '']);
     return res.json({ ok: true, contact_id: id });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -1815,6 +1846,22 @@ app.post('/sales/accounts', async (req, res) => {
     await ensureSchema();
     const b = req.body;
     if (!b.company_name) return res.status(400).json({ error: 'Please add a company name.' });
+    // Duplicate check (same company name) — offer merge unless caller forced create or chose a merge target.
+    if (!b.force && !b.merge_id) {
+      const dup = (await pool.query('SELECT * FROM sales_accounts WHERE LOWER(company_name) = LOWER($1) LIMIT 1', [b.company_name])).rows[0];
+      if (dup) return res.status(409).json({ duplicate: true, type: 'account', existing: dup });
+    }
+    if (b.merge_id) {
+      await pool.query(
+        `UPDATE sales_accounts SET
+           country = COALESCE(NULLIF(country,''), $1), phone = COALESCE(NULLIF(phone,''), $2),
+           website = COALESCE(NULLIF(website,''), $3), billing_address = COALESCE(NULLIF(billing_address,''), $4),
+           shipping_address = COALESCE(NULLIF(shipping_address,''), $5), ownership = COALESCE(NULLIF(ownership,''), $6),
+           industry = COALESCE(NULLIF(industry,''), $7), annual_revenue = COALESCE(NULLIF(annual_revenue,''), $8)
+         WHERE account_id = $9`,
+        [b.country || '', b.phone || '', b.website || '', b.billing_address || '', b.shipping_address || '', b.ownership || '', b.industry || '', b.annual_revenue || '', b.merge_id]);
+      return res.json({ ok: true, merged: true, account_id: b.merge_id });
+    }
     const id = 'ACC-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
     await pool.query(
       `INSERT INTO sales_accounts (account_id, user_email, company_name, country, phone, website, billing_address, shipping_address, ownership, industry, annual_revenue, active, status)
@@ -1823,6 +1870,92 @@ app.post('/sales/accounts', async (req, res) => {
        b.billing_address || '', b.shipping_address || '', b.ownership || '', b.industry || '', b.annual_revenue || '',
        (b.active === false ? false : true), (b.active === false ? 'Inactive' : 'Active')]);
     return res.json({ ok: true, account_id: id });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---- Contracts ----
+app.get('/sales/contracts', async (req, res) => {
+  try { await ensureSchema(); const { rows } = await pool.query('SELECT * FROM sales_contracts ORDER BY created_at DESC'); return res.json({ contracts: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/sales/contracts', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body;
+    if (!b.account && !b.customer_signed_by) return res.status(400).json({ error: 'Please choose an account for the contract.' });
+    const id = 'CON-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    const num = b.contract_number || ('CN-' + Date.now().toString().slice(-6));
+    await pool.query(
+      `INSERT INTO sales_contracts (contract_id, contract_number, user_email, account, start_date, end_date, term_months, address, customer_signed_by, company_signed_by, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [id, num, b.user_email || '', b.account || '', b.start_date || null, b.end_date || null,
+       b.term_months ? parseInt(b.term_months, 10) : null, b.address || '', b.customer_signed_by || '', b.company_signed_by || '', b.status || 'Draft']);
+    return res.json({ ok: true, contract_id: id, contract_number: num });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/sales/contracts/:id', async (req, res) => {
+  try {
+    const fields = ['account', 'start_date', 'end_date', 'term_months', 'address', 'customer_signed_by', 'company_signed_by', 'status'];
+    const sets = [], vals = []; let i = 1;
+    fields.forEach(f => { if (req.body[f] !== undefined) { const v = (f === 'start_date' || f === 'end_date') && req.body[f] === '' ? null : req.body[f]; sets.push(f + ' = $' + i); vals.push(v); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE sales_contracts SET ' + sets.join(', ') + ' WHERE contract_id = $' + i, vals);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+function buildContractHtml(con, print) {
+  const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const d = s => s ? new Date(s).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' }) : '—';
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Contract ${esc(con.contract_number)}</title>
+  <style>body{font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;max-width:820px;margin:28px auto;padding:0 28px;line-height:1.6}
+  .top{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid #4f46e5;padding-bottom:14px}
+  .brand{font-size:22px;font-weight:800;color:#4f46e5}.muted{color:#64748b;font-size:13px}
+  h1{font-size:20px;margin:22px 0 4px}.badge{display:inline-block;background:#eef2ff;color:#4f46e5;font-weight:700;font-size:12px;padding:3px 10px;border-radius:999px}
+  table{width:100%;border-collapse:collapse;margin:16px 0}td{padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:14px;vertical-align:top}
+  td.k{color:#64748b;font-weight:600;width:210px}.sign{display:flex;gap:40px;margin-top:48px}.sign div{flex:1;border-top:1px solid #334155;padding-top:6px;font-size:13px;color:#475569}
+  .note{font-size:12px;color:#94a3b8;margin-top:40px;border-top:1px solid #e2e8f0;padding-top:12px}</style></head>
+  <body>
+  <div class="top"><div><div class="brand">Avanciers</div><div class="muted">Service Agreement / Contract</div></div>
+  <div style="text-align:right"><div class="badge">${esc(con.status || 'Draft')}</div><div class="muted" style="margin-top:6px">Contract No. <b>${esc(con.contract_number)}</b></div></div></div>
+  <h1>Contract — ${esc(con.account || 'Client')}</h1>
+  <table>
+    <tr><td class="k">Account</td><td>${esc(con.account)}</td></tr>
+    <tr><td class="k">Contract Start Date</td><td>${d(con.start_date)}</td></tr>
+    <tr><td class="k">Contract End Date</td><td>${d(con.end_date)}</td></tr>
+    <tr><td class="k">Contract Term</td><td>${esc(con.term_months || '—')} month(s)</td></tr>
+    <tr><td class="k">Address</td><td>${esc(con.address)}</td></tr>
+    <tr><td class="k">Status</td><td>${esc(con.status)}</td></tr>
+  </table>
+  <p>This agreement is entered into between <b>Avanciers</b> ("Company") and <b>${esc(con.account || 'the Client')}</b> ("Customer") for the term and conditions set out above. By signing below, both parties agree to the terms of this contract.</p>
+  <div class="sign">
+    <div><b>Customer Signed By</b><br>${esc(con.customer_signed_by || '____________________')}</div>
+    <div><b>Company Signed By</b><br>${esc(con.company_signed_by || '____________________')} · Avanciers</div>
+  </div>
+  <div class="note">Generated by Recruit 360 · ${new Date().toLocaleString('en-GB')}</div>
+  ${print ? '<script>window.onload=function(){window.print()}</script>' : ''}
+  </body></html>`;
+}
+// Print-ready contract page (opens in a tab; user saves as PDF).
+app.get('/sales/contracts/:id/html', async (req, res) => {
+  try {
+    const con = (await pool.query('SELECT * FROM sales_contracts WHERE contract_id = $1', [req.params.id])).rows[0];
+    if (!con) return res.status(404).send('Contract not found');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(buildContractHtml(con, req.query.print === '1'));
+  } catch (e) { return res.status(500).send(e.message); }
+});
+// Email the contract to the client (HTML body). Uses the same mail setup as the rest of the app.
+app.post('/sales/contracts/:id/email', async (req, res) => {
+  try {
+    const con = (await pool.query('SELECT * FROM sales_contracts WHERE contract_id = $1', [req.params.id])).rows[0];
+    if (!con) return res.status(404).json({ error: 'Contract not found' });
+    let to = req.body.to || '';
+    if (!to && con.account) { const a = (await pool.query('SELECT email FROM sales_contacts WHERE account = $1 AND email <> \'\' LIMIT 1', [con.account])).rows[0]; to = a ? a.email : ''; }
+    if (!to) return res.status(400).json({ error: 'No client email found. Add a contact email for this account, or pass one.' });
+    const sent = await sendEmail({ to, subject: `Contract ${con.contract_number} — Avanciers`, body: buildContractHtml(con, false), html: true });
+    return res.json({ ok: true, to, sent });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -1873,7 +2006,8 @@ app.post('/sales/leads/:id/convert', async (req, res) => {
       [oppId, who, oppName, accName, ctcName, (b.stage || 'Qualification'), (b.close_date || null),
        (b.amount ? Number(b.amount) : null), (b.status || 'Open')]);
 
-    await pool.query("UPDATE sales_leads SET status = 'Converted', converted = TRUE WHERE lead_id = $1", [req.params.id]);
+    // A converted lead is a Won deal and becomes locked (no further edits).
+    await pool.query("UPDATE sales_leads SET status = 'Won', converted = TRUE WHERE lead_id = $1", [req.params.id]);
     return res.json({ ok: true, account_id: accId, contact_id: ctcId, opp_id: oppId, account_name: accName, contact_name: ctcName, opportunity_name: oppName });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -1932,10 +2066,10 @@ app.post('/admin/users', async (req, res) => {
     const pw = b.password || process.env.SEED_PASSWORD || 'Avanciers@360';
     const { salt, hash } = hashPassword(pw);
     await pool.query(
-      `INSERT INTO app_users (user_id, full_name, email, role, user_group, phone, active, password_hash, password_salt)
-       VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7,$8)
-       ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, email = EXCLUDED.email, role = EXCLUDED.role, active = TRUE`,
-      [user_id, b.full_name, b.email || '', b.role, b.user_group || '', b.phone || '', hash, salt]
+      `INSERT INTO app_users (user_id, full_name, email, role, user_group, phone, department, country, active, password_hash, password_salt)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10)
+       ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, email = EXCLUDED.email, role = EXCLUDED.role, department = EXCLUDED.department, country = EXCLUDED.country, active = TRUE`,
+      [user_id, b.full_name, b.email || '', b.role, b.user_group || '', b.phone || '', b.department || '', b.country || 'India', hash, salt]
     );
     return res.json({ ok: true, user_id, email: b.email || '', password: pw });
   } catch (e) { return res.status(500).json({ error: e.message }); }
@@ -1949,7 +2083,7 @@ app.post('/auth/login', async (req, res) => {
     const password = String(req.body?.password || '');
     if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
     const { rows } = await pool.query(
-      `SELECT user_id, full_name, email, role, password_hash, password_salt FROM app_users
+      `SELECT user_id, full_name, email, role, department, country, password_hash, password_salt FROM app_users
         WHERE LOWER(email) = $1 AND active = TRUE
         ORDER BY (password_hash IS NOT NULL) DESC, created_at DESC LIMIT 1`, [email]);
     const u = rows[0];
@@ -1957,7 +2091,7 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
     const initials = String(u.full_name || u.email).split(/\s+/).map(s => s[0]).join('').slice(0, 2).toUpperCase();
-    return res.json({ user: { name: u.full_name, email: u.email, role: u.role, userId: u.user_id, initials } });
+    return res.json({ user: { name: u.full_name, email: u.email, role: u.role, userId: u.user_id, department: u.department || '', country: u.country || 'India', initials } });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -1965,7 +2099,7 @@ app.post('/auth/login', async (req, res) => {
 app.get('/auth/users', async (req, res) => {
   try {
     await ensureAuth();
-    const { rows } = await pool.query("SELECT user_id, full_name, email, role, active FROM app_users WHERE active = TRUE ORDER BY role, full_name");
+    const { rows } = await pool.query("SELECT user_id, full_name, email, role, department, country, active FROM app_users WHERE active = TRUE ORDER BY role, full_name");
     return res.json({ users: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -4025,6 +4159,7 @@ async function ensureSchema() {
     await pool.query("ALTER TABLE sales_contacts ADD COLUMN IF NOT EXISTS account TEXT");
     await pool.query("ALTER TABLE sales_contacts ADD COLUMN IF NOT EXISTS department TEXT");
     await pool.query("ALTER TABLE sales_contacts ADD COLUMN IF NOT EXISTS role TEXT");
+    await pool.query("ALTER TABLE sales_contacts ADD COLUMN IF NOT EXISTS gender TEXT");
     // Activity log (tasks / calls / events / emails) that can hang off any sales record.
     await pool.query(`CREATE TABLE IF NOT EXISTS sales_activities (
       activity_id TEXT PRIMARY KEY,
@@ -4041,6 +4176,24 @@ async function ensureSchema() {
     await pool.query('CREATE INDEX IF NOT EXISTS idx_sales_activities_parent ON sales_activities (parent_type, parent_id)');
     // Mark on a lead once it has been converted.
     await pool.query("ALTER TABLE sales_leads ADD COLUMN IF NOT EXISTS converted BOOLEAN DEFAULT FALSE");
+    // Contracts.
+    await pool.query(`CREATE TABLE IF NOT EXISTS sales_contracts (
+      contract_id       TEXT PRIMARY KEY,
+      contract_number   TEXT,
+      created_at        TIMESTAMPTZ DEFAULT NOW(),
+      user_email        TEXT,
+      account           TEXT,
+      start_date        DATE,
+      end_date          DATE,
+      term_months       INTEGER,
+      address           TEXT,
+      customer_signed_by TEXT,
+      company_signed_by  TEXT,
+      status            TEXT DEFAULT 'Draft'
+    )`);
+    // Sales users carry a department + home country (auto-filled, non-editable in the UI).
+    await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS department TEXT");
+    await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'India'");
     await pool.query(`CREATE TABLE IF NOT EXISTS user_settings (
       user_key   TEXT PRIMARY KEY,
       prefs      JSONB DEFAULT '{}',
