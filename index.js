@@ -90,7 +90,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-09-v17-sales-polish';
+const BUILD_TAG = '2026-10-09-v20-dedupe-hardening';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1813,7 +1813,7 @@ app.post('/sales/contacts', async (req, res) => {
     if (!b.full_name && !b.email) return res.status(400).json({ error: 'Please add a name or email.' });
     // Duplicate check (same name) — offer merge unless caller forced create or chose a merge target.
     if (b.full_name && !b.force && !b.merge_id) {
-      const dup = (await pool.query('SELECT * FROM sales_contacts WHERE LOWER(full_name) = LOWER($1) LIMIT 1', [b.full_name])).rows[0];
+      const dup = (await pool.query('SELECT * FROM sales_contacts WHERE LOWER(TRIM(full_name)) = LOWER(TRIM($1)) LIMIT 1', [b.full_name])).rows[0];
       if (dup) return res.status(409).json({ duplicate: true, type: 'contact', existing: dup });
     }
     if (b.merge_id) {
@@ -1848,7 +1848,7 @@ app.post('/sales/accounts', async (req, res) => {
     if (!b.company_name) return res.status(400).json({ error: 'Please add a company name.' });
     // Duplicate check (same company name) — offer merge unless caller forced create or chose a merge target.
     if (!b.force && !b.merge_id) {
-      const dup = (await pool.query('SELECT * FROM sales_accounts WHERE LOWER(company_name) = LOWER($1) LIMIT 1', [b.company_name])).rows[0];
+      const dup = (await pool.query('SELECT * FROM sales_accounts WHERE LOWER(TRIM(company_name)) = LOWER(TRIM($1)) LIMIT 1', [b.company_name])).rows[0];
       if (dup) return res.status(409).json({ duplicate: true, type: 'account', existing: dup });
     }
     if (b.merge_id) {
@@ -1895,7 +1895,7 @@ app.post('/sales/contracts', async (req, res) => {
 });
 app.patch('/sales/contracts/:id', async (req, res) => {
   try {
-    const fields = ['account', 'start_date', 'end_date', 'term_months', 'address', 'customer_signed_by', 'company_signed_by', 'status'];
+    const fields = ['account', 'start_date', 'end_date', 'term_months', 'address', 'customer_signed_by', 'company_signed_by', 'status', 'ai_cover_note'];
     const sets = [], vals = []; let i = 1;
     fields.forEach(f => { if (req.body[f] !== undefined) { const v = (f === 'start_date' || f === 'end_date') && req.body[f] === '' ? null : req.body[f]; sets.push(f + ' = $' + i); vals.push(v); i++; } });
     if (!sets.length) return res.json({ ok: true });
@@ -1915,25 +1915,44 @@ function buildContractHtml(con, print) {
   h1{font-size:20px;margin:22px 0 4px}.badge{display:inline-block;background:#eef2ff;color:#4f46e5;font-weight:700;font-size:12px;padding:3px 10px;border-radius:999px}
   table{width:100%;border-collapse:collapse;margin:16px 0}td{padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:14px;vertical-align:top}
   td.k{color:#64748b;font-weight:600;width:210px}.sign{display:flex;gap:40px;margin-top:48px}.sign div{flex:1;border-top:1px solid #334155;padding-top:6px;font-size:13px;color:#475569}
+  h2{font-size:15px;margin:26px 0 8px;color:#0f172a}
+  ol.terms{padding-left:18px;margin:8px 0}ol.terms>li{margin:9px 0;font-size:13.5px}ol.terms>li>b{color:#0f172a}
+  .intro{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px 16px;font-size:13.5px}
   .note{font-size:12px;color:#94a3b8;margin-top:40px;border-top:1px solid #e2e8f0;padding-top:12px}</style></head>
   <body>
-  <div class="top"><div><div class="brand">Avanciers</div><div class="muted">Service Agreement / Contract</div></div>
+  <div class="top"><div><div class="brand">Avanciers</div><div class="muted">Staffing &amp; Recruitment Services Agreement</div></div>
   <div style="text-align:right"><div class="badge">${esc(con.status || 'Draft')}</div><div class="muted" style="margin-top:6px">Contract No. <b>${esc(con.contract_number)}</b></div></div></div>
-  <h1>Contract — ${esc(con.account || 'Client')}</h1>
+  <h1>Services Agreement — ${esc(con.account || 'Client')}</h1>
+  <p class="intro">This Staffing &amp; Recruitment Services Agreement (the "Agreement") is made effective as of <b>${d(con.start_date)}</b> between <b>Avanciers</b> ("Company"), and <b>${esc(con.account || 'the Client')}</b> ("Customer"), located at ${esc(con.address) || '—'}. The parties agree to the particulars and terms set out below.</p>
   <table>
-    <tr><td class="k">Account</td><td>${esc(con.account)}</td></tr>
-    <tr><td class="k">Contract Start Date</td><td>${d(con.start_date)}</td></tr>
-    <tr><td class="k">Contract End Date</td><td>${d(con.end_date)}</td></tr>
-    <tr><td class="k">Contract Term</td><td>${esc(con.term_months || '—')} month(s)</td></tr>
-    <tr><td class="k">Address</td><td>${esc(con.address)}</td></tr>
+    <tr><td class="k">Customer / Account</td><td>${esc(con.account)}</td></tr>
+    <tr><td class="k">Registered Address</td><td>${esc(con.address)}</td></tr>
+    <tr><td class="k">Effective (Start) Date</td><td>${d(con.start_date)}</td></tr>
+    <tr><td class="k">End Date</td><td>${d(con.end_date)}</td></tr>
+    <tr><td class="k">Term</td><td>${esc(con.term_months || '—')} month(s)</td></tr>
     <tr><td class="k">Status</td><td>${esc(con.status)}</td></tr>
   </table>
-  <p>This agreement is entered into between <b>Avanciers</b> ("Company") and <b>${esc(con.account || 'the Client')}</b> ("Customer") for the term and conditions set out above. By signing below, both parties agree to the terms of this contract.</p>
+  ${con.ai_cover_note ? `<div style="background:#eef2ff;border-left:4px solid #4f46e5;border-radius:6px;padding:12px 16px;margin:16px 0;font-size:13.5px;line-height:1.6"><div style="font-size:11px;font-weight:700;color:#4f46e5;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Engagement Summary</div>${esc(con.ai_cover_note)}</div>` : ''}
+  <h2>Terms &amp; Conditions</h2>
+  <ol class="terms">
+    <li><b>Scope of Services.</b> The Company shall provide recruitment and staffing services, sourcing and presenting qualified candidates for the Customer's open positions for the duration of this Agreement.</li>
+    <li><b>Term &amp; Renewal.</b> This Agreement is effective from the Start Date and continues until the End Date stated above (${esc(con.term_months || '—')} month term), renewable by mutual written consent of both parties.</li>
+    <li><b>Fees &amp; Payment.</b> The Customer shall pay the agreed service fees per the commercial schedule shared separately. Invoices are payable within thirty (30) days of the invoice date unless otherwise agreed in writing.</li>
+    <li><b>Replacement Guarantee.</b> Should a placed candidate leave or be terminated for cause within ninety (90) days of joining, the Company will source a suitable replacement at no additional placement fee, subject to cleared invoices.</li>
+    <li><b>Confidentiality.</b> Each party shall keep confidential all non-public information, candidate data and business information disclosed under this Agreement and use it solely for the purpose of the engagement.</li>
+    <li><b>Non-Solicitation.</b> During the term and for twelve (12) months thereafter, neither party shall directly solicit the other's employees introduced through this engagement without prior written consent.</li>
+    <li><b>Data Protection &amp; Compliance.</b> Both parties shall comply with applicable data-protection and employment laws. Candidate personal data shall be processed only for lawful recruitment purposes.</li>
+    <li><b>Equal Opportunity.</b> The Company presents candidates without discrimination on the basis of race, gender, religion, age, disability or any other protected characteristic.</li>
+    <li><b>Limitation of Liability.</b> The Company's total liability under this Agreement shall not exceed the fees paid by the Customer in the three (3) months preceding the event giving rise to the claim.</li>
+    <li><b>Termination.</b> Either party may terminate this Agreement with thirty (30) days' written notice. Fees for candidates already placed or in process remain payable.</li>
+    <li><b>Governing Law.</b> This Agreement shall be governed by and construed in accordance with the applicable laws of the Customer's jurisdiction.</li>
+  </ol>
+  <p style="font-size:13.5px;margin-top:14px">By signing below, both parties acknowledge that they have read, understood and agreed to the terms of this Agreement.</p>
   <div class="sign">
-    <div><b>Customer Signed By</b><br>${esc(con.customer_signed_by || '____________________')}</div>
-    <div><b>Company Signed By</b><br>${esc(con.company_signed_by || '____________________')} · Avanciers</div>
+    <div><b>Customer Signed By</b><br>${esc(con.customer_signed_by || '____________________')}<br><span class="muted">${esc(con.account || '')}</span></div>
+    <div><b>Company Signed By</b><br>${esc(con.company_signed_by || '____________________')}<br><span class="muted">Avanciers</span></div>
   </div>
-  <div class="note">Generated by Recruit 360 · ${new Date().toLocaleString('en-GB')}</div>
+  <div class="note">This is a system-generated agreement produced by Recruit 360 from Avanciers' standard template · ${new Date().toLocaleString('en-GB')}</div>
   ${print ? '<script>window.onload=function(){window.print()}</script>' : ''}
   </body></html>`;
 }
@@ -1945,6 +1964,35 @@ app.get('/sales/contracts/:id/html', async (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.send(buildContractHtml(con, req.query.print === '1'));
   } catch (e) { return res.status(500).send(e.message); }
+});
+// AI "smart summary" — Gemini writes a short personalised engagement note for the client.
+// The legal clauses stay fixed; only this opening paragraph is AI-generated, and it is saved
+// so the same text shows in the preview, the PDF and the emailed copy. Recruiter reviews before sending.
+app.post('/sales/contracts/:id/generate-note', async (req, res) => {
+  try {
+    await ensureSchema();
+    const con = (await pool.query('SELECT * FROM sales_contracts WHERE contract_id = $1', [req.params.id])).rows[0];
+    if (!con) return res.status(404).json({ error: 'Contract not found' });
+    // Pull a little context about the account so the note is specific, not generic.
+    let industry = '', country = '';
+    if (con.account) {
+      const a = (await pool.query('SELECT industry, country FROM sales_accounts WHERE LOWER(company_name) = LOWER($1) LIMIT 1', [con.account])).rows[0];
+      if (a) { industry = a.industry || ''; country = a.country || ''; }
+    }
+    const term = con.term_months ? con.term_months + '-month' : '';
+    const prompt = 'You are writing one short, warm, professional opening paragraph for a staffing & recruitment services agreement between Avanciers (a recruitment firm) and a client. '
+      + 'Write 2-3 sentences only, addressed to the client, welcoming the partnership and briefly noting the purpose of the engagement. '
+      + 'Do NOT invent fees, numbers, legal terms, dates or guarantees — those live in the fixed clauses. Plain text, no markdown, no greeting line, no signature.\n\n'
+      + 'Client / Account: ' + (con.account || 'the client') + '\n'
+      + (industry ? 'Industry: ' + industry + '\n' : '')
+      + (country ? 'Country: ' + country + '\n' : '')
+      + (term ? 'Engagement term: ' + term + '\n' : '');
+    const gen = await genModel.generateContent(prompt);
+    let note = gen.response.candidates[0].content.parts[0].text.trim();
+    note = note.replace(/^["']|["']$/g, '').trim();
+    await pool.query('UPDATE sales_contracts SET ai_cover_note = $1 WHERE contract_id = $2', [note, req.params.id]);
+    return res.json({ ok: true, ai_cover_note: note });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 // Email the contract to the client (HTML body). Uses the same mail setup as the rest of the app.
 app.post('/sales/contracts/:id/email', async (req, res) => {
@@ -1987,17 +2035,31 @@ app.post('/sales/leads/:id/convert', async (req, res) => {
     const ctcName = (b.contact_name || lead.email || accName).trim();
     const oppName = (b.opportunity_name || (accName + ' — Opportunity')).trim();
 
-    const accId = 'ACC-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
-    await pool.query(
-      `INSERT INTO sales_accounts (account_id, user_email, company_name, country, phone, website, industry, active, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,'Active')`,
-      [accId, who, accName, lead.country || '', lead.phone || '', '', '']);
+    // Reuse an existing account with the same name instead of creating a duplicate.
+    let accId;
+    const accDup = (await pool.query('SELECT account_id FROM sales_accounts WHERE LOWER(TRIM(company_name)) = LOWER(TRIM($1)) LIMIT 1', [accName])).rows[0];
+    if (accDup) {
+      accId = accDup.account_id;
+    } else {
+      accId = 'ACC-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+      await pool.query(
+        `INSERT INTO sales_accounts (account_id, user_email, company_name, country, phone, website, industry, active, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,'Active')`,
+        [accId, who, accName, lead.country || '', lead.phone || '', '', '']);
+    }
 
-    const ctcId = 'SCT-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
-    await pool.query(
-      `INSERT INTO sales_contacts (contact_id, user_email, full_name, account, phone, email, department, role)
-       VALUES ($1,$2,$3,$4,$5,$6,'','Decision Maker')`,
-      [ctcId, who, ctcName, accName, (b.contact_phone || lead.phone || ''), (b.contact_email || lead.email || '')]);
+    // Reuse an existing contact with the same name under this account instead of duplicating.
+    let ctcId;
+    const ctcDup = (await pool.query('SELECT contact_id FROM sales_contacts WHERE LOWER(TRIM(full_name)) = LOWER(TRIM($1)) LIMIT 1', [ctcName])).rows[0];
+    if (ctcDup) {
+      ctcId = ctcDup.contact_id;
+    } else {
+      ctcId = 'SCT-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+      await pool.query(
+        `INSERT INTO sales_contacts (contact_id, user_email, full_name, account, phone, email, department, role)
+         VALUES ($1,$2,$3,$4,$5,$6,'','Decision Maker')`,
+        [ctcId, who, ctcName, accName, (b.contact_phone || lead.phone || ''), (b.contact_email || lead.email || '')]);
+    }
 
     const oppId = 'OPP-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
     await pool.query(
@@ -4191,6 +4253,7 @@ async function ensureSchema() {
       company_signed_by  TEXT,
       status            TEXT DEFAULT 'Draft'
     )`);
+    await pool.query("ALTER TABLE sales_contracts ADD COLUMN IF NOT EXISTS ai_cover_note TEXT");
     // Sales users carry a department + home country (auto-filled, non-editable in the UI).
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS department TEXT");
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'India'");
