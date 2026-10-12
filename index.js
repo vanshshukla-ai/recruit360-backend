@@ -43,6 +43,7 @@ async function ensureAuth() {
       ['USR-HM-PUSHPAM', 'Pushpam Singh', 'pushpam.singh@avanciers.com', 'hiring_manager'],
       ['USR-REC-NEHA', 'Neha Das', 'neha.das@avanciers.com', 'recruiter'],
       ['USR-REC-SHUBHAM', 'Shubham Swarup', 'shubham.swarup@avanciers.com', 'recruiter'],
+      ['USR-SALES-VANSH', 'Vansh Shukla', 'vansh.shukla@avanciers.com', 'sales'],
     ];
     for (const [uid, name, email, role] of seed) {
       const { salt, hash } = hashPassword(def);
@@ -55,6 +56,8 @@ async function ensureAuth() {
         [uid, name, email, role, hash, salt]
       );
     }
+    // The Sales user belongs to the Sales department (drives the Sales-only workspace).
+    await pool.query("UPDATE app_users SET department = 'Sales' WHERE user_id = 'USR-SALES-VANSH'");
     // Clean up so only the intended testers (plus anyone the admin adds) are active.
     // 1) Deactivate known legacy demo accounts.
     const legacy = ['admin@avanciers.com', 'rajesh.kumar@avanciers.com', 'riya.sharma@avanciers.com', 'amit.verma@avanciers.com', 'sofia.rossi@avanciers.com', 'test.rec@avanciers.com'];
@@ -90,7 +93,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-09-v20-dedupe-hardening';
+const BUILD_TAG = '2026-10-12-v21-sales-login-requirements';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -2004,6 +2007,91 @@ app.post('/sales/contracts/:id/email', async (req, res) => {
     if (!to) return res.status(400).json({ error: 'No client email found. Add a contact email for this account, or pass one.' });
     const sent = await sendEmail({ to, subject: `Contract ${con.contract_number} — Avanciers`, body: buildContractHtml(con, false), html: true });
     return res.json({ ok: true, to, sent });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---- Edit existing Account / Contact / Opportunity (edit on every tab) ----
+app.patch('/sales/accounts/:id', async (req, res) => {
+  try {
+    const fields = ['company_name', 'country', 'phone', 'website', 'billing_address', 'shipping_address', 'ownership', 'industry', 'annual_revenue', 'active', 'status'];
+    const sets = [], vals = []; let i = 1;
+    fields.forEach(f => { if (req.body[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(req.body[f]); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE sales_accounts SET ' + sets.join(', ') + ' WHERE account_id = $' + i, vals);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/sales/contacts/:id', async (req, res) => {
+  try {
+    const fields = ['full_name', 'account', 'phone', 'email', 'department', 'role', 'gender'];
+    const sets = [], vals = []; let i = 1;
+    fields.forEach(f => { if (req.body[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(req.body[f]); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE sales_contacts SET ' + sets.join(', ') + ' WHERE contact_id = $' + i, vals);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/sales/opportunities/:id', async (req, res) => {
+  try {
+    const fields = ['name', 'account', 'contact', 'stage', 'open_date', 'close_date', 'amount', 'status'];
+    const sets = [], vals = []; let i = 1;
+    fields.forEach(f => { if (req.body[f] !== undefined) { const v = (f === 'open_date' || f === 'close_date') && req.body[f] === '' ? null : req.body[f]; sets.push(f + ' = $' + i); vals.push(v); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE sales_opportunities SET ' + sets.join(', ') + ' WHERE opp_id = $' + i, vals);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---- Hiring managers list (for the Requirement hand-off dropdown) ----
+app.get('/sales/hiring-managers', async (req, res) => {
+  try {
+    await ensureSchema();
+    const { rows } = await pool.query("SELECT user_id, full_name, email FROM app_users WHERE role = 'hiring_manager' AND active = TRUE ORDER BY full_name");
+    return res.json({ hiring_managers: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---- Requirements: Sales raises a requirement from an Opportunity and hands it to a Hiring Manager ----
+app.get('/sales/requirements', async (req, res) => {
+  try { await ensureSchema(); const { rows } = await pool.query('SELECT * FROM sales_requirements ORDER BY created_at DESC'); return res.json({ requirements: rows }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/sales/requirements', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body || {};
+    if (!b.title) return res.status(400).json({ error: 'A job title is required.' });
+    const id = 'SRQ-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    const num = b.req_number || ('REQ-' + Math.floor(1000 + Math.random() * 9000));
+    await pool.query(
+      `INSERT INTO sales_requirements (requirement_id, req_number, user_email, requirement_type, title, account, opportunity,
+         openings, location, work_model, employment_type, duration, target_start_date, currency, client_bill_rate,
+         expected_pay, margin, contract_type, assigned_hiring_manager, workflow_template, status, payload)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+      [id, num, b.user_email || '', b.requirement_type || '', b.title || '', b.account || '', b.opportunity || '',
+       b.openings ? parseInt(b.openings, 10) : 1, b.location || '', b.work_model || '', b.employment_type || '', b.duration || '',
+       b.target_start_date || null, b.currency || '', b.client_bill_rate || '', b.expected_pay || '', b.margin || '',
+       b.contract_type || '', b.assigned_hiring_manager || '', b.workflow_template || '', b.status || 'Draft',
+       JSON.stringify(b.payload || {})]);
+    // Notify the assigned hiring manager when a requirement is submitted.
+    if ((b.status || '') === 'Submitted' && b.assigned_hiring_manager) {
+      try { await notify({ recipient: b.assigned_hiring_manager, type: 'REQUIREMENT', message: `New requirement ${num} — "${b.title}" submitted by Sales for ${b.account || 'a client'}.` }); } catch (e) {}
+    }
+    return res.json({ ok: true, requirement_id: id, req_number: num });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/sales/requirements/:id', async (req, res) => {
+  try {
+    const fields = ['status', 'assigned_hiring_manager', 'title', 'openings', 'location', 'work_model'];
+    const sets = [], vals = []; let i = 1;
+    fields.forEach(f => { if (req.body[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(req.body[f]); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE sales_requirements SET ' + sets.join(', ') + ' WHERE requirement_id = $' + i, vals);
+    return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -4254,6 +4342,32 @@ async function ensureSchema() {
       status            TEXT DEFAULT 'Draft'
     )`);
     await pool.query("ALTER TABLE sales_contracts ADD COLUMN IF NOT EXISTS ai_cover_note TEXT");
+    // Requirements raised by Sales from an Opportunity and handed off to a Hiring Manager.
+    await pool.query(`CREATE TABLE IF NOT EXISTS sales_requirements (
+      requirement_id    TEXT PRIMARY KEY,
+      req_number        TEXT,
+      created_at        TIMESTAMPTZ DEFAULT NOW(),
+      user_email        TEXT,
+      requirement_type  TEXT,
+      title             TEXT,
+      account           TEXT,
+      opportunity       TEXT,
+      openings          INTEGER DEFAULT 1,
+      location          TEXT,
+      work_model        TEXT,
+      employment_type   TEXT,
+      duration          TEXT,
+      target_start_date DATE,
+      currency          TEXT,
+      client_bill_rate  TEXT,
+      expected_pay      TEXT,
+      margin            TEXT,
+      contract_type     TEXT,
+      assigned_hiring_manager TEXT,
+      workflow_template TEXT,
+      status            TEXT DEFAULT 'Draft',
+      payload           JSONB DEFAULT '{}'
+    )`);
     // Sales users carry a department + home country (auto-filled, non-editable in the UI).
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS department TEXT");
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'India'");
