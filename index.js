@@ -93,7 +93,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-12-v21-sales-login-requirements';
+const BUILD_TAG = '2026-10-12-v22-sales-sees-all-leads';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1744,11 +1744,12 @@ app.delete('/admin/clients/:id/contacts/:contactId', async (req, res) => {
 app.get('/sales/leads', async (req, res) => {
   try {
     await ensureSchema();
-    // Email security: a non-admin only sees the leads they own; admin sees all.
+    // Visibility: admin and the Sales team see the whole pipeline; other roles see only the leads they own.
     const role = req.query.role || '';
     const email = req.query.email || '';
+    const seesAll = role === 'admin' || role === 'sales' || !role;
     let rows;
-    if (role && role !== 'admin' && email) rows = (await pool.query('SELECT * FROM sales_leads WHERE user_email = $1 ORDER BY created_at DESC', [email])).rows;
+    if (!seesAll && email) rows = (await pool.query('SELECT * FROM sales_leads WHERE user_email = $1 ORDER BY created_at DESC', [email])).rows;
     else rows = (await pool.query('SELECT * FROM sales_leads ORDER BY created_at DESC')).rows;
     return res.json({ leads: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
