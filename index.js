@@ -93,7 +93,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-12-v22-sales-sees-all-leads';
+const BUILD_TAG = '2026-10-13-v24-edit-user-access';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -2077,9 +2077,32 @@ app.post('/sales/requirements', async (req, res) => {
        b.target_start_date || null, b.currency || '', b.client_bill_rate || '', b.expected_pay || '', b.margin || '',
        b.contract_type || '', b.assigned_hiring_manager || '', b.workflow_template || '', b.status || 'Draft',
        JSON.stringify(b.payload || {})]);
-    // Notify the assigned hiring manager when a requirement is submitted.
+    // Notify the assigned hiring manager when a requirement is submitted — in-app notification + email.
     if ((b.status || '') === 'Submitted' && b.assigned_hiring_manager) {
-      try { await notify({ recipient: b.assigned_hiring_manager, type: 'REQUIREMENT', message: `New requirement ${num} — "${b.title}" submitted by Sales for ${b.account || 'a client'}.` }); } catch (e) {}
+      const msg = `New requirement ${num} — "${b.title}" submitted by Sales for ${b.account || 'a client'}.`;
+      try { await notify({ recipient: b.assigned_hiring_manager, type: 'REQUIREMENT', message: msg }); } catch (e) {}
+      try {
+        const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+        const hm = (await pool.query("SELECT email FROM app_users WHERE full_name = $1 AND email <> '' LIMIT 1", [b.assigned_hiring_manager])).rows[0];
+        if (hm && hm.email) {
+          const html = `<div style="font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;max-width:560px">
+            <div style="background:#4f46e5;color:#fff;padding:14px 18px;border-radius:10px 10px 0 0;font-weight:700">Avanciers · New Requirement</div>
+            <div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:18px">
+              <p>Hi ${esc(b.assigned_hiring_manager)},</p>
+              <p>A new hiring requirement has been submitted by the Sales team and assigned to you.</p>
+              <table style="width:100%;border-collapse:collapse;font-size:14px">
+                <tr><td style="color:#64748b;padding:4px 0;width:140px">Requirement</td><td><b>${esc(num)}</b></td></tr>
+                <tr><td style="color:#64748b;padding:4px 0">Role</td><td>${esc(b.title)}</td></tr>
+                <tr><td style="color:#64748b;padding:4px 0">Client / Account</td><td>${esc(b.account || '—')}</td></tr>
+                <tr><td style="color:#64748b;padding:4px 0">Openings</td><td>${esc(b.openings || 1)}</td></tr>
+                <tr><td style="color:#64748b;padding:4px 0">Location</td><td>${esc(b.location || '—')}</td></tr>
+                <tr><td style="color:#64748b;padding:4px 0">Type</td><td>${esc(b.requirement_type || '—')}</td></tr>
+              </table>
+              <p style="margin-top:14px">Please log in to Recruit 360 to review and proceed.</p>
+            </div></div>`;
+          await sendEmail({ to: hm.email, subject: `New requirement ${num} — ${b.title}`, body: html, html: true });
+        }
+      } catch (e) {}
     }
     return res.json({ ok: true, requirement_id: id, req_number: num });
   } catch (e) { return res.status(500).json({ error: e.message }); }
@@ -2199,7 +2222,7 @@ app.patch('/sales/activities/:id', async (req, res) => {
 app.get('/admin/users', async (req, res) => {
   try {
     const { role } = req.query;
-    let sql = 'SELECT user_id, full_name, email, role, user_group, phone, active FROM app_users WHERE active = TRUE';
+    let sql = 'SELECT user_id, full_name, email, role, user_group, phone, department, country, modules, active FROM app_users WHERE active = TRUE';
     const params = [];
     if (role) { sql += ' AND role = $1'; params.push(role); }
     sql += ' ORDER BY role, full_name';
@@ -2216,13 +2239,28 @@ app.post('/admin/users', async (req, res) => {
     // Give every new user a login password so they can sign in and (for recruiters) appear in the assign dropdown.
     const pw = b.password || process.env.SEED_PASSWORD || 'Avanciers@360';
     const { salt, hash } = hashPassword(pw);
+    const modules = Array.isArray(b.modules) ? JSON.stringify(b.modules) : null;
     await pool.query(
-      `INSERT INTO app_users (user_id, full_name, email, role, user_group, phone, department, country, active, password_hash, password_salt)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10)
-       ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, email = EXCLUDED.email, role = EXCLUDED.role, department = EXCLUDED.department, country = EXCLUDED.country, active = TRUE`,
-      [user_id, b.full_name, b.email || '', b.role, b.user_group || '', b.phone || '', b.department || '', b.country || 'India', hash, salt]
+      `INSERT INTO app_users (user_id, full_name, email, role, user_group, phone, department, country, modules, active, password_hash, password_salt)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$11)
+       ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, email = EXCLUDED.email, role = EXCLUDED.role, department = EXCLUDED.department, country = EXCLUDED.country, modules = EXCLUDED.modules, active = TRUE`,
+      [user_id, b.full_name, b.email || '', b.role, b.user_group || '', b.phone || '', b.department || '', b.country || 'India', modules, hash, salt]
     );
     return res.json({ ok: true, user_id, email: b.email || '', password: pw });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Edit an existing user — partial update (role, module access, group, etc.). Production pattern: never delete-and-recreate.
+app.patch('/admin/users/:id', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const sets = [], vals = []; let i = 1;
+    const simple = ['full_name', 'email', 'role', 'department', 'country', 'user_group', 'phone'];
+    simple.forEach(f => { if (b[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(b[f]); i++; } });
+    if (b.modules !== undefined) { sets.push('modules = $' + i); vals.push(Array.isArray(b.modules) && b.modules.length ? JSON.stringify(b.modules) : null); i++; }
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE app_users SET ' + sets.join(', ') + ' WHERE user_id = $' + i, vals);
+    return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -2234,7 +2272,7 @@ app.post('/auth/login', async (req, res) => {
     const password = String(req.body?.password || '');
     if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
     const { rows } = await pool.query(
-      `SELECT user_id, full_name, email, role, department, country, password_hash, password_salt FROM app_users
+      `SELECT user_id, full_name, email, role, department, country, modules, password_hash, password_salt FROM app_users
         WHERE LOWER(email) = $1 AND active = TRUE
         ORDER BY (password_hash IS NOT NULL) DESC, created_at DESC LIMIT 1`, [email]);
     const u = rows[0];
@@ -2242,7 +2280,7 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
     const initials = String(u.full_name || u.email).split(/\s+/).map(s => s[0]).join('').slice(0, 2).toUpperCase();
-    return res.json({ user: { name: u.full_name, email: u.email, role: u.role, userId: u.user_id, department: u.department || '', country: u.country || 'India', initials } });
+    return res.json({ user: { name: u.full_name, email: u.email, role: u.role, userId: u.user_id, department: u.department || '', country: u.country || 'India', modules: Array.isArray(u.modules) ? u.modules : null, initials } });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -4372,6 +4410,8 @@ async function ensureSchema() {
     // Sales users carry a department + home country (auto-filled, non-editable in the UI).
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS department TEXT");
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'India'");
+    // Per-user module access (array of nav module ids). NULL/empty => fall back to the role's default modules.
+    await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS modules JSONB");
     await pool.query(`CREATE TABLE IF NOT EXISTS user_settings (
       user_key   TEXT PRIMARY KEY,
       prefs      JSONB DEFAULT '{}',
