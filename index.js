@@ -44,6 +44,7 @@ async function ensureAuth() {
       ['USR-REC-NEHA', 'Neha Das', 'neha.das@avanciers.com', 'recruiter'],
       ['USR-REC-SHUBHAM', 'Shubham Swarup', 'shubham.swarup@avanciers.com', 'recruiter'],
       ['USR-SALES-VANSH', 'Vansh Shukla', 'vansh.shukla@avanciers.com', 'sales'],
+      ['USR-HR-DIMPLE', 'Dimple HR', 'dimple.hr@avanciers.com', 'hr'],
     ];
     for (const [uid, name, email, role] of seed) {
       const { salt, hash } = hashPassword(def);
@@ -93,7 +94,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-13-v24-edit-user-access';
+const BUILD_TAG = '2026-10-14-v26-onboarding-candidate';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -2116,6 +2117,206 @@ app.patch('/sales/requirements/:id', async (req, res) => {
     vals.push(req.params.id);
     await pool.query('UPDATE sales_requirements SET ' + sets.join(', ') + ' WHERE requirement_id = $' + i, vals);
     return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ========================= ONBOARDING LIFECYCLE =========================
+// Standard checklist seeded on every new onboarding case (owners per Avanciers flow).
+const ONB_TASKS = [
+  ['Identity / duplicate check', 'Placement Validation', 'identity', true, 0],
+  ['Offer accepted & stored', 'Hiring Manager', 'offer', true, 2],
+  ['Candidate forms & details', 'Candidate', 'forms', true, 3],
+  ['Right-to-work / background', 'HR / Compliance', 'compliance', true, 4],
+  ['Banking & payroll setup', 'Candidate + Payroll', 'payroll', true, 5],
+  ['Client-specific documents', 'Hiring Manager', 'client-docs', true, 6],
+  ['Mobility (visa / travel / insurance)', 'HR + Finance', 'mobility', false, 8],
+];
+const ONB_DOCS = [
+  ['Government ID', 'Identity verification', true, 1],
+  ['Tax / payroll form', 'Payroll setup', true, 5],
+  ['Banking details', 'Salary payment setup', true, 5],
+  ['Signed Avanciers offer', 'Terms of engagement', true, 0],
+];
+function onbReadiness(tasks, docs) {
+  const rt = tasks.filter(t => t.required), rd = docs.filter(d => d.required);
+  const tDone = rt.filter(t => t.status === 'Completed').length;
+  const dDone = rd.filter(d => d.status === 'Verified').length;
+  const outstanding = [
+    ...rt.filter(t => t.status !== 'Completed').map(t => t.title),
+    ...rd.filter(d => d.status !== 'Verified').map(d => 'Document: ' + d.name),
+  ];
+  return { ready: outstanding.length === 0, outstanding,
+    tasks_done: tDone, tasks_total: rt.length, docs_done: dDone, docs_total: rd.length };
+}
+const onbProgress = (tasks) => ({ done: tasks.filter(t => t.status === 'Completed').length, total: tasks.length });
+
+app.get('/onboarding/cases', async (req, res) => {
+  try {
+    await ensureSchema();
+    const { owner, status } = req.query;
+    const cases = (await pool.query('SELECT * FROM onboarding_cases ORDER BY created_at DESC')).rows;
+    const out = [];
+    for (const c of cases) {
+      if (status && c.status !== status) continue;
+      if (owner && c.coordinator !== owner && c.recruiter !== owner && c.hiring_manager !== owner) continue;
+      const tasks = (await pool.query('SELECT required, status FROM onboarding_tasks WHERE case_id = $1', [c.case_id])).rows;
+      const docs = (await pool.query('SELECT required, status FROM onboarding_documents WHERE case_id = $1', [c.case_id])).rows;
+      out.push({ ...c, progress: onbProgress(tasks), readiness: onbReadiness(tasks, docs) });
+    }
+    return res.json({ cases: out });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/onboarding/cases', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body || {};
+    if (!b.candidate_name) return res.status(400).json({ error: 'Candidate name is required.' });
+    const id = 'ONC-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    const num = b.case_number || ('ONB-' + Math.floor(1000 + Math.random() * 9000));
+    const start = b.target_start_date || null;
+    await pool.query(
+      `INSERT INTO onboarding_cases (case_id, case_number, candidate_name, candidate_email, role_title, client,
+         requirement_ref, placement_ref, employment_type, entity, work_location, target_start_date,
+         recruiter, hiring_manager, coordinator, status, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+      [id, num, b.candidate_name, b.candidate_email || '', b.role_title || '', b.client || '',
+       b.requirement_ref || '', b.placement_ref || '', b.employment_type || 'Contractor • C2C', b.entity || 'Avanciers',
+       b.work_location || '', start, b.recruiter || '', b.hiring_manager || '', b.coordinator || b.recruiter || '',
+       'In Progress', b.notes || '']);
+    // Seed the standard checklist + documents.
+    const base = start ? new Date(start) : new Date();
+    const due = (off) => { const d = new Date(base); d.setDate(d.getDate() - 12 + off); return d.toISOString().slice(0, 10); };
+    for (const [title, owner, cat, req_, so] of ONB_TASKS) {
+      const tid = 'ONT-' + Date.now().toString().slice(-7) + Math.floor(Math.random() * 1000);
+      await pool.query('INSERT INTO onboarding_tasks (task_id, case_id, title, owner_role, category, required, due_date, status, sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+        [tid, id, title, owner, cat, req_, due(so), 'Not started', so]);
+    }
+    for (const [name, reason, req_, so] of ONB_DOCS) {
+      const did = 'OND-' + Date.now().toString().slice(-7) + Math.floor(Math.random() * 1000);
+      await pool.query('INSERT INTO onboarding_documents (doc_id, case_id, name, reason, required, due_date, status, sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+        [did, id, name, reason, req_, due(so), 'Requested', so]);
+    }
+    // Notify the HM and the candidate that onboarding has started.
+    try { if (b.hiring_manager) await notify({ recipient: b.hiring_manager, type: 'ONBOARDING', message: `Onboarding started for ${b.candidate_name} — ${num} (${b.role_title || 'role'} at ${b.client || 'client'}).` }); } catch (e) {}
+    try {
+      if (b.candidate_email) {
+        const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+        const html = `<div style="font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;max-width:560px">
+          <div style="background:#4f46e5;color:#fff;padding:14px 18px;border-radius:10px 10px 0 0;font-weight:700">Welcome to Avanciers — Onboarding</div>
+          <div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:18px">
+            <p>Hi ${esc(b.candidate_name)},</p>
+            <p>Your onboarding for <b>${esc(b.role_title || 'your assignment')}</b>${b.client ? ' at <b>' + esc(b.client) + '</b>' : ''} has started. Please log in to complete your personal details, upload the requested documents and finish payroll setup.</p>
+            ${start ? `<p><b>Target start date:</b> ${esc(start)}</p>` : ''}
+            <p>Our team will guide you through each step.</p>
+          </div></div>`;
+        await sendEmail({ to: b.candidate_email, subject: `Your Avanciers onboarding — ${b.role_title || 'assignment'}`, body: html, html: true });
+      }
+    } catch (e) {}
+    return res.json({ ok: true, case_id: id, case_number: num });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.get('/onboarding/cases/:id', async (req, res) => {
+  try {
+    const c = (await pool.query('SELECT * FROM onboarding_cases WHERE case_id = $1', [req.params.id])).rows[0];
+    if (!c) return res.status(404).json({ error: 'Case not found' });
+    const tasks = (await pool.query('SELECT * FROM onboarding_tasks WHERE case_id = $1 ORDER BY sort_order, created_at', [req.params.id])).rows;
+    const docs = (await pool.query('SELECT * FROM onboarding_documents WHERE case_id = $1 ORDER BY sort_order, created_at', [req.params.id])).rows;
+    return res.json({ case: c, tasks, documents: docs, progress: onbProgress(tasks), readiness: onbReadiness(tasks, docs) });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/onboarding/cases/:id', async (req, res) => {
+  try {
+    const fields = ['candidate_name', 'candidate_email', 'role_title', 'client', 'requirement_ref', 'placement_ref', 'employment_type', 'entity', 'work_location', 'target_start_date', 'recruiter', 'hiring_manager', 'coordinator', 'status', 'notes'];
+    const sets = [], vals = []; let i = 1;
+    fields.forEach(f => { if (req.body[f] !== undefined) { const v = f === 'target_start_date' && req.body[f] === '' ? null : req.body[f]; sets.push(f + ' = $' + i); vals.push(v); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE onboarding_cases SET ' + sets.join(', ') + ' WHERE case_id = $' + i, vals);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/onboarding/tasks/:id', async (req, res) => {
+  try {
+    const fields = ['status', 'owner_role', 'due_date', 'evidence', 'notes'];
+    const sets = [], vals = []; let i = 1;
+    fields.forEach(f => { if (req.body[f] !== undefined) { const v = f === 'due_date' && req.body[f] === '' ? null : req.body[f]; sets.push(f + ' = $' + i); vals.push(v); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE onboarding_tasks SET ' + sets.join(', ') + ' WHERE task_id = $' + i, vals);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Candidate uploads a document → Document AI / Gemini sanity-check → status Received (HR then Verifies).
+app.post('/onboarding/documents/:id/upload', async (req, res) => {
+  try {
+    const d = (await pool.query('SELECT * FROM onboarding_documents WHERE doc_id = $1', [req.params.id])).rows[0];
+    if (!d) return res.status(404).json({ error: 'Document not found' });
+    const b = req.body || {};
+    let aiCheck = 'Uploaded — pending HR review.', aiVerified = false;
+    if (b.text && String(b.text).trim()) {
+      try {
+        const prompt = `A candidate uploaded a document for the requirement "${d.name}" (needed for: ${d.reason}). Based on the extracted text below, decide if it plausibly IS that kind of document. Return ONLY JSON: {"valid": true|false, "note": "one short sentence"}.\n\nTEXT:\n${String(b.text).slice(0, 4000)}`;
+        const gen = await genModel.generateContent(prompt);
+        let out = gen.response.candidates[0].content.parts[0].text.trim().replace(/```json/g, '').replace(/```/g, '').trim();
+        const parsed = JSON.parse(out);
+        aiVerified = !!parsed.valid; aiCheck = (parsed.valid ? 'AI check passed: ' : 'AI check flagged: ') + (parsed.note || '');
+      } catch (e) { aiCheck = 'Uploaded — AI check unavailable, pending HR review.'; }
+    }
+    await pool.query('UPDATE onboarding_documents SET file_name = $1, uploaded_at = NOW(), status = $2, ai_check = $3, ai_verified = $4 WHERE doc_id = $5',
+      [b.file_name || 'document', 'Received', aiCheck, aiVerified, req.params.id]);
+    return res.json({ ok: true, ai_check: aiCheck, ai_verified: aiVerified });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/onboarding/documents/:id', async (req, res) => {
+  try {
+    const fields = ['status', 'due_date', 'notes'];
+    const sets = [], vals = []; let i = 1;
+    fields.forEach(f => { if (req.body[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(req.body[f]); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE onboarding_documents SET ' + sets.join(', ') + ' WHERE doc_id = $' + i, vals);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Activate the assignment — only when the readiness gate passes.
+app.post('/onboarding/cases/:id/activate', async (req, res) => {
+  try {
+    const c = (await pool.query('SELECT * FROM onboarding_cases WHERE case_id = $1', [req.params.id])).rows[0];
+    if (!c) return res.status(404).json({ error: 'Case not found' });
+    const tasks = (await pool.query('SELECT required, status FROM onboarding_tasks WHERE case_id = $1', [req.params.id])).rows;
+    const docs = (await pool.query('SELECT required, status, name FROM onboarding_documents WHERE case_id = $1', [req.params.id])).rows;
+    const r = onbReadiness(tasks, docs);
+    if (!r.ready) return res.status(409).json({ error: 'Not ready to activate.', outstanding: r.outstanding });
+    await pool.query("UPDATE onboarding_cases SET status = 'Activated' WHERE case_id = $1", [req.params.id]);
+    try { if (c.hiring_manager) await notify({ recipient: c.hiring_manager, type: 'ONBOARDING', message: `Assignment activated for ${c.candidate_name} — ${c.case_number}.` }); } catch (e) {}
+    return res.json({ ok: true, status: 'Activated' });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Candidate-facing: their own case + tasks + documents, by email.
+app.get('/onboarding/candidate', async (req, res) => {
+  try {
+    await ensureSchema();
+    const email = String(req.query.email || '').trim().toLowerCase();
+    if (!email) return res.json({ case: null });
+    const c = (await pool.query('SELECT * FROM onboarding_cases WHERE LOWER(candidate_email) = $1 ORDER BY created_at DESC LIMIT 1', [email])).rows[0];
+    if (!c) return res.json({ case: null });
+    const tasks = (await pool.query("SELECT * FROM onboarding_tasks WHERE case_id = $1 AND owner_role LIKE 'Candidate%' ORDER BY sort_order", [c.case_id])).rows;
+    const docs = (await pool.query('SELECT * FROM onboarding_documents WHERE case_id = $1 ORDER BY sort_order', [c.case_id])).rows;
+    const allTasks = (await pool.query('SELECT required, status FROM onboarding_tasks WHERE case_id = $1', [c.case_id])).rows;
+    return res.json({ case: c, tasks, documents: docs, progress: onbProgress(allTasks) });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Placed candidates (from the recruitment flow) — to create an onboarding case from an existing placement.
+app.get('/onboarding/placements', async (req, res) => {
+  try {
+    await ensureSchema();
+    const { rows } = await pool.query(
+      `SELECT s.candidate_id, s.candidate_name, s.job_title, s.client_name, s.submitted_by, s.created_at,
+              COALESCE(c.email, '') AS candidate_email
+         FROM submissions s LEFT JOIN candidates c ON c.candidate_id = s.candidate_id
+        WHERE s.status = 'PLACED'
+        ORDER BY s.last_updated DESC NULLS LAST, s.created_at DESC`);
+    return res.json({ placements: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -4406,6 +4607,56 @@ async function ensureSchema() {
       workflow_template TEXT,
       status            TEXT DEFAULT 'Draft',
       payload           JSONB DEFAULT '{}'
+    )`);
+    // ---- Onboarding lifecycle (offer accepted → handoff → candidate tasks → compliance → readiness → activation) ----
+    await pool.query(`CREATE TABLE IF NOT EXISTS onboarding_cases (
+      case_id           TEXT PRIMARY KEY,
+      case_number       TEXT,
+      created_at        TIMESTAMPTZ DEFAULT NOW(),
+      candidate_name    TEXT,
+      candidate_email   TEXT,
+      role_title        TEXT,
+      client            TEXT,
+      requirement_ref   TEXT,
+      placement_ref     TEXT,
+      employment_type   TEXT,
+      entity            TEXT,
+      work_location     TEXT,
+      target_start_date DATE,
+      recruiter         TEXT,
+      hiring_manager    TEXT,
+      coordinator       TEXT,
+      status            TEXT DEFAULT 'In Progress',
+      notes             TEXT
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS onboarding_tasks (
+      task_id      TEXT PRIMARY KEY,
+      case_id      TEXT,
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      title        TEXT,
+      owner_role   TEXT,
+      category     TEXT,
+      required     BOOLEAN DEFAULT TRUE,
+      due_date     DATE,
+      status       TEXT DEFAULT 'Not started',
+      evidence     TEXT,
+      notes        TEXT,
+      sort_order   INTEGER DEFAULT 0
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS onboarding_documents (
+      doc_id       TEXT PRIMARY KEY,
+      case_id      TEXT,
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      name         TEXT,
+      reason       TEXT,
+      required     BOOLEAN DEFAULT TRUE,
+      due_date     DATE,
+      status       TEXT DEFAULT 'Requested',
+      file_name    TEXT,
+      uploaded_at  TIMESTAMPTZ,
+      ai_check     TEXT,
+      ai_verified  BOOLEAN DEFAULT FALSE,
+      sort_order   INTEGER DEFAULT 0
     )`);
     // Sales users carry a department + home country (auto-filled, non-editable in the UI).
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS department TEXT");
