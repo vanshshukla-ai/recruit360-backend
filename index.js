@@ -147,7 +147,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-14-v28-onboarding-autoflow';
+const BUILD_TAG = '2026-10-14-v29-handoff-ownership';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -2365,15 +2365,26 @@ app.get('/onboarding/candidate', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 // Placed candidates (from the recruitment flow) — to create an onboarding case from an existing placement.
+// A candidate who already has an onboarding case is excluded, so no one can be onboarded twice.
+// Optional ?recruiter= filters to a single recruiter's placements (used by the Placement Handoff screen).
 app.get('/onboarding/placements', async (req, res) => {
   try {
     await ensureSchema();
-    const { rows } = await pool.query(
+    const recruiter = String(req.query.recruiter || '').trim();
+    const params = [];
+    let sql =
       `SELECT s.candidate_id, s.candidate_name, s.job_title, s.client_name, s.submitted_by, s.created_at,
-              COALESCE(c.email, '') AS candidate_email
+              COALESCE(c.email, '') AS candidate_email, COALESCE(c.phone, '') AS candidate_phone
          FROM submissions s LEFT JOIN candidates c ON c.candidate_id = s.candidate_id
         WHERE s.status = 'PLACED'
-        ORDER BY s.last_updated DESC NULLS LAST, s.created_at DESC`);
+          AND NOT EXISTS (
+            SELECT 1 FROM onboarding_cases o
+             WHERE (o.placement_ref <> '' AND o.placement_ref = s.candidate_id)
+                OR (o.candidate_email <> '' AND LOWER(o.candidate_email) = LOWER(COALESCE(c.email, '')))
+                OR (LOWER(o.candidate_name) = LOWER(s.candidate_name)))`;
+    if (recruiter) { params.push(recruiter); sql += ` AND LOWER(s.submitted_by) = LOWER($${params.length})`; }
+    sql += ' ORDER BY s.last_updated DESC NULLS LAST, s.created_at DESC';
+    const { rows } = await pool.query(sql, params);
     return res.json({ placements: rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
