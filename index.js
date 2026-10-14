@@ -73,6 +73,59 @@ async function ensureAuth() {
   } catch (e) { console.log('ensureAuth warn:', e.message); }
 }
 
+// Create (or find) a portal login for a placed candidate so they can sign in to the onboarding portal.
+// Returns { email, password|null, created }. `password` is only returned when a NEW login was created
+// (an existing active account is never touched — they already have credentials).
+async function provisionCandidateLogin(email, fullName) {
+  const addr = String(email || '').trim();
+  if (!addr) return null;
+  try {
+    const existing = (await pool.query('SELECT user_id FROM app_users WHERE LOWER(email) = LOWER($1) AND active = TRUE LIMIT 1', [addr])).rows[0];
+    if (existing) return { email: addr, password: null, created: false };
+    const uid = 'USR-CAND-' + Date.now().toString().slice(-6) + Math.floor(Math.random() * 90 + 10);
+    const pw = 'Welcome@' + Math.floor(1000 + Math.random() * 9000);
+    const { salt, hash } = hashPassword(pw);
+    await pool.query(
+      `INSERT INTO app_users (user_id, full_name, email, role, active, password_hash, password_salt)
+       VALUES ($1,$2,$3,'candidate',TRUE,$4,$5)`,
+      [uid, fullName || addr, addr, hash, salt]);
+    return { email: addr, password: pw, created: true };
+  } catch (e) { console.log('provisionCandidateLogin warn:', e.message); return null; }
+}
+
+// Send the candidate the branded welcome email with their portal link and (for a new account) credentials.
+// `c` is a case-like object with candidate_email/candidate_name/role_title/client/target_start_date.
+async function sendOnboardingWelcome(c, cred) {
+  if (!c || !c.candidate_email) return;
+  try {
+    const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+    const portal = process.env.PORTAL_URL || 'https://direct-tribute-502305-q5.web.app';
+    const start = c.target_start_date ? String(typeof c.target_start_date === 'string' ? c.target_start_date : new Date(c.target_start_date).toISOString()).slice(0, 10) : '';
+    const creds = cred && cred.created
+      ? `<div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;padding:14px;margin:14px 0">
+           <div style="font-weight:700;color:#4f46e5;margin-bottom:6px">Your portal login</div>
+           <div style="font-size:14px">Email: <b>${esc(cred.email)}</b><br/>Temporary password: <b>${esc(cred.password)}</b></div>
+           <div style="font-size:12px;color:#64748b;margin-top:6px">Please change your password after you sign in.</div>
+         </div>`
+      : `<div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;padding:14px;margin:14px 0">
+           <div style="font-weight:700;color:#4f46e5;margin-bottom:6px">Your portal login</div>
+           <div style="font-size:14px">Sign in with your existing Avanciers account: <b>${esc(c.candidate_email)}</b></div>
+         </div>`;
+    const html = `<div style="font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;max-width:560px">
+      <div style="background:#4f46e5;color:#fff;padding:14px 18px;border-radius:10px 10px 0 0;font-weight:700">Welcome to Avanciers — Onboarding</div>
+      <div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:18px">
+        <p>Hi ${esc(c.candidate_name)},</p>
+        <p>Congratulations — your onboarding for <b>${esc(c.role_title || 'your assignment')}</b>${c.client ? ' at <b>' + esc(c.client) + '</b>' : ''} has started. Please sign in to complete your personal details, upload the requested documents and finish payroll setup.</p>
+        ${start ? `<p><b>Target start date:</b> ${esc(start)}</p>` : ''}
+        ${creds}
+        <p style="text-align:center;margin:18px 0"><a href="${portal}" style="background:#4f46e5;color:#fff;text-decoration:none;font-weight:700;padding:11px 22px;border-radius:8px;display:inline-block">Open your onboarding portal</a></p>
+        <p style="font-size:12px;color:#64748b">Or paste this link into your browser: ${portal}</p>
+        <p>Our team will guide you through each step.</p>
+      </div></div>`;
+    await sendEmail({ to: c.candidate_email, subject: `Your Avanciers onboarding — ${c.role_title || 'assignment'}`, body: html, html: true });
+  } catch (e) { console.log('sendOnboardingWelcome warn:', e.message); }
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
@@ -94,7 +147,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-14-v26-onboarding-candidate';
+const BUILD_TAG = '2026-10-14-v28-onboarding-autoflow';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -2198,21 +2251,15 @@ app.post('/onboarding/cases', async (req, res) => {
     }
     // Notify the HM and the candidate that onboarding has started.
     try { if (b.hiring_manager) await notify({ recipient: b.hiring_manager, type: 'ONBOARDING', message: `Onboarding started for ${b.candidate_name} — ${num} (${b.role_title || 'role'} at ${b.client || 'client'}).` }); } catch (e) {}
+    // Provision the candidate's portal login and email them the link + credentials.
+    let cred = null;
     try {
       if (b.candidate_email) {
-        const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-        const html = `<div style="font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;max-width:560px">
-          <div style="background:#4f46e5;color:#fff;padding:14px 18px;border-radius:10px 10px 0 0;font-weight:700">Welcome to Avanciers — Onboarding</div>
-          <div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:18px">
-            <p>Hi ${esc(b.candidate_name)},</p>
-            <p>Your onboarding for <b>${esc(b.role_title || 'your assignment')}</b>${b.client ? ' at <b>' + esc(b.client) + '</b>' : ''} has started. Please log in to complete your personal details, upload the requested documents and finish payroll setup.</p>
-            ${start ? `<p><b>Target start date:</b> ${esc(start)}</p>` : ''}
-            <p>Our team will guide you through each step.</p>
-          </div></div>`;
-        await sendEmail({ to: b.candidate_email, subject: `Your Avanciers onboarding — ${b.role_title || 'assignment'}`, body: html, html: true });
+        cred = await provisionCandidateLogin(b.candidate_email, b.candidate_name);
+        await sendOnboardingWelcome({ candidate_email: b.candidate_email, candidate_name: b.candidate_name, role_title: b.role_title, client: b.client, target_start_date: start }, cred);
       }
     } catch (e) {}
-    return res.json({ ok: true, case_id: id, case_number: num });
+    return res.json({ ok: true, case_id: id, case_number: num, candidate_login: cred });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 app.get('/onboarding/cases/:id', async (req, res) => {
@@ -2232,7 +2279,18 @@ app.patch('/onboarding/cases/:id', async (req, res) => {
     if (!sets.length) return res.json({ ok: true });
     vals.push(req.params.id);
     await pool.query('UPDATE onboarding_cases SET ' + sets.join(', ') + ' WHERE case_id = $' + i, vals);
-    return res.json({ ok: true });
+    // Hardening: if an email was just added to the case, provision the candidate's login and
+    // send the welcome email now (only when a brand-new login is created, so edits never re-spam).
+    let cred = null;
+    try {
+      const addr = String(req.body.candidate_email || '').trim();
+      if (addr) {
+        const c = (await pool.query('SELECT * FROM onboarding_cases WHERE case_id = $1', [req.params.id])).rows[0];
+        cred = await provisionCandidateLogin(addr, c && c.candidate_name);
+        if (cred && cred.created) await sendOnboardingWelcome(c, cred);
+      }
+    } catch (e) {}
+    return res.json({ ok: true, candidate_login: cred });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 app.patch('/onboarding/tasks/:id', async (req, res) => {
