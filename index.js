@@ -147,7 +147,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-14-v29-handoff-ownership';
+const BUILD_TAG = '2026-10-15-v31-hr-candidate-messages';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -2267,8 +2267,10 @@ app.get('/onboarding/cases/:id', async (req, res) => {
     const c = (await pool.query('SELECT * FROM onboarding_cases WHERE case_id = $1', [req.params.id])).rows[0];
     if (!c) return res.status(404).json({ error: 'Case not found' });
     const tasks = (await pool.query('SELECT * FROM onboarding_tasks WHERE case_id = $1 ORDER BY sort_order, created_at', [req.params.id])).rows;
-    const docs = (await pool.query('SELECT * FROM onboarding_documents WHERE case_id = $1 ORDER BY sort_order, created_at', [req.params.id])).rows;
-    return res.json({ case: c, tasks, documents: docs, progress: onbProgress(tasks), readiness: onbReadiness(tasks, docs) });
+    const docs = (await pool.query("SELECT doc_id, case_id, created_at, name, reason, required, due_date, status, file_name, file_mime, uploaded_at, ai_check, ai_verified, ai_summary, reviewed_by, reviewed_at, reject_reason, sort_order, (file_data IS NOT NULL) AS has_file FROM onboarding_documents WHERE case_id = $1 ORDER BY sort_order, created_at", [req.params.id])).rows;
+    const offer = await getOffer(req.params.id);
+    const messages = (await pool.query('SELECT * FROM onboarding_messages WHERE case_id = $1 ORDER BY created_at DESC LIMIT 50', [req.params.id])).rows;
+    return res.json({ case: c, tasks, documents: docs, offer, messages, progress: onbProgress(tasks), readiness: onbReadiness(tasks, docs) });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 app.patch('/onboarding/cases/:id', async (req, res) => {
@@ -2309,27 +2311,84 @@ app.post('/onboarding/documents/:id/upload', async (req, res) => {
   try {
     const d = (await pool.query('SELECT * FROM onboarding_documents WHERE doc_id = $1', [req.params.id])).rows[0];
     if (!d) return res.status(404).json({ error: 'Document not found' });
+    const caseRow = (await pool.query('SELECT candidate_name FROM onboarding_cases WHERE case_id = $1', [d.case_id])).rows[0] || {};
     const b = req.body || {};
-    let aiCheck = 'Uploaded — pending HR review.', aiVerified = false;
-    if (b.text && String(b.text).trim()) {
-      try {
-        const prompt = `A candidate uploaded a document for the requirement "${d.name}" (needed for: ${d.reason}). Based on the extracted text below, decide if it plausibly IS that kind of document. Return ONLY JSON: {"valid": true|false, "note": "one short sentence"}.\n\nTEXT:\n${String(b.text).slice(0, 4000)}`;
+    // Strip any data: URL prefix the browser may send.
+    const data = String(b.data_base64 || '').replace(/^data:[^;]+;base64,/, '');
+    const mime = b.mime_type || 'application/octet-stream';
+    let aiCheck = 'Uploaded — pending HR review.', aiVerified = false, aiSummary = '';
+
+    const want = `"${d.name}" (needed for: ${d.reason || 'onboarding'})`;
+    const parseJson = (t) => JSON.parse(String(t).replace(/```json/g, '').replace(/```/g, '').trim());
+    const summarise = (p) => {
+      const lines = [];
+      if (p.document_type) lines.push('Detected: ' + p.document_type);
+      if (p.holder_name) lines.push('Name on document: ' + p.holder_name);
+      if (p.id_number) lines.push('ID / reference: ' + p.id_number);
+      if (p.expiry) lines.push('Expiry / validity: ' + p.expiry);
+      if (p.authenticity) lines.push('Authenticity: ' + p.authenticity);
+      if (p.name_match !== undefined) lines.push('Matches candidate (' + (caseRow.candidate_name || '—') + '): ' + (p.name_match ? 'Yes' : 'Not confirmed'));
+      return lines.join('\n');
+    };
+
+    try {
+      if (data) {
+        // Real check: send the actual image/PDF to Gemini (multimodal Document AI).
+        const prompt = `You are a compliance document checker for an onboarding team. A candidate (expected name: "${caseRow.candidate_name || 'unknown'}") uploaded a file for the required document ${want}. Examine the attached document image/PDF and return ONLY JSON with keys:
+{"valid": true|false,            // is this genuinely the requested kind of document?
+ "document_type": "what the document actually is",
+ "holder_name": "name printed on the document, or ''",
+ "id_number": "document / ID number if visible, else ''",
+ "expiry": "expiry or validity date if present, else ''",
+ "authenticity": "Looks genuine | Possibly altered | Low quality / unclear",
+ "name_match": true|false,       // does the holder name match the expected candidate name?
+ "note": "one short sentence for the HR reviewer"}`;
+        const gen = await genModel.generateContent({ contents: [{ role: 'user', parts: [{ inlineData: { mimeType: mime, data } }, { text: prompt }] }] });
+        const p = parseJson(gen.response.candidates[0].content.parts[0].text);
+        aiVerified = !!p.valid && p.authenticity !== 'Possibly altered';
+        aiCheck = (p.valid ? 'AI check passed' : 'AI check flagged') + (p.note ? ': ' + p.note : '');
+        aiSummary = summarise(p);
+      } else if (b.text && String(b.text).trim()) {
+        const prompt = `A candidate uploaded a document for ${want}. From the extracted text, decide if it plausibly IS that document. Return ONLY JSON: {"valid": true|false, "document_type": "", "holder_name": "", "note": "one short sentence"}.\n\nTEXT:\n${String(b.text).slice(0, 4000)}`;
         const gen = await genModel.generateContent(prompt);
-        let out = gen.response.candidates[0].content.parts[0].text.trim().replace(/```json/g, '').replace(/```/g, '').trim();
-        const parsed = JSON.parse(out);
-        aiVerified = !!parsed.valid; aiCheck = (parsed.valid ? 'AI check passed: ' : 'AI check flagged: ') + (parsed.note || '');
-      } catch (e) { aiCheck = 'Uploaded — AI check unavailable, pending HR review.'; }
-    }
-    await pool.query('UPDATE onboarding_documents SET file_name = $1, uploaded_at = NOW(), status = $2, ai_check = $3, ai_verified = $4 WHERE doc_id = $5',
-      [b.file_name || 'document', 'Received', aiCheck, aiVerified, req.params.id]);
-    return res.json({ ok: true, ai_check: aiCheck, ai_verified: aiVerified });
+        const p = parseJson(gen.response.candidates[0].content.parts[0].text);
+        aiVerified = !!p.valid;
+        aiCheck = (p.valid ? 'AI check passed' : 'AI check flagged') + (p.note ? ': ' + p.note : '');
+        aiSummary = summarise(p);
+      }
+    } catch (e) { aiCheck = 'Uploaded — automated check unavailable, pending HR review.'; }
+
+    await pool.query(
+      `UPDATE onboarding_documents SET file_name = $1, file_data = $2, file_mime = $3, uploaded_at = NOW(),
+         status = 'Received', ai_check = $4, ai_verified = $5, ai_summary = $6, reviewed_by = NULL, reviewed_at = NULL, reject_reason = NULL
+       WHERE doc_id = $7`,
+      [b.file_name || 'document', data || null, data ? mime : null, aiCheck, aiVerified, aiSummary || null, req.params.id]);
+    return res.json({ ok: true, ai_check: aiCheck, ai_verified: aiVerified, ai_summary: aiSummary });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Serve the actual uploaded file so HR can view it before verifying.
+app.get('/onboarding/documents/:id/file', async (req, res) => {
+  try {
+    const d = (await pool.query('SELECT file_data, file_mime, file_name FROM onboarding_documents WHERE doc_id = $1', [req.params.id])).rows[0];
+    if (!d || !d.file_data) return res.status(404).json({ error: 'No file on record for this document.' });
+    const buf = Buffer.from(d.file_data, 'base64');
+    res.setHeader('Content-Type', d.file_mime || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${(d.file_name || 'document').replace(/"/g, '')}"`);
+    return res.send(buf);
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 app.patch('/onboarding/documents/:id', async (req, res) => {
   try {
-    const fields = ['status', 'due_date', 'notes'];
+    const b = req.body || {};
+    const fields = ['status', 'due_date', 'notes', 'reject_reason'];
     const sets = [], vals = []; let i = 1;
-    fields.forEach(f => { if (req.body[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(req.body[f]); i++; } });
+    fields.forEach(f => { if (b[f] !== undefined) { sets.push(f + ' = $' + i); vals.push(b[f]); i++; } });
+    // When HR verifies or rejects, stamp who reviewed it and when (audit trail).
+    if (b.status === 'Verified' || b.status === 'Rejected') {
+      sets.push('reviewed_by = $' + i); vals.push(b.reviewed_by || 'HR'); i++;
+      sets.push('reviewed_at = NOW()');
+      if (b.status === 'Verified') { sets.push('reject_reason = NULL'); }
+    }
     if (!sets.length) return res.json({ ok: true });
     vals.push(req.params.id);
     await pool.query('UPDATE onboarding_documents SET ' + sets.join(', ') + ' WHERE doc_id = $' + i, vals);
@@ -2350,6 +2409,167 @@ app.post('/onboarding/cases/:id/activate', async (req, res) => {
     return res.json({ ok: true, status: 'Activated' });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
+
+// ========= PHASED FINAL-OFFER WORKFLOW =========
+// Initial offers are sent by the Hiring Manager in recruitment. The FINAL offer letter + welcome
+// is prepared by HR here, digitally signed by an Admin when required, then sent by HR to the candidate.
+function offerNeedsSignature(contractType, salaryPackage) {
+  const ct = String(contractType || '').toLowerCase();
+  if (ct.includes('full-time') || ct.includes('full time') || ct.includes('contract-to-hire') || ct.includes('c2h') || ct.includes('permanent')) return true;
+  const num = parseFloat(String(salaryPackage || '').replace(/[^0-9.]/g, ''));
+  if (!isNaN(num) && num >= 150000) return true; // high-value packages require a signature
+  return false;
+}
+async function getOffer(caseId) {
+  return (await pool.query('SELECT * FROM onboarding_offers WHERE case_id = $1 ORDER BY created_at DESC LIMIT 1', [caseId])).rows[0] || null;
+}
+// HR creates or updates the draft final offer for a case.
+app.post('/onboarding/cases/:id/offer', async (req, res) => {
+  try {
+    await ensureSchema();
+    const c = (await pool.query('SELECT * FROM onboarding_cases WHERE case_id = $1', [req.params.id])).rows[0];
+    if (!c) return res.status(404).json({ error: 'Case not found' });
+    const b = req.body || {};
+    const contract = b.contract_type || c.employment_type || '';
+    const salary = b.salary_package || '';
+    const reqSig = (b.requires_signature === undefined) ? offerNeedsSignature(contract, salary) : !!b.requires_signature;
+    let offer = await getOffer(req.params.id);
+    if (offer) {
+      await pool.query(
+        `UPDATE onboarding_offers SET salary_package=$1, contract_type=$2, requires_signature=$3, body=$4, prepared_by=$5, updated_at=NOW() WHERE offer_id=$6`,
+        [salary, contract, reqSig, b.body || offer.body || '', b.prepared_by || offer.prepared_by || 'HR', offer.offer_id]);
+      offer = await getOffer(req.params.id);
+    } else {
+      const oid = 'OFR-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+      await pool.query(
+        `INSERT INTO onboarding_offers (offer_id, case_id, offer_type, salary_package, contract_type, requires_signature, body, status, prepared_by)
+         VALUES ($1,$2,'final',$3,$4,$5,$6,'Draft',$7)`,
+        [oid, req.params.id, salary, contract, reqSig, b.body || '', b.prepared_by || 'HR']);
+      offer = await getOffer(req.params.id);
+    }
+    return res.json({ ok: true, offer });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// AI-draft the final offer + welcome letter from the case details.
+app.post('/onboarding/offers/:oid/generate', async (req, res) => {
+  try {
+    const offer = (await pool.query('SELECT * FROM onboarding_offers WHERE offer_id = $1', [req.params.oid])).rows[0];
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    const c = (await pool.query('SELECT * FROM onboarding_cases WHERE case_id = $1', [offer.case_id])).rows[0] || {};
+    let body = '';
+    try {
+      const prompt = `Write a warm, professional FINAL offer letter and welcome note for a successful candidate, as plain text (no markdown). Details:
+Candidate: ${c.candidate_name || ''}
+Role: ${c.role_title || ''}
+Client / engagement: ${c.client || ''}
+Employer entity: ${c.entity || 'Avanciers'}
+Employment type: ${offer.contract_type || c.employment_type || ''}
+Compensation package: ${offer.salary_package || 'as discussed'}
+Work location: ${c.work_location || ''}
+Target start date: ${c.target_start_date || 'to be confirmed'}
+Include: congratulations, confirmed role & compensation, start date, a short welcome paragraph, and a closing from the Avanciers HR team. Keep it under 300 words. Do not invent legal clauses.`;
+      const gen = await genModel.generateContent(prompt);
+      body = gen.response.candidates[0].content.parts[0].text.trim();
+    } catch (e) { return res.status(502).json({ error: 'Could not generate the letter right now.' }); }
+    await pool.query('UPDATE onboarding_offers SET body = $1, updated_at = NOW() WHERE offer_id = $2', [body, req.params.oid]);
+    return res.json({ ok: true, body });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// HR sends the draft to Admin for a digital signature.
+app.post('/onboarding/offers/:oid/request-signature', async (req, res) => {
+  try {
+    const offer = (await pool.query('SELECT * FROM onboarding_offers WHERE offer_id = $1', [req.params.oid])).rows[0];
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    if (!offer.body || !offer.body.trim()) return res.status(400).json({ error: 'Add the letter content before requesting a signature.' });
+    const c = (await pool.query('SELECT candidate_name, case_number FROM onboarding_cases WHERE case_id = $1', [offer.case_id])).rows[0] || {};
+    await pool.query("UPDATE onboarding_offers SET status = 'Awaiting Signature', updated_at = NOW() WHERE offer_id = $1", [req.params.oid]);
+    try {
+      const admins = (await pool.query("SELECT full_name FROM app_users WHERE role = 'admin' AND active = TRUE")).rows;
+      for (const a of admins) await notify({ recipient: a.full_name, type: 'OFFER', message: `Offer letter for ${c.candidate_name} (${c.case_number}) needs your digital signature.` });
+    } catch (e) {}
+    return res.json({ ok: true, status: 'Awaiting Signature' });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Admin applies a digital signature.
+app.post('/onboarding/offers/:oid/sign', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const offer = (await pool.query('SELECT * FROM onboarding_offers WHERE offer_id = $1', [req.params.oid])).rows[0];
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    const signer = b.signed_by || 'Administrator';
+    await pool.query("UPDATE onboarding_offers SET status = 'Signed', signed_by = $1, signature_name = $2, signed_at = NOW(), updated_at = NOW() WHERE offer_id = $3",
+      [signer, b.signature_name || signer, req.params.oid]);
+    const c = (await pool.query('SELECT candidate_name, coordinator, hiring_manager FROM onboarding_cases WHERE case_id = $1', [offer.case_id])).rows[0] || {};
+    try { const back = c.coordinator || c.hiring_manager; if (back) await notify({ recipient: back, type: 'OFFER', message: `Offer letter for ${c.candidate_name} has been digitally signed by ${signer}. You can now send it to the candidate.` }); } catch (e) {}
+    return res.json({ ok: true, status: 'Signed', signed_by: signer });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// HR sends the final, signed offer + welcome to the candidate.
+app.post('/onboarding/offers/:oid/send', async (req, res) => {
+  try {
+    const offer = (await pool.query('SELECT * FROM onboarding_offers WHERE offer_id = $1', [req.params.oid])).rows[0];
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    if (offer.requires_signature && offer.status !== 'Signed') return res.status(409).json({ error: 'This offer requires a digital signature from Admin before it can be sent.' });
+    if (!offer.body || !offer.body.trim()) return res.status(400).json({ error: 'There is no letter content to send.' });
+    const c = (await pool.query('SELECT * FROM onboarding_cases WHERE case_id = $1', [offer.case_id])).rows[0] || {};
+    if (!c.candidate_email) return res.status(400).json({ error: 'No candidate email on the case.' });
+    const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+    const sig = offer.signed_by ? `<div style="margin-top:18px;padding-top:12px;border-top:1px dashed #cbd5e1"><div style="font-size:12px;color:#64748b">Digitally signed</div><div style="font-family:'Segoe UI',cursive;font-size:20px;color:#4f46e5">${esc(offer.signature_name || offer.signed_by)}</div><div style="font-size:11px;color:#94a3b8">${esc(offer.signed_by)} · ${offer.signed_at ? new Date(offer.signed_at).toLocaleString('en-GB') : ''}</div></div>` : '';
+    const html = `<div style="font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;max-width:620px">
+      <div style="background:#4f46e5;color:#fff;padding:16px 20px;border-radius:10px 10px 0 0;font-weight:700">Your Final Offer & Welcome — Avanciers</div>
+      <div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:22px">
+        <div style="white-space:pre-wrap;font-size:14px;line-height:1.6">${esc(offer.body)}</div>
+        ${sig}
+      </div></div>`;
+    await sendEmail({ to: c.candidate_email, subject: `Your final offer & welcome — ${c.role_title || 'Avanciers'}`, body: html, html: true });
+    await pool.query("UPDATE onboarding_offers SET status = 'Sent', sent_at = NOW(), updated_at = NOW() WHERE offer_id = $1", [req.params.oid]);
+    try { await notify({ recipient: 'candidate', type: 'OFFER', message: `Your final offer letter and welcome pack have been sent to ${c.candidate_email}.` }); } catch (e) {}
+    return res.json({ ok: true, status: 'Sent' });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Revise a job offer — reopen a signed/sent offer back to Draft so HR can amend and re-route it.
+app.post('/onboarding/offers/:oid/revise', async (req, res) => {
+  try {
+    const offer = (await pool.query('SELECT * FROM onboarding_offers WHERE offer_id = $1', [req.params.oid])).rows[0];
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    await pool.query("UPDATE onboarding_offers SET status = 'Draft', signed_by = NULL, signature_name = NULL, signed_at = NULL, updated_at = NOW() WHERE offer_id = $1", [req.params.oid]);
+    return res.json({ ok: true, status: 'Draft' });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---- HR → candidate messages / reminders (shown in the candidate portal + emailed + in-app) ----
+app.post('/onboarding/cases/:id/message', async (req, res) => {
+  try {
+    await ensureSchema();
+    const c = (await pool.query('SELECT * FROM onboarding_cases WHERE case_id = $1', [req.params.id])).rows[0];
+    if (!c) return res.status(404).json({ error: 'Case not found' });
+    const b = req.body || {};
+    const body = String(b.body || '').trim();
+    if (!body) return res.status(400).json({ error: 'Message cannot be empty.' });
+    const mid = 'ONM-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    await pool.query('INSERT INTO onboarding_messages (msg_id, case_id, from_name, from_role, body) VALUES ($1,$2,$3,$4,$5)',
+      [mid, req.params.id, b.from_name || 'HR', b.from_role || 'hr', body]);
+    // In-app notification to the candidate portal.
+    try { await notify({ recipient: 'candidate', type: 'ONBOARDING', message: `Message from ${b.from_name || 'HR'}: ${body.slice(0, 120)}` }); } catch (e) {}
+    // Email the candidate.
+    try {
+      if (c.candidate_email) {
+        const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+        const portal = process.env.PORTAL_URL || 'https://direct-tribute-502305-q5.web.app';
+        const html = `<div style="font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;max-width:560px">
+          <div style="background:#4f46e5;color:#fff;padding:14px 18px;border-radius:10px 10px 0 0;font-weight:700">A message about your onboarding</div>
+          <div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:18px">
+            <p>Hi ${esc(c.candidate_name)},</p>
+            <div style="white-space:pre-wrap;font-size:14px;line-height:1.6;background:#f8fafc;border-left:3px solid #4f46e5;padding:10px 14px;border-radius:6px">${esc(body)}</div>
+            <p style="text-align:center;margin:18px 0"><a href="${portal}" style="background:#4f46e5;color:#fff;text-decoration:none;font-weight:700;padding:11px 22px;border-radius:8px;display:inline-block">Open your onboarding portal</a></p>
+            <p style="font-size:12px;color:#64748b">— ${esc(b.from_name || 'Avanciers HR')}</p>
+          </div></div>`;
+        await sendEmail({ to: c.candidate_email, subject: `Action needed on your Avanciers onboarding`, body: html, html: true });
+      }
+    } catch (e) {}
+    return res.json({ ok: true, msg_id: mid });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
 // Candidate-facing: their own case + tasks + documents, by email.
 app.get('/onboarding/candidate', async (req, res) => {
   try {
@@ -2359,9 +2579,10 @@ app.get('/onboarding/candidate', async (req, res) => {
     const c = (await pool.query('SELECT * FROM onboarding_cases WHERE LOWER(candidate_email) = $1 ORDER BY created_at DESC LIMIT 1', [email])).rows[0];
     if (!c) return res.json({ case: null });
     const tasks = (await pool.query("SELECT * FROM onboarding_tasks WHERE case_id = $1 AND owner_role LIKE 'Candidate%' ORDER BY sort_order", [c.case_id])).rows;
-    const docs = (await pool.query('SELECT * FROM onboarding_documents WHERE case_id = $1 ORDER BY sort_order', [c.case_id])).rows;
+    const docs = (await pool.query("SELECT doc_id, case_id, name, reason, required, due_date, status, file_name, uploaded_at, ai_check, ai_verified, ai_summary, reject_reason, sort_order, (file_data IS NOT NULL) AS has_file FROM onboarding_documents WHERE case_id = $1 ORDER BY sort_order", [c.case_id])).rows;
     const allTasks = (await pool.query('SELECT required, status FROM onboarding_tasks WHERE case_id = $1', [c.case_id])).rows;
-    return res.json({ case: c, tasks, documents: docs, progress: onbProgress(allTasks) });
+    const messages = (await pool.query('SELECT msg_id, from_name, from_role, body, created_at FROM onboarding_messages WHERE case_id = $1 ORDER BY created_at DESC LIMIT 50', [c.case_id])).rows;
+    return res.json({ case: c, tasks, documents: docs, messages, progress: onbProgress(allTasks) });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 // Placed candidates (from the recruitment flow) — to create an onboarding case from an existing placement.
@@ -4726,6 +4947,40 @@ async function ensureSchema() {
       ai_check     TEXT,
       ai_verified  BOOLEAN DEFAULT FALSE,
       sort_order   INTEGER DEFAULT 0
+    )`);
+    // Store the actual uploaded file so HR can view it before verifying, plus the review audit trail.
+    await pool.query('ALTER TABLE onboarding_documents ADD COLUMN IF NOT EXISTS file_data TEXT');
+    await pool.query('ALTER TABLE onboarding_documents ADD COLUMN IF NOT EXISTS file_mime TEXT');
+    await pool.query('ALTER TABLE onboarding_documents ADD COLUMN IF NOT EXISTS ai_summary TEXT');
+    await pool.query('ALTER TABLE onboarding_documents ADD COLUMN IF NOT EXISTS reviewed_by TEXT');
+    await pool.query('ALTER TABLE onboarding_documents ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ');
+    await pool.query('ALTER TABLE onboarding_documents ADD COLUMN IF NOT EXISTS reject_reason TEXT');
+    // Phased final-offer workflow: HR drafts → Admin digitally signs → HR sends to the candidate.
+    await pool.query(`CREATE TABLE IF NOT EXISTS onboarding_offers (
+      offer_id          TEXT PRIMARY KEY,
+      case_id           TEXT,
+      created_at        TIMESTAMPTZ DEFAULT NOW(),
+      updated_at        TIMESTAMPTZ DEFAULT NOW(),
+      offer_type        TEXT DEFAULT 'final',
+      salary_package    TEXT,
+      contract_type     TEXT,
+      requires_signature BOOLEAN DEFAULT FALSE,
+      body              TEXT,
+      status            TEXT DEFAULT 'Draft',
+      prepared_by       TEXT,
+      signed_by         TEXT,
+      signature_name    TEXT,
+      signed_at         TIMESTAMPTZ,
+      sent_at           TIMESTAMPTZ
+    )`);
+    // HR → candidate messages / reminders shown in the candidate portal.
+    await pool.query(`CREATE TABLE IF NOT EXISTS onboarding_messages (
+      msg_id      TEXT PRIMARY KEY,
+      case_id     TEXT,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      from_name   TEXT,
+      from_role   TEXT,
+      body        TEXT
     )`);
     // Sales users carry a department + home country (auto-filled, non-editable in the UI).
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS department TEXT");
