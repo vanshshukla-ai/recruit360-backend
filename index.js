@@ -147,7 +147,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-15-v31-hr-candidate-messages';
+const BUILD_TAG = '2026-10-15-v32-hm-dashboard-rounds';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1147,6 +1147,48 @@ app.patch('/submissions/:id/interview', async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: 'Could not update interview', detail: err.message });
   }
+});
+
+// ===== Multi-round interviews (Hiring Manager can request an additional round) =====
+app.get('/submissions/:id/rounds', async (req, res) => {
+  try {
+    await ensureSchema();
+    const rows = (await pool.query('SELECT * FROM interview_rounds WHERE submission_id = $1 ORDER BY sort_order, created_at', [req.params.id])).rows;
+    return res.json({ rounds: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/submissions/:id/rounds', async (req, res) => {
+  try {
+    await ensureSchema();
+    const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
+    if (!sub) return res.status(404).json({ error: 'Submission not found' });
+    const b = req.body || {};
+    const name = String(b.round_name || 'Additional interview').trim();
+    const rid = 'IVR-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    const n = (await pool.query('SELECT COUNT(*)::int AS c FROM interview_rounds WHERE submission_id = $1', [req.params.id])).rows[0].c;
+    const meet = 'https://meet.google.com/' + Math.random().toString(36).slice(2, 5) + '-' + Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 5);
+    const status = b.scheduled_at ? 'Scheduled' : 'Pending';
+    await pool.query('INSERT INTO interview_rounds (round_id, submission_id, round_name, scheduled_at, panel, status, meeting_link, created_by, sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+      [rid, req.params.id, name, b.scheduled_at || null, b.panel || '', status, meet, b.created_by || 'Hiring Manager', n + 1]);
+    try {
+      const msg = `Additional interview round "${name}" requested for ${sub.candidate_name}${b.scheduled_at ? ' on ' + b.scheduled_at : ''} (${sub.job_title || 'role'}).`;
+      if (sub.submitted_by) await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by, type: 'INTERVIEW', message: msg });
+      await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: `A new interview round "${name}" has been scheduled${b.scheduled_at ? ' on ' + b.scheduled_at : ''}. Link: ${meet}` });
+    } catch (e) {}
+    return res.json({ ok: true, round_id: rid, meeting_link: meet });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/rounds/:id', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const fields = ['round_name', 'scheduled_at', 'panel', 'status', 'feedback'];
+    const sets = [], vals = []; let i = 1;
+    fields.forEach(f => { if (b[f] !== undefined) { const v = f === 'scheduled_at' && b[f] === '' ? null : b[f]; sets.push(f + ' = $' + i); vals.push(v); i++; } });
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE interview_rounds SET ' + sets.join(', ') + ' WHERE round_id = $' + i, vals);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
 // Record an offer decision for a submission
@@ -4981,6 +5023,20 @@ async function ensureSchema() {
       from_name   TEXT,
       from_role   TEXT,
       body        TEXT
+    )`);
+    // Multi-round interviews — a submission can have several rounds; the Hiring Manager can add one.
+    await pool.query(`CREATE TABLE IF NOT EXISTS interview_rounds (
+      round_id      TEXT PRIMARY KEY,
+      submission_id TEXT,
+      created_at    TIMESTAMPTZ DEFAULT NOW(),
+      round_name    TEXT,
+      scheduled_at  TIMESTAMPTZ,
+      panel         TEXT,
+      status        TEXT DEFAULT 'Pending',
+      feedback      TEXT,
+      meeting_link  TEXT,
+      created_by    TEXT,
+      sort_order    INTEGER DEFAULT 0
     )`);
     // Sales users carry a department + home country (auto-filled, non-editable in the UI).
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS department TEXT");
