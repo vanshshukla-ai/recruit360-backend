@@ -147,7 +147,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-15-v32-hm-dashboard-rounds';
+const BUILD_TAG = '2026-10-16-v33-emailfix-dashboards-salesreports';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -941,7 +941,7 @@ app.post('/submissions/offline', async (req, res) => {
     let candidate_id = b.candidate_id;
     if (!candidate_id) {
       candidate_id = 'C' + Date.now().toString().slice(-6);
-      const email = b.email || candidateEmail(candidate_id);
+      const email = b.email || await candidateEmail(candidate_id);
       try {
         await pool.query(
           `INSERT INTO candidates (candidate_id, full_name, email, phone, role, origin_city, destination_country, visa_status, consent_given, recruiter, experience_years, created_at, last_updated)
@@ -1122,7 +1122,7 @@ app.patch('/submissions/:id/interview', async (req, res) => {
     try { hm = (await pool.query('SELECT hiring_manager FROM jobs WHERE job_id = $1', [sub.job_id])).rows[0]?.hiring_manager || ''; } catch (e) {}
 
     // Build the CANDIDATE email (link + notes) — returned so the UI can open mailto AND logged.
-    const candEmail = candidateEmail(sub.candidate_id);
+    const candEmail = await candidateEmail(sub.candidate_id);
     const emailSubject = 'Your ' + roundLabel + ' is scheduled — ' + (sub.job_title || 'a role');
     const emailBody = 'Dear ' + (sub.candidate_name || 'Candidate') + ',\n\n'
       + 'Your ' + roundLabel + (sub.client_name ? ' with ' + sub.client_name : '') + ' for ' + (sub.job_title || 'a role') + ' has been scheduled' + (interview_date ? ' for ' + interview_date : '') + '.\n\n'
@@ -1417,7 +1417,7 @@ app.patch('/submissions/:id/approval', async (req, res) => {
     const { decision, approver } = req.body; // APPROVED | REJECTED
     const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
     if (!sub) return res.status(404).json({ error: 'not found' });
-    const candEmail = candidateEmail(sub.candidate_id);
+    const candEmail = await candidateEmail(sub.candidate_id);
     const cArgs = { submission_id: req.params.id, candidate_id: sub.candidate_id, job_id: sub.job_id, sent_by: approver || 'hiring_manager' };
 
     if (decision !== 'APPROVED') {
@@ -1476,11 +1476,17 @@ app.get('/candidates/:id/history', async (req, res) => {
 });
 
 // ---------- CANDIDATE EMAIL ----------
-// Demo mode: if DEMO_EMAIL is set, every candidate email routes to that one real
-// inbox so you can show real delivery live. Otherwise it derives the placeholder.
-function candidateEmail(candidate_id) {
-  if (process.env.DEMO_EMAIL) return process.env.DEMO_EMAIL;
-  return (candidate_id || '').toLowerCase() + '@example.com';
+// Resolve the REAL email the recruiter saved for this candidate so recruitment emails
+// reach the actual person (onboarding/sales already send to the stored address). Returns
+// '' when no genuine email is on file, so nothing is sent to a demo/placeholder inbox.
+async function candidateEmail(candidate_id) {
+  try {
+    if (candidate_id) {
+      const r = (await pool.query('SELECT email FROM candidates WHERE candidate_id = $1', [candidate_id])).rows[0];
+      if (r && r.email && /.+@.+\..+/.test(r.email) && !/@example\.com$/i.test(r.email)) return r.email;
+    }
+  } catch (e) {}
+  return '';
 }
 
 // ---------- NOTIFICATIONS ----------
@@ -3968,7 +3974,7 @@ app.post('/submissions/:id/context-action', async (req, res) => {
     const { rows } = await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, status FROM submissions WHERE submission_id = $1', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     const s = rows[0];
-    const candEmail = candidateEmail(s.candidate_id);
+    const candEmail = await candidateEmail(s.candidate_id);
 
     if (action === 'request_resume') {
       // create onboarding + invite email
@@ -4114,7 +4120,7 @@ app.patch('/submissions/:id/placement-approval', async (req, res) => {
     if (!s) return res.status(404).json({ error: 'not found' });
 
     const cArgs = { submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, sent_by: approver || 'hiring_manager' };
-    const candEmail = candidateEmail(s.candidate_id);
+    const candEmail = await candidateEmail(s.candidate_id);
     if (decision === 'APPROVED') {
       // Stage 6: HM gives internal approval to hire -> move to the OFFER stage (prepare offer letter).
       // The candidate is NOT placed yet; placement (onboarding + visa email + job-fill) happens once the
@@ -4385,7 +4391,7 @@ app.post('/submissions/:id/offer/send', async (req, res) => {
     if (!r) return res.status(404).json({ error: 'not found' });
     if (r.offer_status !== 'SIGNED') return res.status(400).json({ error: 'The offer must be signed by an admin before it can be sent.' });
     let data = {}; try { data = JSON.parse(r.offer_json); } catch (e) {}
-    const candEmail = candidateEmail(r.candidate_id);
+    const candEmail = await candidateEmail(r.candidate_id);
     const emailSubject = 'Your Employment Offer — ' + (r.job_title || 'a role') + ' at ' + COMPANY_NAME;
     const emailBody = 'Dear ' + (r.candidate_name || 'Candidate') + ',\n\nCongratulations! On behalf of ' + COMPANY_NAME + ', we are delighted to extend a formal offer of employment for the role of ' + (data.role_title || r.job_title || 'the position') + (r.client_name ? ' (assignment with ' + r.client_name + ')' : '') + '.\n\nYour signed offer letter is attached. It sets out your compensation, benefits, leave, the initial service commitment and the conditions of the offer. Please review it carefully.\n\nTo accept, kindly confirm by replying to this email. On acceptance, we will begin onboarding and will need the following documents to proceed:\n1. Identity & address proof (passport / national ID).\n2. Education and experience certificates.\n3. Recent photographs and completed joining forms (we will share these).\n4. Any documents required for visa processing — our visa partner (' + VISA_PARTNER_NAME + ') will guide you.\n\nIf you have any questions, our team is happy to help. We look forward to welcoming you aboard.\n\nBest regards,\n' + COMPANY_NAME + ' Talent Team';
     const cc = [r.submitted_by ? 'recruiter (' + r.submitted_by + ')' : null].filter(Boolean).join(', ');
@@ -4402,7 +4408,7 @@ app.post('/submissions/:id/offer/accept', async (req, res) => {
     await ensureSlots();
     const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, submitted_by, offer_status FROM submissions WHERE submission_id = $1', [req.params.id])).rows[0];
     if (!s) return res.status(404).json({ error: 'not found' });
-    const candEmail = candidateEmail(s.candidate_id);
+    const candEmail = await candidateEmail(s.candidate_id);
     const cArgs = { submission_id: req.params.id, candidate_id: s.candidate_id, job_id: s.job_id, sent_by: req.body?.by || 'recruiter' };
     await pool.query("UPDATE submissions SET status = 'PLACED', offer_status = 'ACCEPTED', last_updated = NOW() WHERE submission_id = $1", [req.params.id]);
     try { await pool.query("UPDATE candidates SET visa_status = 'PLACEMENT_ACTIVE', last_updated = NOW() WHERE candidate_id = $1", [s.candidate_id]); } catch (e) {}
@@ -4531,7 +4537,7 @@ app.post('/submissions/:id/slots/propose', async (req, res) => {
       accepted.push({ slot_id, slot_time: iso });
     }
     // email the candidate the options
-    const candEmail = candidateEmail(s.candidate_id);
+    const candEmail = await candidateEmail(s.candidate_id);
     const opts = accepted.map((a, i) => `  ${i + 1}. ${new Date(a.slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}`).join('\n');
     const label = kind === 'client' ? 'client interview' : 'recruiter call';
     const emailSubject = `Choose a time for your ${label} — ${s.job_title || 'a role'}`;
@@ -4562,7 +4568,7 @@ app.post('/submissions/:id/slots/fix', async (req, res) => {
     await pool.query(`INSERT INTO interview_slots (slot_id, submission_id, candidate_id, job_id, kind, slot_time, duration_min, status, proposed_by, meet_link) VALUES ($1,$2,$3,$4,$5,$6,$7,'CONFIRMED',$8,$9)`,
       [slot_id, req.params.id, s.candidate_id, s.job_id, kind, slot_time, dur, fixed_by || 'recruiter', link]);
     await pool.query('UPDATE submissions SET interview_link = $1, interview_date = $2, last_updated = NOW() WHERE submission_id = $3', [link, slot_time, req.params.id]).catch(() => {});
-    const candEmail = candidateEmail(s.candidate_id);
+    const candEmail = await candidateEmail(s.candidate_id);
     const label = kind === 'client' ? 'client interview' : 'recruiter call';
     const when = new Date(slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
     const clientCc = kind === 'client' ? clientEmailFor(s.client_name) : '';
@@ -4613,7 +4619,7 @@ app.post('/slots/:slotId/confirm', async (req, res) => {
     await pool.query("UPDATE interview_slots SET status = 'CANCELLED' WHERE submission_id = $1 AND kind = $2 AND status = 'PROPOSED' AND slot_id <> $3", [slot.submission_id, slot.kind, req.params.slotId]);
     const s = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [slot.submission_id])).rows[0] || {};
     await pool.query('UPDATE submissions SET interview_link = $1, interview_date = $2, last_updated = NOW() WHERE submission_id = $3', [link, slot.slot_time, slot.submission_id]).catch(() => {});
-    const candEmail = candidateEmail(slot.candidate_id);
+    const candEmail = await candidateEmail(slot.candidate_id);
     const label = slot.kind === 'client' ? 'client interview' : 'recruiter call';
     const when = new Date(slot.slot_time).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
     const clientCc = slot.kind === 'client' ? clientEmailFor(s.client_name) : '';
@@ -4687,7 +4693,7 @@ app.post('/submissions/bulk-approval', async (req, res) => {
     for (const id of submission_ids) {
       const sub = (await pool.query('SELECT candidate_id, candidate_name, job_id, job_title, client_name, submitted_by FROM submissions WHERE submission_id = $1', [id])).rows[0];
       if (!sub) continue;
-      const candEmail = candidateEmail(sub.candidate_id);
+      const candEmail = await candidateEmail(sub.candidate_id);
       if (decision === 'APPROVED') {
         await pool.query("UPDATE submissions SET status = 'RECRUITER_CALL', last_updated = NOW() WHERE submission_id = $1", [id]);
         const recruiterName = sub.submitted_by || 'your recruiter';
