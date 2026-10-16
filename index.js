@@ -147,7 +147,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-16-v33-emailfix-dashboards-salesreports';
+const BUILD_TAG = '2026-10-16-v35-clients-merge-nopipeline';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1170,10 +1170,34 @@ app.post('/submissions/:id/rounds', async (req, res) => {
     const status = b.scheduled_at ? 'Scheduled' : 'Pending';
     await pool.query('INSERT INTO interview_rounds (round_id, submission_id, round_name, scheduled_at, panel, status, meeting_link, created_by, sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
       [rid, req.params.id, name, b.scheduled_at || null, b.panel || '', status, meet, b.created_by || 'Hiring Manager', n + 1]);
+    const whenTxt = b.scheduled_at ? new Date(b.scheduled_at).toLocaleString('en-GB', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'to be confirmed';
     try {
-      const msg = `Additional interview round "${name}" requested for ${sub.candidate_name}${b.scheduled_at ? ' on ' + b.scheduled_at : ''} (${sub.job_title || 'role'}).`;
+      const msg = `Additional interview round "${name}" requested for ${sub.candidate_name}${b.scheduled_at ? ' on ' + whenTxt : ''} (${sub.job_title || 'role'}).`;
       if (sub.submitted_by) await notify({ candidate_id: sub.candidate_id, recipient: sub.submitted_by, type: 'INTERVIEW', message: msg });
-      await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: `A new interview round "${name}" has been scheduled${b.scheduled_at ? ' on ' + b.scheduled_at : ''}. Link: ${meet}` });
+      await notify({ candidate_id: sub.candidate_id, recipient: 'candidate', type: 'INTERVIEW', message: `A new interview round "${name}" has been scheduled${b.scheduled_at ? ' on ' + whenTxt : ''}. Link: ${meet}` });
+    } catch (e) {}
+    // Proper email to the candidate with the round name, date/time, panel and join link.
+    try {
+      const candEmail = await candidateEmail(sub.candidate_id);
+      if (candEmail) {
+        const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+        const html = `<div style="font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;max-width:560px">
+          <div style="background:#4f46e5;color:#fff;padding:14px 18px;border-radius:10px 10px 0 0;font-weight:700">Interview scheduled — ${esc(name)}</div>
+          <div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:18px">
+            <p>Dear ${esc(sub.candidate_name || 'Candidate')},</p>
+            <p>An interview round has been scheduled for your application${sub.job_title ? ' for <b>' + esc(sub.job_title) + '</b>' : ''}${sub.client_name ? ' at <b>' + esc(sub.client_name) + '</b>' : ''}.</p>
+            <table style="font-size:14px;margin:12px 0">
+              <tr><td style="padding:3px 10px 3px 0;color:#64748b">Round</td><td><b>${esc(name)}</b></td></tr>
+              <tr><td style="padding:3px 10px 3px 0;color:#64748b">Date &amp; time</td><td><b>${esc(whenTxt)}</b></td></tr>
+              ${b.panel ? `<tr><td style="padding:3px 10px 3px 0;color:#64748b">Panel</td><td>${esc(b.panel)}</td></tr>` : ''}
+            </table>
+            <p style="text-align:center;margin:18px 0"><a href="${meet}" style="background:#4f46e5;color:#fff;text-decoration:none;font-weight:700;padding:11px 22px;border-radius:8px;display:inline-block">Join the interview</a></p>
+            <p style="font-size:12px;color:#64748b">Or paste this link into your browser: ${meet}</p>
+            <p>Please confirm your availability by replying to this email. Best of luck!</p>
+            <p style="font-size:12px;color:#64748b">— Avanciers Talent Team</p>
+          </div></div>`;
+        await sendEmail({ to: candEmail, subject: `Your ${name} is scheduled — ${sub.job_title || 'Avanciers'}`, body: html, html: true });
+      }
     } catch (e) {}
     return res.json({ ok: true, round_id: rid, meeting_link: meet });
   } catch (e) { return res.status(500).json({ error: e.message }); }
@@ -1778,8 +1802,24 @@ app.get('/jobs/:jobId/full', async (req, res) => {
 
 // ---------- CLIENTS (admin manages; dropdown for HM & recruiter) ----------
 app.get('/admin/clients', async (req, res) => {
-  try { const { rows } = await pool.query('SELECT * FROM clients WHERE active = TRUE ORDER BY client_name'); return res.json({ clients: rows }); }
-  catch (e) { return res.status(500).json({ error: e.message }); }
+  try {
+    await ensureSchema();
+    // Clients come from the clients table AND from the accounts the Sales team adds (sales_accounts),
+    // so a client added by Sales shows up automatically in the requisition client dropdown.
+    const { rows } = await pool.query(`
+      SELECT client_id, client_name, country, source FROM (
+        SELECT client_id, client_name, COALESCE(country,'') AS country, 'clients' AS source FROM clients WHERE active = TRUE
+        UNION ALL
+        SELECT account_id AS client_id, company_name AS client_name, COALESCE(country,'') AS country, 'sales' AS source
+          FROM sales_accounts WHERE COALESCE(status,'Active') <> 'Inactive' AND COALESCE(company_name,'') <> ''
+      ) t
+      WHERE COALESCE(client_name,'') <> ''
+      ORDER BY client_name`);
+    // De-duplicate by name (case-insensitive) so the same client isn't listed twice.
+    const seen = new Set(); const out = [];
+    for (const r of rows) { const k = (r.client_name || '').toLowerCase().trim(); if (!seen.has(k)) { seen.add(k); out.push(r); } }
+    return res.json({ clients: out });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 app.post('/admin/clients', async (req, res) => {
   try {
@@ -2480,7 +2520,8 @@ app.post('/onboarding/cases/:id/offer', async (req, res) => {
     const b = req.body || {};
     const contract = b.contract_type || c.employment_type || '';
     const salary = b.salary_package || '';
-    const reqSig = (b.requires_signature === undefined) ? offerNeedsSignature(contract, salary) : !!b.requires_signature;
+    // The final offer + welcome letter ALWAYS goes to an Admin for digital signature before HR sends it.
+    const reqSig = true;
     let offer = await getOffer(req.params.id);
     if (offer) {
       await pool.query(
