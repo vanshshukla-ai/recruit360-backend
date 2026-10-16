@@ -147,7 +147,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-16-v35-clients-merge-nopipeline';
+const BUILD_TAG = '2026-10-16-v36-real-meeting-link';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -1114,8 +1114,7 @@ app.patch('/submissions/:id/interview', async (req, res) => {
     const roundLabel = sub.status === 'CLIENT_INTERVIEW' ? 'client interview' : sub.status === 'HR_INTERVIEW' ? 'HR interview' : sub.status === 'RECRUITER_CALL' ? 'recruiter call' : 'interview';
 
     // Generate a meeting link (Google Meet style) — do NOT change the stage; stages advance via the step buttons.
-    const meetCode = Math.random().toString(36).slice(2, 5) + '-' + Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 5);
-    const interview_link = 'https://meet.google.com/' + meetCode;
+    const interview_link = makeMeetingLink((sub.candidate_name || 'Candidate') + '-' + roundLabel);
 
     // Hiring manager for this job (to keep everyone in the loop)
     let hm = '';
@@ -1166,7 +1165,7 @@ app.post('/submissions/:id/rounds', async (req, res) => {
     const name = String(b.round_name || 'Additional interview').trim();
     const rid = 'IVR-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
     const n = (await pool.query('SELECT COUNT(*)::int AS c FROM interview_rounds WHERE submission_id = $1', [req.params.id])).rows[0].c;
-    const meet = 'https://meet.google.com/' + Math.random().toString(36).slice(2, 5) + '-' + Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 5);
+    const meet = makeMeetingLink((sub.candidate_name || 'Candidate') + '-' + name);
     const status = b.scheduled_at ? 'Scheduled' : 'Pending';
     await pool.query('INSERT INTO interview_rounds (round_id, submission_id, round_name, scheduled_at, panel, status, meeting_link, created_by, sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
       [rid, req.params.id, name, b.scheduled_at || null, b.panel || '', status, meet, b.created_by || 'Hiring Manager', n + 1]);
@@ -1511,6 +1510,15 @@ async function candidateEmail(candidate_id) {
     }
   } catch (e) {}
   return '';
+}
+
+// Real, working video-meeting link. Uses Jitsi Meet — the room opens and connects on click with no
+// account or setup (unlike a random meet.google.com code, which does not reserve a real room). The
+// room is named after the candidate + round so it reads clearly in calendars and emails.
+function makeMeetingLink(label) {
+  const slug = String(label || 'Interview').replace(/[^A-Za-z0-9]+/g, '').slice(0, 28) || 'Interview';
+  const rand = Math.random().toString(36).slice(2, 8);
+  return 'https://meet.jit.si/Recruit360-' + slug + '-' + rand;
 }
 
 // ---------- NOTIFICATIONS ----------
@@ -3171,8 +3179,7 @@ app.patch('/validation/:id/advance', async (req, res) => {
 // ---------- VALIDATION: generate an interview link (real Meet-style link) + email content ----------
 app.post('/validation/:id/interview-link', async (req, res) => {
   try {
-    const code = Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 6);
-    const link = `https://meet.google.com/${code}`;
+    const link = makeMeetingLink('Validation-Interview');
     await pool.query('UPDATE candidate_validation SET interview_link = $1, updated_at = NOW() WHERE validation_id = $2', [link, req.params.id]);
     const v = await pool.query('SELECT candidate_name FROM candidate_validation WHERE validation_id = $1', [req.params.id]);
     const name = v.rows.length ? v.rows[0].candidate_name : 'Candidate';
@@ -4098,8 +4105,7 @@ app.post('/submissions/:id/context-action', async (req, res) => {
     if (ADVANCE[action]) {
       await pool.query('UPDATE submissions SET status = $1, last_updated = NOW() WHERE submission_id = $2', [ADVANCE[action], req.params.id]);
       const labels = { schedule_call: 'recruiter call', schedule_client: 'client interview' };
-      const meetCode = Math.random().toString(36).slice(2, 5) + '-' + Math.random().toString(36).slice(2, 6) + '-' + Math.random().toString(36).slice(2, 5);
-      const interview_link = 'https://meet.google.com/' + meetCode;
+      const interview_link = makeMeetingLink((s.candidate_name || 'Candidate') + '-' + labels[action]);
       const emailSubject = 'Your ' + labels[action] + ' is scheduled — ' + (s.job_title || 'a role');
       const emailBody = 'Dear ' + s.candidate_name + ',\n\nYour ' + labels[action] + ' for ' + (s.job_title || 'a role') + (s.client_name ? ' at ' + s.client_name : '') + ' has been scheduled.\n\nJoin using this link:\n' + interview_link + '\n\nPlease confirm your availability by replying to this email.\n\nBest regards,\nRecruit 360 Team';
       await pool.query('UPDATE submissions SET interview_link = $1 WHERE submission_id = $2', [interview_link, req.params.id]).catch(() => {});
@@ -4514,8 +4520,7 @@ app.get('/offers/active', async (req, res) => {
 // (Care 360-style: the agent suggests slots and never double-books a candidate or recruiter.)
 // ============================================================
 function meetLink() {
-  const p = () => Math.random().toString(36).slice(2, 6);
-  return 'https://meet.google.com/' + p().slice(0, 3) + '-' + p() + '-' + p().slice(0, 3);
+  return makeMeetingLink('Interview');
 }
 function clientEmailFor(name) { return (String(name || 'client').toLowerCase().replace(/[^a-z0-9]+/g, '') || 'client') + '@client.com'; }
 const VISA_TEAM_EMAIL = 'visa-team@fragomen.com'; // third-party visa agency (Fragomen) placeholder
