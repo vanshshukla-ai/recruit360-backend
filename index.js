@@ -147,7 +147,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-16-v36-real-meeting-link';
+const BUILD_TAG = '2026-10-19-v38-timesheet-ui-hr-reports';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -2667,6 +2667,110 @@ app.post('/onboarding/cases/:id/message', async (req, res) => {
     return res.json({ ok: true, msg_id: mid });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
+
+// ========= TIMESHEETS (candidate logs weekly hours → HR reviews & approves) =========
+// Hours are stored as "HH:MM" strings in a category grid. hmToHours tolerates "HH:MM" or plain decimals.
+const hmToHours = (v) => {
+  if (v == null) return 0;
+  const s = String(v).trim();
+  if (!s) return 0;
+  if (s.indexOf(':') >= 0) { const p = s.split(':'); return (parseInt(p[0], 10) || 0) + (parseInt(p[1], 10) || 0) / 60; }
+  const f = parseFloat(s); return isNaN(f) ? 0 : f;
+};
+// Sum works for both the new grid shape {lines:[{values:["HH:MM"...]}]} and the old flat [{hours}] shape.
+const sumHours = (entries) => {
+  if (entries && Array.isArray(entries.lines)) {
+    return entries.lines.reduce((t, l) => t + ((Array.isArray(l && l.values) ? l.values : []).reduce((s, v) => s + hmToHours(v), 0)), 0);
+  }
+  return (Array.isArray(entries) ? entries : []).reduce((t, e) => t + hmToHours(e && e.hours), 0);
+};
+// Build an empty weekly grid (Mon-anchored 7 days) with the standard category rows.
+const seedTimesheet = (week_start) => {
+  const base = new Date(week_start);
+  const days = Array.from({ length: 7 }, (_, i) => { const d = new Date(base); d.setDate(base.getDate() + i); return d.toISOString().slice(0, 10); });
+  const line = (category, billable) => ({ category, billable: !!billable, values: Array(7).fill('00:00') });
+  return { period: 'weekly', days, lines: [line('Billable', true), line('Standard', false), line('Time Off', false), line('Leave', false)] };
+};
+// List timesheets. ?email= for a candidate's own; HR/admin omit email to see all; ?status= to filter.
+app.get('/timesheets', async (req, res) => {
+  try {
+    await ensureSchema();
+    const email = String(req.query.email || '').trim();
+    const status = String(req.query.status || '').trim();
+    const where = [], params = []; let i = 1;
+    if (email) { where.push(`LOWER(candidate_email) = LOWER($${i++})`); params.push(email); }
+    if (status && status !== 'All') { where.push(`status = $${i++}`); params.push(status); }
+    const sql = 'SELECT * FROM timesheets' + (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' ORDER BY week_start DESC, created_at DESC LIMIT 200';
+    const { rows } = await pool.query(sql, params);
+    return res.json({ timesheets: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Create a timesheet (candidate) for a week. Pre-fills client/role from their onboarding case if present.
+app.post('/timesheets', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body || {};
+    const email = String(b.candidate_email || '').trim();
+    if (!email || !b.week_start) return res.status(400).json({ error: 'Candidate email and week start are required.' });
+    // avoid duplicate week for the same candidate
+    const dup = (await pool.query('SELECT timesheet_id FROM timesheets WHERE LOWER(candidate_email) = LOWER($1) AND week_start = $2', [email, b.week_start])).rows[0];
+    if (dup) return res.status(409).json({ error: 'A timesheet for this week already exists.', timesheet_id: dup.timesheet_id });
+    const c = (await pool.query('SELECT candidate_name, client, role_title, case_id FROM onboarding_cases WHERE LOWER(candidate_email) = LOWER($1) ORDER BY created_at DESC LIMIT 1', [email])).rows[0] || {};
+    const id = 'TMS-' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 100);
+    // Accept the new grid shape; fall back to a freshly seeded grid so a timesheet is never empty.
+    const entries = (b.entries && Array.isArray(b.entries.lines)) ? b.entries
+      : (Array.isArray(b.entries) && b.entries.length ? b.entries : seedTimesheet(b.week_start));
+    await pool.query(
+      `INSERT INTO timesheets (timesheet_id, candidate_email, candidate_name, case_ref, client, role_title, week_start, entries, total_hours, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Draft')`,
+      [id, email, b.candidate_name || c.candidate_name || '', c.case_id || '', b.client || c.client || '', b.role_title || c.role_title || '', b.week_start, JSON.stringify(entries), sumHours(entries)]);
+    const row = (await pool.query('SELECT * FROM timesheets WHERE timesheet_id = $1', [id])).rows[0];
+    return res.json({ ok: true, timesheet: row });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Update a timesheet — candidate edits entries while Draft/Rejected; submit/approve/reject change status.
+app.patch('/timesheets/:id', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const t = (await pool.query('SELECT * FROM timesheets WHERE timesheet_id = $1', [req.params.id])).rows[0];
+    if (!t) return res.status(404).json({ error: 'Timesheet not found' });
+    const sets = [], vals = []; let i = 1;
+    if (b.entries !== undefined) { const ent = (b.entries && (Array.isArray(b.entries.lines) || Array.isArray(b.entries))) ? b.entries : {}; sets.push(`entries = $${i++}`); vals.push(JSON.stringify(ent)); sets.push(`total_hours = $${i++}`); vals.push(sumHours(ent)); }
+    if (b.status !== undefined) {
+      sets.push(`status = $${i++}`); vals.push(b.status);
+      if (b.status === 'Submitted') { sets.push('submitted_at = NOW()'); }
+      if (b.status === 'Approved' || b.status === 'Rejected') { sets.push(`reviewed_by = $${i++}`); vals.push(b.reviewed_by || 'HR'); sets.push('reviewed_at = NOW()'); }
+    }
+    if (b.review_notes !== undefined) { sets.push(`review_notes = $${i++}`); vals.push(b.review_notes); }
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE timesheets SET ' + sets.join(', ') + ' WHERE timesheet_id = $' + i, vals);
+    // Notifications / emails on the key transitions.
+    try {
+      const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+      const wk = t.week_start ? new Date(t.week_start).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '';
+      if (b.status === 'Submitted') {
+        await notify({ recipient: 'hr', type: 'TIMESHEET', message: `${t.candidate_name || t.candidate_email} submitted a timesheet for week of ${wk} (${sumHours(b.entries !== undefined ? b.entries : t.entries)}h).` });
+      }
+      if ((b.status === 'Approved' || b.status === 'Rejected') && t.candidate_email) {
+        const approved = b.status === 'Approved';
+        const html = `<div style="font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;max-width:560px">
+          <div style="background:${approved ? '#059669' : '#e11d48'};color:#fff;padding:14px 18px;border-radius:10px 10px 0 0;font-weight:700">Timesheet ${approved ? 'approved' : 'needs changes'}</div>
+          <div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:18px">
+            <p>Hi ${esc(t.candidate_name || 'there')},</p>
+            <p>Your timesheet for the week of <b>${esc(wk)}</b> has been <b>${approved ? 'approved' : 'sent back for changes'}</b>.</p>
+            ${b.review_notes ? `<div style="white-space:pre-wrap;font-size:14px;background:#f8fafc;border-left:3px solid ${approved ? '#059669' : '#e11d48'};padding:10px 14px;border-radius:6px">${esc(b.review_notes)}</div>` : ''}
+            <p style="font-size:12px;color:#64748b">— Avanciers HR</p>
+          </div></div>`;
+        await sendEmail({ to: t.candidate_email, subject: `Your timesheet (week of ${wk}) — ${approved ? 'Approved' : 'Changes needed'}`, body: html, html: true });
+        await notify({ recipient: 'candidate', type: 'TIMESHEET', message: `Your timesheet for week of ${wk} was ${approved ? 'approved' : 'returned for changes'}.` });
+      }
+    } catch (e) {}
+    const row = (await pool.query('SELECT * FROM timesheets WHERE timesheet_id = $1', [req.params.id])).rows[0];
+    return res.json({ ok: true, timesheet: row });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
 // Candidate-facing: their own case + tasks + documents, by email.
 app.get('/onboarding/candidate', async (req, res) => {
   try {
@@ -3042,6 +3146,22 @@ app.get('/reports/:role', async (req, res) => {
         totals: { jobs, open, submissions: subs, placements: placed }, byStatus: byStatus.rows });
     }
 
+    if (role === 'hr') {
+      // HR scope: onboarding lifecycle + document verification + timesheets.
+      const cases = await n('SELECT COUNT(*) c FROM onboarding_cases');
+      const active = await n("SELECT COUNT(*) c FROM onboarding_cases WHERE status = 'Activated'");
+      const inProgress = await n("SELECT COUNT(*) c FROM onboarding_cases WHERE status NOT IN ('Activated')");
+      const docsPending = await n("SELECT COUNT(*) c FROM onboarding_documents WHERE status = 'Uploaded'");
+      const docsVerified = await n("SELECT COUNT(*) c FROM onboarding_documents WHERE status = 'Verified'");
+      const tsSubmitted = await n("SELECT COUNT(*) c FROM timesheets WHERE status = 'Submitted'");
+      const tsApproved = await n("SELECT COUNT(*) c FROM timesheets WHERE status = 'Approved'");
+      const byStatus = await pool.query(`SELECT COALESCE(NULLIF(status,''),'In Progress') status, COUNT(*) cases FROM onboarding_cases GROUP BY 1 ORDER BY cases DESC`);
+      const byClient = await pool.query(`SELECT COALESCE(NULLIF(client,''),'—') client, COUNT(*) cases FROM onboarding_cases GROUP BY 1 ORDER BY cases DESC LIMIT 10`);
+      return res.json({ role, scope: 'Onboarding, document verification & timesheets',
+        totals: { cases, active, in_progress: inProgress, docs_pending: docsPending, docs_verified: docsVerified, timesheets_submitted: tsSubmitted, timesheets_approved: tsApproved },
+        byStatus: byStatus.rows, byClient: byClient.rows });
+    }
+
     // recruiter — scoped to THIS recruiter's assigned jobs + their own submissions
     const recPred = `(recruiter = $1 OR assigned_recruiter_id = $2 OR replace(COALESCE(assigned_recruiter_ids,''),' ','') ILIKE '%' || $2 || '%')`;
     const assigned = await n(`SELECT COUNT(*) c FROM jobs WHERE ${recPred}`, [name, userId]);
@@ -3059,6 +3179,22 @@ app.get('/reports/:role/export', async (req, res) => {
     const role = req.params.role;
     const name = req.query.name || '';
     const userId = req.query.userId || '';
+    // HR exports onboarding cases or timesheets instead of jobs/submissions.
+    if (role === 'hr') {
+      const hrType = req.query.type === 'timesheets' ? 'timesheets' : 'cases';
+      let hrRows = [];
+      if (hrType === 'timesheets') {
+        hrRows = (await pool.query(`SELECT timesheet_id, candidate_name, candidate_email, client, role_title, week_start, total_hours, status, reviewed_by, reviewed_at FROM timesheets ORDER BY week_start DESC`)).rows;
+      } else {
+        hrRows = (await pool.query(`SELECT case_number, candidate_name, candidate_email, role_title, client, employment_type, target_start_date, status, recruiter, hiring_manager FROM onboarding_cases ORDER BY created_at DESC`)).rows;
+      }
+      const hcols = hrRows.length ? Object.keys(hrRows[0]) : ['no_data'];
+      const hesc = v => { if (v == null) return ''; const s = String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+      const hcsv = [hcols.join(','), ...hrRows.map(r => hcols.map(c => hesc(r[c])).join(','))].join('\n');
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="recruit360_hr_${hrType}.csv"`);
+      return res.send(hcsv);
+    }
     const type = (req.query.type === 'submissions') ? 'submissions' : 'jobs';
     let rows = [];
     if (type === 'submissions') {
@@ -5089,6 +5225,24 @@ async function ensureSchema() {
       meeting_link  TEXT,
       created_by    TEXT,
       sort_order    INTEGER DEFAULT 0
+    )`);
+    // Timesheets — candidates/contractors log weekly hours; HR reviews and approves.
+    await pool.query(`CREATE TABLE IF NOT EXISTS timesheets (
+      timesheet_id   TEXT PRIMARY KEY,
+      created_at     TIMESTAMPTZ DEFAULT NOW(),
+      candidate_email TEXT,
+      candidate_name TEXT,
+      case_ref       TEXT,
+      client         TEXT,
+      role_title     TEXT,
+      week_start     DATE,
+      entries        JSONB DEFAULT '[]',
+      total_hours    NUMERIC DEFAULT 0,
+      status         TEXT DEFAULT 'Draft',
+      submitted_at   TIMESTAMPTZ,
+      reviewed_by    TEXT,
+      reviewed_at    TIMESTAMPTZ,
+      review_notes   TEXT
     )`);
     // Sales users carry a department + home country (auto-filled, non-editable in the UI).
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS department TEXT");
