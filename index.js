@@ -147,7 +147,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-19-v38-timesheet-ui-hr-reports';
+const BUILD_TAG = '2026-10-21-v39-attendance-leave';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -2771,6 +2771,184 @@ app.patch('/timesheets/:id', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
+// ========= ATTENDANCE & LEAVE (daily check-in/out + leave requests) =========
+const SHIFT_LABEL = '11:00 AM - 08:00 PM';
+const SHIFT_START_MIN = 11 * 60;          // 11:00 in minutes
+const HALF_DAY_MINUTES = 270;             // < 4h30m worked => Half Day
+const LEAVE_QUOTA = { Casual: 12, Sick: 8, Earned: 15, Unpaid: 0 };
+// "Now" and "today" in IST (the office timezone) regardless of server TZ.
+const istNow = () => new Date(Date.now() + 5.5 * 3600 * 1000);
+const istDateStr = (d) => (d || istNow()).toISOString().slice(0, 10);
+const istMinutesOfDay = (d) => { const x = d || istNow(); return x.getUTCHours() * 60 + x.getUTCMinutes(); };
+const fmtIST = (ts) => { if (!ts) return null; const d = new Date(new Date(ts).getTime() + 5.5 * 3600 * 1000); let h = d.getUTCHours(), m = d.getUTCMinutes(); const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12; return `${h}:${String(m).padStart(2, '0')} ${ap}`; };
+
+// Candidate clocks IN. Creates/updates today's row; flags late vs 11:00 IST.
+app.post('/attendance/checkin', async (req, res) => {
+  try {
+    await ensureSchema();
+    const email = String(req.body.email || '').trim();
+    const name = String(req.body.name || '').trim();
+    if (!email) return res.status(400).json({ error: 'email required' });
+    const today = istDateStr();
+    const existing = (await pool.query('SELECT * FROM attendance WHERE LOWER(email) = LOWER($1) AND work_date = $2', [email, today])).rows[0];
+    if (existing && existing.check_in) return res.status(409).json({ error: 'Already checked in today.', attendance: existing });
+    const lateMin = Math.max(0, istMinutesOfDay() - SHIFT_START_MIN);
+    if (existing) {
+      await pool.query('UPDATE attendance SET check_in = NOW(), late_minutes = $2, status = $3 WHERE att_id = $1', [existing.att_id, lateMin, 'Present']);
+    } else {
+      const id = 'ATT-' + Date.now().toString().slice(-9) + Math.floor(Math.random() * 100);
+      await pool.query('INSERT INTO attendance (att_id, email, name, work_date, check_in, shift, status, late_minutes) VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7)', [id, email, name, today, SHIFT_LABEL, 'Present', lateMin]);
+    }
+    const row = (await pool.query('SELECT * FROM attendance WHERE LOWER(email) = LOWER($1) AND work_date = $2', [email, today])).rows[0];
+    return res.json({ ok: true, attendance: row, late_minutes: lateMin });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Candidate clocks OUT. Computes worked minutes + Present/Half Day.
+app.post('/attendance/checkout', async (req, res) => {
+  try {
+    await ensureSchema();
+    const email = String(req.body.email || '').trim();
+    if (!email) return res.status(400).json({ error: 'email required' });
+    const today = istDateStr();
+    const row = (await pool.query('SELECT * FROM attendance WHERE LOWER(email) = LOWER($1) AND work_date = $2', [email, today])).rows[0];
+    if (!row || !row.check_in) return res.status(400).json({ error: 'You have not checked in today.' });
+    if (row.check_out) return res.status(409).json({ error: 'Already checked out today.', attendance: row });
+    const worked = Math.max(0, Math.round((Date.now() - new Date(row.check_in).getTime()) / 60000));
+    const status = worked > 0 && worked < HALF_DAY_MINUTES ? 'Half Day' : 'Present';
+    await pool.query('UPDATE attendance SET check_out = NOW(), worked_minutes = $2, status = $3 WHERE att_id = $1', [row.att_id, worked, status]);
+    const out = (await pool.query('SELECT * FROM attendance WHERE att_id = $1', [row.att_id])).rows[0];
+    return res.json({ ok: true, attendance: out, worked_minutes: worked });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// List attendance rows. ?email= for one person; otherwise all (HR). ?from=&to= to bound.
+app.get('/attendance', async (req, res) => {
+  try {
+    await ensureSchema();
+    const email = String(req.query.email || '').trim();
+    const where = [], params = []; let i = 1;
+    if (email) { where.push(`LOWER(email) = LOWER($${i++})`); params.push(email); }
+    if (req.query.from) { where.push(`work_date >= $${i++}`); params.push(req.query.from); }
+    if (req.query.to) { where.push(`work_date <= $${i++}`); params.push(req.query.to); }
+    const sql = 'SELECT * FROM attendance' + (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' ORDER BY work_date DESC, check_in DESC LIMIT 200';
+    const { rows } = await pool.query(sql, params);
+    return res.json({ attendance: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// HR team board for a date: who is present / late / half-day / on leave / absent.
+app.get('/attendance/summary', async (req, res) => {
+  try {
+    await ensureSchema();
+    const date = String(req.query.date || istDateStr()).trim();
+    const att = (await pool.query('SELECT email, name, check_in, check_out, worked_minutes, status, late_minutes FROM attendance WHERE work_date = $1', [date])).rows;
+    const leaves = (await pool.query("SELECT email, name, leave_type FROM leave_requests WHERE status = 'Approved' AND $1 BETWEEN from_date AND to_date", [date])).rows;
+    const roster = (await pool.query("SELECT name, email FROM app_users WHERE role = 'candidate'")).rows;
+    const has = (list, e) => list.some(x => (x.email || '').toLowerCase() === (e || '').toLowerCase());
+    const present = att.filter(a => a.check_in && a.status === 'Present');
+    const late = att.filter(a => a.check_in && (a.late_minutes || 0) > 0);
+    const halfDay = att.filter(a => a.status === 'Half Day').concat(leaves.filter(l => /Half/.test(l.leave_type || '')));
+    const onLeave = leaves.filter(l => !/Half/.test(l.leave_type || ''));
+    const absent = roster.filter(p => !has(att, p.email) && !has(leaves, p.email));
+    return res.json({ date, counts: { present: present.length, late: late.length, half_day: halfDay.length, on_leave: onLeave.length, absent: absent.length, roster: roster.length },
+      present, late, half_day: halfDay, on_leave: onLeave, absent, all: att });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// A candidate's own month summary (present / half / leave / late / hours / leave balance).
+app.get('/attendance/mysummary', async (req, res) => {
+  try {
+    await ensureSchema();
+    const email = String(req.query.email || '').trim();
+    if (!email) return res.json({ summary: null });
+    const month = String(req.query.month || istDateStr().slice(0, 7)); // YYYY-MM
+    const rows = (await pool.query("SELECT * FROM attendance WHERE LOWER(email) = LOWER($1) AND to_char(work_date,'YYYY-MM') = $2", [email, month])).rows;
+    const present = rows.filter(r => r.status === 'Present').length;
+    const half = rows.filter(r => r.status === 'Half Day').length;
+    const late = rows.filter(r => (r.late_minutes || 0) > 0).length;
+    const minutes = rows.reduce((t, r) => t + (r.worked_minutes || 0), 0);
+    const year = month.slice(0, 4);
+    const takenRows = (await pool.query("SELECT category, COALESCE(SUM(days),0) d FROM leave_requests WHERE LOWER(email) = LOWER($1) AND status='Approved' AND to_char(from_date,'YYYY') = $2 GROUP BY category", [email, year])).rows;
+    const taken = {}; takenRows.forEach(r => { taken[r.category] = +r.d; });
+    const leaveDays = Object.values(taken).reduce((a, b) => a + b, 0);
+    const balance = Object.keys(LEAVE_QUOTA).filter(k => k !== 'Unpaid').map(k => ({ category: k, quota: LEAVE_QUOTA[k], taken: taken[k] || 0, balance: Math.max(0, LEAVE_QUOTA[k] - (taken[k] || 0)) }));
+    return res.json({ summary: { month, present, half_day: half, late, leave_days: leaveDays, worked_minutes: minutes, balance } });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+// Leave requests — list (?email= own, ?status= filter), create, and HR approve/reject.
+app.get('/leave-requests', async (req, res) => {
+  try {
+    await ensureSchema();
+    const email = String(req.query.email || '').trim();
+    const status = String(req.query.status || '').trim();
+    const where = [], params = []; let i = 1;
+    if (email) { where.push(`LOWER(email) = LOWER($${i++})`); params.push(email); }
+    if (status && status !== 'All') { where.push(`status = $${i++}`); params.push(status); }
+    const sql = 'SELECT * FROM leave_requests' + (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' ORDER BY created_at DESC LIMIT 200';
+    const { rows } = await pool.query(sql, params);
+    return res.json({ leaves: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.post('/leave-requests', async (req, res) => {
+  try {
+    await ensureSchema();
+    const b = req.body || {};
+    const email = String(b.email || '').trim();
+    if (!email || !b.from_date) return res.status(400).json({ error: 'email and from_date are required' });
+    const from = b.from_date, to = b.to_date || b.from_date;
+    const half = /Half/.test(b.leave_type || '');
+    let days = half ? 0.5 : (Math.round((new Date(to) - new Date(from)) / 86400000) + 1);
+    if (!(days > 0)) days = half ? 0.5 : 1;
+    const id = 'LV-' + Date.now().toString().slice(-9) + Math.floor(Math.random() * 100);
+    await pool.query('INSERT INTO leave_requests (leave_id, email, name, leave_type, category, from_date, to_date, days, reason, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+      [id, email, b.name || '', b.leave_type || 'Full Day', b.category || 'Casual', from, to, days, b.reason || '', 'Pending']);
+    try { await notify({ recipient: 'hr', type: 'LEAVE', message: `${b.name || email} requested ${days} day(s) ${b.category || ''} leave from ${from}.` }); } catch (e) {}
+    const row = (await pool.query('SELECT * FROM leave_requests WHERE leave_id = $1', [id])).rows[0];
+    return res.json({ ok: true, leave: row });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.patch('/leave-requests/:id', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const lv = (await pool.query('SELECT * FROM leave_requests WHERE leave_id = $1', [req.params.id])).rows[0];
+    if (!lv) return res.status(404).json({ error: 'Leave request not found' });
+    const sets = [], vals = []; let i = 1;
+    if (b.status !== undefined) { sets.push(`status = $${i++}`); vals.push(b.status); sets.push(`reviewed_by = $${i++}`); vals.push(b.reviewed_by || 'HR'); sets.push('reviewed_at = NOW()'); }
+    if (b.review_notes !== undefined) { sets.push(`review_notes = $${i++}`); vals.push(b.review_notes); }
+    if (!sets.length) return res.json({ ok: true });
+    vals.push(req.params.id);
+    await pool.query('UPDATE leave_requests SET ' + sets.join(', ') + ' WHERE leave_id = $' + i, vals);
+    // On approval, mark those dates as Leave in attendance so the team board + records reflect it.
+    if (b.status === 'Approved') {
+      try {
+        const start = new Date(lv.from_date), end = new Date(lv.to_date || lv.from_date);
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+          const ds = d.toISOString().slice(0, 10);
+          const ex = (await pool.query('SELECT att_id FROM attendance WHERE LOWER(email) = LOWER($1) AND work_date = $2', [lv.email, ds])).rows[0];
+          if (ex) await pool.query("UPDATE attendance SET status = 'Leave' WHERE att_id = $1", [ex.att_id]);
+          else await pool.query("INSERT INTO attendance (att_id, email, name, work_date, shift, status) VALUES ($1,$2,$3,$4,$5,'Leave')", ['ATT-' + Date.now().toString().slice(-9) + Math.floor(Math.random() * 1000), lv.email, lv.name, ds, SHIFT_LABEL]);
+        }
+      } catch (e) {}
+    }
+    // Email the candidate the outcome.
+    try {
+      if ((b.status === 'Approved' || b.status === 'Rejected') && lv.email) {
+        const ok = b.status === 'Approved';
+        const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+        const html = `<div style="font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;max-width:560px">
+          <div style="background:${ok ? '#059669' : '#e11d48'};color:#fff;padding:14px 18px;border-radius:10px 10px 0 0;font-weight:700">Leave ${ok ? 'approved' : 'declined'}</div>
+          <div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:18px">
+            <p>Hi ${esc(lv.name || 'there')},</p>
+            <p>Your ${esc(lv.category)} leave request (${esc(lv.leave_type)}) from <b>${esc(String(lv.from_date).slice(0, 10))}</b> to <b>${esc(String(lv.to_date).slice(0, 10))}</b> has been <b>${ok ? 'approved' : 'declined'}</b>.</p>
+            ${b.review_notes ? `<div style="white-space:pre-wrap;font-size:14px;background:#f8fafc;border-left:3px solid ${ok ? '#059669' : '#e11d48'};padding:10px 14px;border-radius:6px">${esc(b.review_notes)}</div>` : ''}
+            <p style="font-size:12px;color:#64748b">— Avanciers HR</p>
+          </div></div>`;
+        await sendEmail({ to: lv.email, subject: `Your leave request — ${ok ? 'Approved' : 'Declined'}`, body: html, html: true });
+        await notify({ recipient: 'candidate', type: 'LEAVE', message: `Your leave request was ${ok ? 'approved' : 'declined'}.` });
+      }
+    } catch (e) {}
+    const row = (await pool.query('SELECT * FROM leave_requests WHERE leave_id = $1', [req.params.id])).rows[0];
+    return res.json({ ok: true, leave: row });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
 // Candidate-facing: their own case + tasks + documents, by email.
 app.get('/onboarding/candidate', async (req, res) => {
   try {
@@ -5243,6 +5421,39 @@ async function ensureSchema() {
       reviewed_by    TEXT,
       reviewed_at    TIMESTAMPTZ,
       review_notes   TEXT
+    )`);
+    // Attendance — daily check-in / check-out per candidate/contractor (one row per person per day).
+    await pool.query(`CREATE TABLE IF NOT EXISTS attendance (
+      att_id         TEXT PRIMARY KEY,
+      created_at     TIMESTAMPTZ DEFAULT NOW(),
+      email          TEXT,
+      name           TEXT,
+      work_date      DATE,
+      check_in       TIMESTAMPTZ,
+      check_out      TIMESTAMPTZ,
+      worked_minutes INTEGER DEFAULT 0,
+      shift          TEXT DEFAULT '11:00 AM - 08:00 PM',
+      status         TEXT DEFAULT 'Present',
+      late_minutes   INTEGER DEFAULT 0,
+      notes          TEXT
+    )`);
+    await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS attendance_email_date ON attendance (LOWER(email), work_date)');
+    // Leave requests — candidate applies; HR approves/rejects.
+    await pool.query(`CREATE TABLE IF NOT EXISTS leave_requests (
+      leave_id     TEXT PRIMARY KEY,
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      email        TEXT,
+      name         TEXT,
+      leave_type   TEXT DEFAULT 'Full Day',
+      category     TEXT DEFAULT 'Casual',
+      from_date    DATE,
+      to_date      DATE,
+      days         NUMERIC DEFAULT 1,
+      reason       TEXT,
+      status       TEXT DEFAULT 'Pending',
+      reviewed_by  TEXT,
+      reviewed_at  TIMESTAMPTZ,
+      review_notes TEXT
     )`);
     // Sales users carry a department + home country (auto-filled, non-editable in the UI).
     await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS department TEXT");
