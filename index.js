@@ -2841,7 +2841,7 @@ app.get('/attendance/summary', async (req, res) => {
     const date = String(req.query.date || istDateStr()).trim();
     const att = (await pool.query('SELECT email, name, check_in, check_out, worked_minutes, status, late_minutes FROM attendance WHERE work_date = $1', [date])).rows;
     const leaves = (await pool.query("SELECT email, name, leave_type FROM leave_requests WHERE status = 'Approved' AND $1 BETWEEN from_date AND to_date", [date])).rows;
-    const roster = (await pool.query("SELECT name, email FROM app_users WHERE role = 'candidate'")).rows;
+    const roster = (await pool.query("SELECT full_name AS name, email FROM app_users WHERE role = 'candidate'")).rows;
     const has = (list, e) => list.some(x => (x.email || '').toLowerCase() === (e || '').toLowerCase());
     const present = att.filter(a => a.check_in && a.status === 'Present');
     const late = att.filter(a => a.check_in && (a.late_minutes || 0) > 0);
