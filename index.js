@@ -147,7 +147,7 @@ const bq = new BigQuery({ projectId: 'direct-tribute-502305-q5' });
 
 // Bump this string every time the backend changes. After deploying, `curl .../version` must show it,
 // which proves the running service is the latest file (not a stale revision).
-const BUILD_TAG = '2026-10-21-v39-attendance-leave';
+const BUILD_TAG = '2026-10-27-v40-hm-timesheet-reports-drilldown';
 app.get('/', (req, res) => res.json({ status: 'Recruit360 API running', module: 'M1-M3' }));
 app.get('/version', (req, res) => res.json({ build: BUILD_TAG, time: new Date().toISOString() }));
 
@@ -2750,7 +2750,10 @@ app.patch('/timesheets/:id', async (req, res) => {
       const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
       const wk = t.week_start ? new Date(t.week_start).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '';
       if (b.status === 'Submitted') {
-        await notify({ recipient: 'hr', type: 'TIMESHEET', message: `${t.candidate_name || t.candidate_email} submitted a timesheet for week of ${wk} (${sumHours(b.entries !== undefined ? b.entries : t.entries)}h).` });
+        const smsg = `${t.candidate_name || t.candidate_email} submitted a timesheet for week of ${wk} (${sumHours(b.entries !== undefined ? b.entries : t.entries)}h).`;
+        // Both HR and the Hiring Manager can review/approve timesheets.
+        await notify({ recipient: 'hr', type: 'TIMESHEET', message: smsg });
+        await notify({ recipient: 'hiring_manager', type: 'TIMESHEET', message: smsg });
       }
       if ((b.status === 'Approved' || b.status === 'Rejected') && t.candidate_email) {
         const approved = b.status === 'Approved';
@@ -3399,6 +3402,37 @@ app.get('/reports/:role/export', async (req, res) => {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="recruit360_${role}_${type}.csv"`);
     return res.send(csv);
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- REPORTS LIST (JSON) — same scope as export; powers the clickable drill-down on stat cards ----------
+app.get('/reports/:role/list', async (req, res) => {
+  try {
+    await ensureSchema();
+    const role = req.params.role;
+    const name = req.query.name || '';
+    const userId = req.query.userId || '';
+    const type = (req.query.type === 'submissions') ? 'submissions' : 'jobs';
+    let rows = [];
+    if (type === 'submissions') {
+      let sql = `SELECT s.submission_id, s.candidate_name, s.job_title, s.client_name, s.status, s.submitted_by, s.created_at
+                   FROM submissions s LEFT JOIN jobs j ON j.job_id = s.job_id`;
+      const params = []; const where = [];
+      if (role === 'hiring_manager' && name) { params.push(name); where.push(`j.hiring_manager = $${params.length}`); }
+      else if (role === 'recruiter' && name) { params.push(name); where.push(`s.submitted_by = $${params.length}`); }
+      if (where.length) sql += ' WHERE ' + where.join(' AND ');
+      sql += ' ORDER BY s.created_at DESC LIMIT 500';
+      rows = (await pool.query(sql, params)).rows;
+    } else {
+      let sql = `SELECT job_id, title, job_code, client, hiring_manager, recruiter, status, number_of_positions, bill_rate, created_date FROM jobs`;
+      const params = []; const where = [];
+      if (role === 'hiring_manager' && name) { params.push(name); where.push(`hiring_manager = $${params.length}`); }
+      else if (role === 'recruiter') { params.push(name || ''); params.push(userId || ''); where.push(`(recruiter = $1 OR assigned_recruiter_id = $2 OR replace(COALESCE(assigned_recruiter_ids,''),' ','') ILIKE '%' || $2 || '%')`); }
+      if (where.length) sql += ' WHERE ' + where.join(' AND ');
+      sql += ' ORDER BY created_date DESC LIMIT 500';
+      rows = (await pool.query(sql, params)).rows;
+    }
+    return res.json({ rows });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
